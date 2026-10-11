@@ -1,3 +1,7 @@
 /target
 /dist
 .DS_Store
+.idea/
+.junie/
+summaries/
+lemmings/

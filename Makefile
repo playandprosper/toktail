@@ -8,7 +8,7 @@
 #
 # Works with the GNU make 3.81 that ships with macOS.
 
-SHELL := /bin/bash
+SHELL := $(shell which bash)
 APP_NAME   := Toktail
 APP        := dist/$(APP_NAME).app
 INSTALLED  := /Applications/$(APP_NAME).app
