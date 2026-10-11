@@ -8,18 +8,25 @@
 //!
 //!   Toktail                  menu bar app (default)
 //!   Toktail --headless       no menu bar; proxy, portal and S3 only
+//!   Toktail --demo           sample data and pretend traffic, to see Pip in action
 //!   Toktail --set-s3-secret  store the S3 secret key in the Keychain
 //!   Toktail fingerprint      read a request JSON on stdin, print its prompt_sha256
 //!   Toktail --version
 
 mod app;
 mod config;
+mod crypto;
+mod demo;
+mod hardware;
 mod ledger;
 mod live;
 mod login;
 mod portal;
+mod portal_records;
+mod portal_settings;
 mod pricing;
 mod proxy;
+mod records;
 mod s3sync;
 mod secrets;
 mod tray;
@@ -51,7 +58,7 @@ fn real_main() -> Result<()> {
     }
     if has("--help") || has("-h") {
         println!(
-            "Toktail {} — every token leaves a trail.\n\n  Toktail                  menu bar app\n  Toktail --headless       run without the menu bar\n  Toktail --set-s3-secret  store the S3 secret key in the Keychain\n  Toktail fingerprint      print prompt_sha256 for a request JSON on stdin\n\nConfig: {}\nHome:   {}",
+            "Toktail {} — every token leaves a trail.\n\n  Toktail                  menu bar app\n  Toktail --headless       run without the menu bar\n  Toktail --demo           try it with sample data and pretend traffic\n  Toktail --set-s3-secret  store the S3 secret key in the Keychain\n  Toktail fingerprint      print prompt_sha256 for a request JSON on stdin\n\nConfig: {}\nHome:   {}",
             env!("CARGO_PKG_VERSION"),
             config::base_dir().join("config.toml").display(),
             portal::REPOSITORY
@@ -70,6 +77,14 @@ fn real_main() -> Result<()> {
             ),
         }
         return Ok(());
+    }
+
+    let demo = has("--demo");
+    if demo {
+        let dir = demo::demo_dir();
+        demo::prepare(&dir)?;
+        log::info!("demo mode: sample data in {}", dir.display());
+        config::set_base_dir(dir);
     }
 
     let (cfg, paths, first_run) = config::load()?;
@@ -98,7 +113,7 @@ fn real_main() -> Result<()> {
         }
     };
 
-    if cfg!(target_os = "macos") && (first_run || cfg.app.launch_at_login) {
+    if !demo && cfg!(target_os = "macos") && (first_run || cfg.app.launch_at_login) {
         if let Err(e) = login::set_enabled(cfg.app.launch_at_login) {
             log::warn!("launch at login: {e:#}");
         }
@@ -110,7 +125,16 @@ fn real_main() -> Result<()> {
         .thread_name("toktail")
         .build()?;
 
-    let ledger = ledger::Ledger::open(paths.data_dir.clone())?;
+    secrets::set_base(paths.base.clone());
+    if demo {
+        secrets::set_namespace(" (demo)");
+        if secrets::get_encryption_password().is_none() {
+            secrets::set_encryption_password(Some(demo::PASSWORD))?;
+        }
+    }
+    let default_host = cfg.default_host_id();
+    secrets::migrate_single_token(&default_host);
+    let ledger = ledger::Ledger::open(paths.data_dir.clone(), &default_host)?;
     let paths_base = paths.base.clone();
     log::info!("CSV ledger: {}", paths.data_dir.display());
     let app = Arc::new(app::App {
@@ -122,13 +146,38 @@ fn real_main() -> Result<()> {
         rt: runtime.handle().clone(),
         live: live::Live::new(),
         prices: RwLock::new(pricing::PriceBook::load(&paths_base)),
+        demo,
+        host_live: RwLock::new(Default::default()),
+        host_tokens: RwLock::new(Default::default()),
+        proxy_restart: tokio::sync::Notify::new(),
+        check_upstream: tokio::sync::Notify::new(),
+        crypto: crypto::Crypto::new(),
+        records: records::Records::new(),
+        hardware: RwLock::new(hardware::Fleet::load(&paths_base)),
     });
+    app.load_host_tokens();
+    app.configure_crypto();
+    if let Some(p) = app.crypto.problem() {
+        log::warn!("encryption: {p}");
+    }
+    {
+        let _guard = runtime.enter();
+        records::start(app.clone());
+    }
 
     runtime.spawn(proxy::run(app.clone()));
     runtime.spawn(portal::serve(app.clone(), portal_listener));
     runtime.spawn(s3sync::run(app.clone()));
 
-    if first_run && !headless {
+    if demo {
+        runtime.spawn(demo::fake_lmstudios());
+        runtime.spawn(demo::traffic());
+        println!(
+            "\nToktail demo: open {} (Ctrl-C to stop)\n",
+            app.portal_url()
+        );
+    }
+    if (first_run || demo) && !headless {
         let _ = open_url(&app.portal_url());
     }
 

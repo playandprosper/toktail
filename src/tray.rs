@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Pip in the menu bar: napping when idle, running while tokens stream
 //! (faster with throughput), sprinting during a stampede. The menu shows
-//! today's count, the per-model breakdown, the portal, S3 and quit.
+//! today's count, the per-host and per-model breakdowns, the portal, S3 and
+//! quit. The running can be turned off ("Animate Pip in Menu Bar"): Pip then
+//! sits still, awake while tokens flow and asleep otherwise.
 
 use crate::app::{ago, fmt_compact, fmt_thousands, App};
 use crate::live::PipState;
@@ -43,16 +45,20 @@ struct Ui {
     today: MenuItem,
     requests: MenuItem,
     by_model: Submenu,
+    by_host: Submenu,
+    hosts_line: MenuItem,
+    animate: CheckMenuItem,
     open_portal: MenuItem,
     open_data: MenuItem,
     edit_config: MenuItem,
     sync: MenuItem,
     s3_status: MenuItem,
-    proxy_status: MenuItem,
+    settings: MenuItem,
     login: CheckMenuItem,
     about: MenuItem,
     quit: MenuItem,
     model_lines: Vec<String>,
+    host_lines: Vec<String>,
     last_title: String,
     // Animation state
     shown: Option<usize>, // None = sleeping frame
@@ -153,16 +159,24 @@ impl Ui {
         let today = MenuItem::new("Today: —", false, None);
         let requests = MenuItem::new("Requests today: —", false, None);
         let by_model = Submenu::new("Today by model", true);
+        let by_host = Submenu::new("Today by host", true);
+        let hosts_line = MenuItem::new("Hosts: checking…", false, None);
+        let animate = CheckMenuItem::new(
+            "Animate Pip in Menu Bar",
+            true,
+            app.config.read().app.animate_menu_bar,
+            None,
+        );
         let open_portal = MenuItem::new("Open Portal…", true, None);
         let open_data = MenuItem::new("Open Data Folder", true, None);
+        let settings = MenuItem::new("Settings…", true, None);
         let edit_config = MenuItem::new("Edit Config…", true, None);
         let s3_enabled = app.config.read().s3.enabled;
         let sync = MenuItem::new("Sync to S3 Now", s3_enabled, None);
         let s3_status = MenuItem::new("S3: off", false, None);
-        let proxy_status = MenuItem::new("Proxy: starting…", false, None);
         let login = CheckMenuItem::new(
             "Launch at Login",
-            cfg!(target_os = "macos"),
+            cfg!(target_os = "macos") && !app.demo,
             login::is_enabled(),
             None,
         );
@@ -174,21 +188,31 @@ impl Ui {
         let quit = MenuItem::new("Quit Toktail", true, None);
 
         let menu = Menu::new();
+        if app.demo {
+            menu.append(&MenuItem::new(
+                "Demo mode: sample data and pretend traffic",
+                false,
+                None,
+            ))?;
+        }
         menu.append_items(&[
             &pip_line,
             &PredefinedMenuItem::separator(),
             &today,
             &requests,
+            &by_host,
             &by_model,
             &PredefinedMenuItem::separator(),
             &open_portal,
             &open_data,
+            &settings,
             &edit_config,
             &PredefinedMenuItem::separator(),
             &sync,
             &s3_status,
-            &proxy_status,
+            &hosts_line,
             &PredefinedMenuItem::separator(),
+            &animate,
             &login,
             &about,
             &quit,
@@ -219,13 +243,17 @@ impl Ui {
             open_portal,
             open_data,
             edit_config,
+            settings,
+            by_host,
+            hosts_line,
+            animate,
             sync,
             s3_status,
-            proxy_status,
             login,
             about,
             quit,
             model_lines: Vec::new(),
+            host_lines: Vec::new(),
             last_title: String::new(),
             shown: None,
             frame: 0,
@@ -260,6 +288,14 @@ impl Ui {
                 }
                 return;
             }
+            _ if !app.config.read().app.animate_menu_bar => {
+                // Still, but awake: no running in the menu bar.
+                if self.shown != Some(0) {
+                    self.set_icon(&self.run[0]);
+                    self.shown = Some(0);
+                }
+                return;
+            }
             PipState::Processing => Duration::from_millis(
                 (200.0 - snap.tokens_per_sec.min(200.0) * 0.6).max(80.0) as u64,
             ),
@@ -288,7 +324,8 @@ impl Ui {
             )
         });
         self.today.set_text(format!(
-            "Today: {} out · {} in",
+            "Today: {} tokens ({} out · {} in)",
+            fmt_thousands(out + inp),
             fmt_thousands(out),
             fmt_thousands(inp)
         ));
@@ -302,8 +339,9 @@ impl Ui {
                 .iter()
                 .map(|m| {
                     format!(
-                        "{} — {} out · {} in · {} req",
+                        "{} — {} combined · {} out · {} in · {} req",
                         m.model,
+                        fmt_compact(m.totals.output + m.totals.input),
                         fmt_compact(m.totals.output),
                         fmt_compact(m.totals.input),
                         fmt_thousands(m.totals.requests)
@@ -344,7 +382,7 @@ impl Ui {
 
         let st = app.status.read().clone();
         let s3_text = if !s3_enabled {
-            "S3: off (see Edit Config…)".to_string()
+            "S3: off (see Settings…)".to_string()
         } else if st.s3.in_progress {
             "S3: syncing…".to_string()
         } else if let Some(err) = &st.s3.last_error {
@@ -356,18 +394,67 @@ impl Ui {
             "S3: waiting for first sync".to_string()
         };
         self.s3_status.set_text(s3_text);
-        self.proxy_status.set_text(if st.proxy_ok {
-            format!("✓ {}", st.proxy_msg)
-        } else {
-            format!(
-                "⚠ {}",
-                if st.proxy_msg.is_empty() {
-                    "Proxy starting…"
+        let hosts = app.config.read().hosts.clone();
+        let per_host = app.ledger.with_data(|d| ledger::day_by_host(d, day));
+        let mut healthy = 0;
+        let enabled = hosts.iter().filter(|h| h.enabled).count();
+        let mut lines = Vec::new();
+        for h in &hosts {
+            let hs = st.hosts.get(&h.id).cloned().unwrap_or_default();
+            let t = per_host.get(&h.id).cloned().unwrap_or_default();
+            let ok = h.enabled && hs.proxy_ok && hs.upstream.ok;
+            if ok {
+                healthy += 1;
+            }
+            let mark = if !h.enabled {
+                "○"
+            } else if ok {
+                "✓"
+            } else {
+                "⚠"
+            };
+            let tps = app.live_for(&h.id).snapshot(10).tokens_per_sec;
+            let mut line = format!(
+                "{mark} {} — {} tokens today",
+                h.name,
+                fmt_compact(t.input + t.output)
+            );
+            if tps >= 0.5 {
+                line.push_str(&format!(" · {} tok/s", fmt_thousands(tps.round() as u64)));
+            }
+            if h.enabled && !ok {
+                let why = if !hs.proxy_ok {
+                    hs.proxy_msg.clone()
                 } else {
-                    &st.proxy_msg
+                    hs.upstream.message.clone()
+                };
+                if !why.is_empty() {
+                    line.push_str(&format!(" · {}", why.chars().take(60).collect::<String>()));
                 }
+            }
+            lines.push(line);
+        }
+        if lines != self.host_lines {
+            while self.by_host.remove_at(0).is_some() {}
+            for l in &lines {
+                let _ = self.by_host.append(&MenuItem::new(l, false, None));
+            }
+            self.host_lines = lines;
+        }
+        self.hosts_line.set_text(if enabled == 0 {
+            "Hosts: all turned off".to_string()
+        } else if healthy == enabled {
+            format!(
+                "✓ {healthy} host{} counting",
+                if healthy == 1 { "" } else { "s" }
             )
+        } else {
+            format!("⚠ {healthy} of {enabled} hosts reachable (see Today by host)")
         });
+        if self.animate.is_checked() != app.config.read().app.animate_menu_bar {
+            self.animate
+                .set_checked(app.config.read().app.animate_menu_bar);
+        }
     }
 
     fn on_click(&mut self, app: &Arc<App>, e: MenuEvent) {
@@ -376,6 +463,8 @@ impl Ui {
             open(&app.portal_url(), false);
         } else if id == self.open_data.id() {
             open(&app.ledger.dir().display().to_string(), false);
+        } else if id == self.settings.id() {
+            open(&format!("{}#settings", app.portal_url()), false);
         } else if id == self.edit_config.id() {
             open(&app.paths.config_file.display().to_string(), true);
         } else if id == self.about.id() {
@@ -383,6 +472,15 @@ impl Ui {
         } else if id == self.sync.id() {
             app.sync_now.notify_one();
             self.s3_status.set_text("S3: syncing…");
+        } else if id == self.animate.id() {
+            let want = self.animate.is_checked();
+            let mut c = app.config.write();
+            c.app.animate_menu_bar = want;
+            if let Err(e) = config::save(&app.paths.config_file, &c) {
+                log::warn!("could not save config: {e:#}");
+            }
+            drop(c);
+            self.shown = None;
         } else if id == self.login.id() {
             let want = self.login.is_checked();
             match login::set_enabled(want) {

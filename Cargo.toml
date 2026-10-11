@@ -1,6 +1,6 @@
 [package]
 name = "toktail"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2021"
 description = "Toktail: every token leaves a trail. Counts the tokens your LM Studio host renders, per model per day, into CSV mirrored to S3, with Pip the Token Fox in your menu bar."
 license = "Apache-2.0"
@@ -15,23 +15,27 @@ name = "Toktail"
 path = "src/main.rs"
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow = "1"
+argon2 = "0.5"
+base64 = "0.22"
 axum = "0.8"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1"
 dirs = "6"
+flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
 log = "0.4"
 env_logger = "0.11"
 parking_lot = "0.12"
-reqwest = { version = "0.13", default-features = false, features = ["stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["stream", "native-tls", "blocking"] }
 rust-s3 = { version = "0.38", default-features = false, features = ["tokio-native-tls", "fail-on-err"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "signal", "process"] }
 toml = "0.9"
 uuid = { version = "1", features = ["v4"] }
 tray-icon = "0.26"

@@ -28,16 +28,21 @@ struct Stamp {
     mtime_ms: u128,
 }
 
+/// Runs for the life of the app; syncs while S3 is on (it can be turned on
+/// and off in Settings without a restart).
 pub async fn run(app: Arc<App>) {
-    let cfg = app.config.read().s3.clone();
-    app.status.write().s3.enabled = cfg.enabled;
-    if !cfg.enabled {
-        log::info!("S3 mirror disabled in config.toml");
-        return;
-    }
-    let every = Duration::from_secs(cfg.sync_interval_minutes.max(1) * 60);
+    let mut logged_off = false;
     loop {
-        sync_once(&app).await;
+        let cfg = app.config.read().s3.clone();
+        app.status.write().s3.enabled = cfg.enabled;
+        if cfg.enabled {
+            logged_off = false;
+            sync_once(&app).await;
+        } else if !logged_off {
+            log::info!("S3 mirror is off");
+            logged_off = true;
+        }
+        let every = Duration::from_secs(cfg.sync_interval_minutes.max(1) * 60);
         tokio::select! {
             _ = tokio::time::sleep(every) => {}
             _ = app.sync_now.notified() => {}
@@ -58,9 +63,27 @@ pub async fn sync_once(app: &Arc<App>) {
         }
         s.s3.in_progress = true;
     }
-    let result = upload_changed(app, &cfg).await;
+    let mut result = upload_changed(app, &cfg).await;
+    if let Ok(n) = result {
+        // Saved prompts/responses and the small sealed side files travel too.
+        result = async {
+            let mut n = n;
+            loop {
+                let before = app.records.pending_count();
+                let up = crate::records::upload_pending(app).await?;
+                n += up * 2;
+                if up == 0 || app.records.pending_count() >= before {
+                    break;
+                }
+            }
+            n += upload_side_files(app, &cfg).await?;
+            Ok::<usize, anyhow::Error>(n)
+        }
+        .await;
+    }
     let mut s = app.status.write();
     s.s3.in_progress = false;
+    s.s3.records_pending = app.records.pending_count() as u64;
     match result {
         Ok(n) => {
             if n > 0 {
@@ -84,7 +107,7 @@ pub async fn final_sync(app: &Arc<App>) {
     }
 }
 
-fn bucket(cfg: &S3Config) -> Result<Box<Bucket>> {
+pub fn bucket(cfg: &S3Config) -> Result<Box<Bucket>> {
     if cfg.endpoint.trim().is_empty() || cfg.bucket.trim().is_empty() {
         bail!("set [s3] endpoint and bucket in config.toml");
     }
@@ -114,6 +137,108 @@ fn bucket(cfg: &S3Config) -> Result<Box<Bucket>> {
     } else {
         b
     })
+}
+
+fn current_bucket(app: &App) -> Result<Box<Bucket>> {
+    let cfg = app.config.read().s3.clone();
+    if !cfg.enabled {
+        bail!("S3 is off");
+    }
+    bucket(&cfg)
+}
+
+/// Uploads one object.
+pub async fn put_object(app: &App, key: &str, bytes: &[u8], content_type: &str) -> Result<()> {
+    let b = current_bucket(app)?;
+    b.put_object_with_content_type(key, bytes, content_type)
+        .await
+        .with_context(|| format!("uploading {key}"))?;
+    Ok(())
+}
+
+/// Downloads one object; `None` when it isn't there.
+pub async fn get_object(app: &App, key: &str) -> Result<Option<Vec<u8>>> {
+    let b = current_bucket(app)?;
+    match b.get_object(key).await {
+        Ok(r) => Ok(Some(r.to_vec())),
+        Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(None),
+        Err(e) => Err(anyhow!(e).context(format!("downloading {key}"))),
+    }
+}
+
+/// Deletes one object (missing objects are fine).
+pub async fn delete_object(app: &App, key: &str) -> Result<()> {
+    let b = current_bucket(app)?;
+    match b.delete_object(key).await {
+        Ok(_) | Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(()),
+        Err(e) => Err(anyhow!(e).context(format!("deleting {key}"))),
+    }
+}
+
+/// Checks the S3 settings by writing, reading and deleting a tiny object.
+pub async fn test(cfg: &S3Config) -> Result<String> {
+    let b = bucket(cfg)?;
+    let key = object_key(&cfg.prefix, ".toktail-check");
+    let body = format!("toktail check {}", Local::now().to_rfc3339());
+    b.put_object_with_content_type(&key, body.as_bytes(), "text/plain")
+        .await
+        .context("writing a test object")?;
+    let back = b.get_object(&key).await.context("reading it back")?;
+    let _ = b.delete_object(&key).await;
+    if back.as_slice() != body.as_bytes() {
+        bail!("the bucket returned something different from what was written");
+    }
+    Ok(format!(
+        "Connected to {} / {}",
+        cfg.endpoint.trim(),
+        cfg.bucket.trim()
+    ))
+}
+
+/// hardware.json, the sealed key store and sealed notes: needed to read the
+/// records back on another Mac. All three hold nothing in the clear except
+/// hardware.json, which has no prompts or secrets in it.
+async fn upload_side_files(app: &Arc<App>, cfg: &S3Config) -> Result<usize> {
+    let state_path = app.paths.base.join("s3-side-files.json");
+    let mut state: SyncState = std::fs::read(&state_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let mut n = 0;
+    for (name, key_name) in [
+        ("hardware.json", "hardware.json"),
+        ("keystore.tkt", "records/keystore.tkt"),
+        ("notes.tkt", "records/notes.tkt"),
+    ] {
+        let path = app.paths.base.join(name);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let stamp = Stamp {
+            len: meta.len(),
+            mtime_ms: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+        };
+        if state.files.get(name) == Some(&stamp) {
+            continue;
+        }
+        let bytes = tokio::fs::read(&path).await?;
+        put_object(
+            app,
+            &object_key(&cfg.prefix, key_name),
+            &bytes,
+            "application/octet-stream",
+        )
+        .await?;
+        state.files.insert(name.to_string(), stamp);
+        n += 1;
+    }
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
+    Ok(n)
 }
 
 pub fn object_key(prefix: &str, name: &str) -> String {

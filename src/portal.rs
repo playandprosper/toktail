@@ -2,11 +2,15 @@
 //! The local dashboard ("portal"). Bound to 127.0.0.1 only, with a Host
 //! header check so other websites can't reach it through DNS rebinding.
 //! All page assets are embedded; nothing is loaded from the internet.
+//!
+//! Pages: Dashboard, Prompts (records), Savings (hardware), Settings. The
+//! record and settings endpoints live in portal_records.rs and
+//! portal_settings.rs.
 
 use crate::app::App;
-use crate::config;
 use crate::ledger::{self, Filter};
 use crate::pricing;
+use crate::{portal_records, portal_settings};
 use axum::extract::{Query, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -21,13 +25,58 @@ use std::sync::Arc;
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const PIP_SVG: &str = include_str!("../assets/pip.svg");
-const APP_CSS: &str = include_str!("../assets/app.css");
-const PIP_JS: &str = include_str!("../assets/pip.js");
-const DASHBOARD_JS: &str = include_str!("../assets/dashboard.js");
+/// Page scripts and styles, served from memory.
+const ASSETS: [(&str, &str, &str); 9] = [
+    (
+        "/app.css",
+        "text/css; charset=utf-8",
+        include_str!("../assets/app.css"),
+    ),
+    (
+        "/pip.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/pip.js"),
+    ),
+    (
+        "/common.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/common.js"),
+    ),
+    (
+        "/dashboard.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/dashboard.js"),
+    ),
+    (
+        "/prompts.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/prompts.js"),
+    ),
+    (
+        "/savings.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/savings.js"),
+    ),
+    (
+        "/settings.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/settings.js"),
+    ),
+    (
+        "/stage.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/stage.js"),
+    ),
+    (
+        "/main.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/main.js"),
+    ),
+];
 pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 
 pub fn router(app: Arc<App>) -> Router {
-    Router::new()
+    let mut r = Router::new()
         .route("/", get(index))
         .route("/api/ping", get(ping))
         .route("/api/meta", get(meta))
@@ -38,31 +87,16 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/export.csv", get(export_csv))
         .route("/api/sync", post(sync_now))
         .route("/pip.svg", get(pip_svg))
-        .route(
-            "/app.css",
-            get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS) }),
-        )
-        .route(
-            "/pip.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    PIP_JS,
-                )
-            }),
-        )
-        .route(
-            "/dashboard.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    DASHBOARD_JS,
-                )
-            }),
-        )
         .route("/api/live", get(live))
-        .route("/api/costs", get(costs))
-        .route("/api/settings", get(get_settings).post(set_settings))
+        .route("/api/costs", get(costs));
+    for (path, ct, body) in ASSETS {
+        r = r.route(
+            path,
+            get(move || async move { ([(header::CONTENT_TYPE, ct)], body) }),
+        );
+    }
+    r.merge(portal_settings::routes())
+        .merge(portal_records::routes())
         .layer(middleware::from_fn_with_state(app.clone(), local_only))
         .with_state(app)
 }
@@ -128,16 +162,18 @@ async fn local_only(State(app): State<Arc<App>>, req: Request, next: Next) -> Re
 }
 
 #[derive(Debug, Deserialize)]
-struct Q {
-    from: Option<String>,
-    to: Option<String>,
+pub struct Q {
+    pub from: Option<String>,
+    pub to: Option<String>,
     /// Model names separated by '|'. Absent = all models.
-    models: Option<String>,
-    limit: Option<usize>,
+    pub models: Option<String>,
+    /// Host ids separated by '|'. Absent = all hosts.
+    pub hosts: Option<String>,
+    pub limit: Option<usize>,
 }
 
 impl Q {
-    fn filter(&self) -> Filter {
+    pub fn filter(&self) -> Filter {
         let date = |s: &Option<String>| {
             s.as_deref()
                 .and_then(|d| NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d").ok())
@@ -145,14 +181,17 @@ impl Q {
         Filter {
             from: date(&self.from),
             to: date(&self.to),
-            models: self.models.as_ref().map(|m| {
-                m.split('|')
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect::<HashSet<_>>()
-            }),
+            models: self.models.as_ref().map(|m| split_set(m)),
+            hosts: self.hosts.as_ref().map(|m| split_set(m)),
         }
     }
+}
+
+fn split_set(s: &str) -> HashSet<String> {
+    s.split('|')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 async fn index() -> Html<&'static str> {
@@ -164,8 +203,12 @@ async fn ping() -> Json<serde_json::Value> {
 }
 
 async fn meta(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
-    let (models, first, last, rows, files) = app.ledger.with_data(|d| {
+    let today = Local::now().date_naive();
+    let week_ago = today - chrono::Days::new(6);
+    let (models, first, last, rows, files, per_host) = app.ledger.with_data(|d| {
         let mut per: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
+        // host -> (all time, today, last 7 days, first date, last date)
+        let mut hosts: BTreeMap<String, [ledger::Totals; 3]> = BTreeMap::new();
         let mut first: Option<NaiveDate> = None;
         let mut last: Option<NaiveDate> = None;
         let mut n = 0u64;
@@ -177,31 +220,74 @@ async fn meta(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
             e.2 += 1;
             first = Some(first.map_or(r.date, |f| f.min(r.date)));
             last = Some(last.map_or(r.date, |l| l.max(r.date)));
+            let h = hosts.entry(r.host.to_string()).or_default();
+            h[0].add(r);
+            if r.date == today {
+                h[1].add(r);
+            }
+            if r.date >= week_ago {
+                h[2].add(r);
+            }
         }
         let mut models: Vec<_> = per.into_iter().collect();
-        models.sort_by_key(|m| std::cmp::Reverse(m.1 .0));
+        models.sort_by_key(|m| std::cmp::Reverse(m.1 .0 + m.1 .1));
         let models: Vec<_> = models
             .into_iter()
-            .map(|(m, (o, i, q))| json!({"model": m, "output": o, "input": i, "requests": q}))
+            .map(|(m, (o, i, q))| json!({"model": m, "output": o, "input": i, "combined": o + i, "requests": q}))
             .collect();
-        (models, first, last, n, d.file_names())
+        (models, first, last, n, d.file_names(), hosts)
     });
     let st = app.status.read().clone();
     let cfg = app.config.read().clone();
+    let stampede = app.stampede_tps();
+    let mut hosts: Vec<serde_json::Value> = cfg
+        .hosts
+        .iter()
+        .map(|h| {
+            let t = per_host.get(&h.id).cloned().unwrap_or_default();
+            let hs = st.hosts.get(&h.id).cloned().unwrap_or_default();
+            let snap = app.live_for(&h.id).snapshot(10);
+            json!({
+                "id": h.id, "name": h.name, "enabled": h.enabled, "listen": h.listen,
+                "upstream": crate::proxy::normalize_upstream(&h.upstream).unwrap_or(h.upstream.clone()),
+                "proxy_ok": hs.proxy_ok, "proxy_message": hs.proxy_msg,
+                "lmstudio": { "checked": hs.upstream.checked, "ok": hs.upstream.ok, "message": hs.upstream.message, "models": hs.upstream.models },
+                "all_time": t[0], "today": t[1], "week": t[2],
+                "state": crate::live::pip_state(&snap, stampede),
+                "removed": false,
+            })
+        })
+        .collect();
+    // Hosts that were removed from Settings still have history.
+    for (id, t) in &per_host {
+        if cfg.host(id).is_none() {
+            hosts.push(json!({ "id": id, "name": id, "enabled": false, "removed": true, "all_time": t[0], "today": t[1], "week": t[2], "state": "idle" }));
+        }
+    }
+    let enc_mode = cfg.encryption.mode.clone();
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "repository": REPOSITORY,
         "portal": { "intro_animation": cfg.portal.intro_animation, "pip_roams": cfg.portal.pip_roams },
         "costs_enabled": cfg.costs.show_comparison,
-        "today": Local::now().date_naive(),
+        "today": today,
         "utc_offset_minutes": Local::now().offset().local_minus_utc() / 60,
         "models": models,
+        "hosts": hosts,
+        "max_hosts": crate::config::MAX_HOSTS,
         "first_date": first,
         "last_date": last,
         "rows": rows,
         "files": files,
         "data_dir": app.ledger.dir().display().to_string(),
-        "proxy": { "ok": st.proxy_ok, "message": st.proxy_msg, "listen": cfg.proxy.listen, "upstream": cfg.proxy.upstream },
+        "capture": {
+            "enabled": cfg.capture.enabled,
+            "dir": crate::records::root(&app).display().to_string(),
+            "encryption": enc_mode,
+            "problem": app.crypto.problem(),
+            "error": app.records.errors.lock().clone(),
+            "pending_upload": app.records.pending_count(),
+        },
         "s3": {
             "enabled": st.s3.enabled,
             "in_progress": st.s3.in_progress,
@@ -277,11 +363,41 @@ async fn pip_svg() -> Response {
 #[derive(Debug, Deserialize)]
 struct LiveQ {
     seconds: Option<usize>,
+    host: Option<String>,
 }
 
-/// Pip's pulse: live tokens/sec and mood. Polled about once a second.
+/// Pip's pulse: live tokens/sec and mood, combined and per host. Polled
+/// about once a second.
 async fn live(State(app): State<Arc<App>>, Query(q): Query<LiveQ>) -> Json<serde_json::Value> {
-    let (snap, state) = app.pip(q.seconds.unwrap_or(120));
+    let secs = q.seconds.unwrap_or(120);
+    let stampede = app.stampede_tps();
+    let ids: Vec<String> = app
+        .config
+        .read()
+        .hosts
+        .iter()
+        .map(|h| h.id.clone())
+        .collect();
+    let (snap, state) = match q
+        .host
+        .as_deref()
+        .filter(|h| !h.is_empty() && ids.iter().any(|i| i == h))
+    {
+        Some(h) => {
+            let s = app.live_for(h).snapshot(secs);
+            let st = crate::live::pip_state(&s, stampede);
+            (s, st)
+        }
+        None => app.pip(secs),
+    };
+    let hosts: serde_json::Map<String, serde_json::Value> = ids
+        .iter()
+        .map(|id| {
+            let s = app.live_for(id).snapshot(60);
+            let st = crate::live::pip_state(&s, stampede);
+            (id.clone(), json!({ "state": st, "tokens_per_sec": s.tokens_per_sec, "active_requests": s.active_requests, "per_second": s.per_second, "output_last_minute": s.output_last_minute, "input_last_minute": s.input_last_minute }))
+        })
+        .collect();
     Json(json!({
         "state": state,
         "per_second": snap.per_second,
@@ -290,8 +406,9 @@ async fn live(State(app): State<Arc<App>>, Query(q): Query<LiveQ>) -> Json<serde
         "output_last_minute": snap.output_last_minute,
         "input_last_minute": snap.input_last_minute,
         "seconds_since_activity": snap.seconds_since_activity,
-        "stampede_tps": app.stampede_tps(),
+        "stampede_tps": stampede,
         "typical_tps": app.typical_tps(),
+        "hosts": hosts,
     }))
 }
 
@@ -299,134 +416,36 @@ async fn costs(State(app): State<Arc<App>>, Query(q): Query<Q>) -> Response {
     let f = q.filter();
     let cfg = app.config.read().costs.clone();
     let book = app.prices.read().clone();
-    Json(
-        app.ledger
-            .with_data(|d| pricing::report(d, &f, &book, &cfg)),
-    )
-    .into_response()
-}
-
-fn settings_json(app: &App) -> serde_json::Value {
-    let cfg = app.config.read().clone();
-    let book = app.prices.read();
-    json!({
-        "portal": { "intro_animation": cfg.portal.intro_animation, "pip_roams": cfg.portal.pip_roams },
-        "costs": {
-            "show_comparison": cfg.costs.show_comparison,
-            "baseline": cfg.costs.baseline,
-            "compare": book.compared(&cfg.costs),
-            "electricity_usd_per_kwh": cfg.costs.electricity_usd_per_kwh,
-            "watts_while_generating": cfg.costs.watts_while_generating,
-            "hardware_cost_usd": cfg.costs.hardware_cost_usd,
-        },
-        "app": { "stampede_tokens_per_sec": cfg.app.stampede_tokens_per_sec },
-        "prices": {
-            "as_of": book.as_of,
-            "origin": book.origin,
-            "models": book.models.iter().map(|m| json!({
-                "id": m.id, "provider": m.provider, "name": m.name,
-                "input": m.input, "output": m.output, "per_request": m.per_request, "default": m.default,
-            })).collect::<Vec<_>>(),
-        },
-        "config_file": app.paths.config_file.display().to_string(),
+    let fleet = app.hardware.read().clone();
+    let a = app.clone();
+    let f2 = f.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        a.ledger.with_data(|d| pricing::report(d, &f2, &book, &cfg))
     })
-}
-
-async fn get_settings(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
-    Json(settings_json(&app))
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct SettingsIn {
-    portal: Option<PortalIn>,
-    costs: Option<CostsIn>,
-    app: Option<AppIn>,
-}
-#[derive(Debug, Default, Deserialize)]
-struct PortalIn {
-    intro_animation: Option<bool>,
-    pip_roams: Option<bool>,
-}
-#[derive(Debug, Default, Deserialize)]
-struct CostsIn {
-    show_comparison: Option<bool>,
-    baseline: Option<String>,
-    compare: Option<Vec<String>>,
-    electricity_usd_per_kwh: Option<f64>,
-    watts_while_generating: Option<f64>,
-    hardware_cost_usd: Option<f64>,
-}
-#[derive(Debug, Default, Deserialize)]
-struct AppIn {
-    stampede_tokens_per_sec: Option<f64>,
-}
-
-fn finite_nonneg(v: f64, max: f64) -> Option<f64> {
-    (v.is_finite() && v >= 0.0 && v <= max).then_some(v)
-}
-
-/// Applies settings changed in the portal and writes them to config.toml.
-async fn set_settings(State(app): State<Arc<App>>, Json(body): Json<SettingsIn>) -> Response {
-    let known: Vec<String> = app
-        .prices
-        .read()
-        .models
+    .await;
+    let Ok(report) = report else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    // The hardware's share of this range: each machine's price spread over
+    // its lifecycle, for the days in the range.
+    let today = Local::now().date_naive();
+    let from = f
+        .from
+        .or_else(|| report.daily.first().map(|d| d.date))
+        .unwrap_or(today);
+    let to = f.to.unwrap_or(today).min(today);
+    let machines: Vec<serde_json::Value> = fleet
+        .machines
         .iter()
-        .map(|m| m.id.clone())
+        .filter(|m| f.hosts.as_ref().is_none_or(|h| h.contains(&m.host)))
+        .map(|m| json!({ "name": m.name, "host": m.host, "amortized": m.amortized(from, to, today), "price_usd": m.price_usd, "lifecycle_months": m.lifecycle_months }))
+        .filter(|v| v["amortized"].as_f64().unwrap_or(0.0) > 0.0)
         .collect();
-    let mut cfg = app.config.read().clone();
-    if let Some(p) = body.portal {
-        if let Some(v) = p.intro_animation {
-            cfg.portal.intro_animation = v;
-        }
-        if let Some(v) = p.pip_roams {
-            cfg.portal.pip_roams = v;
-        }
-    }
-    if let Some(c) = body.costs {
-        if let Some(v) = c.show_comparison {
-            cfg.costs.show_comparison = v;
-        }
-        if let Some(v) = c.baseline.filter(|b| known.contains(b)) {
-            cfg.costs.baseline = v;
-        }
-        if let Some(v) = c.compare {
-            cfg.costs.compare = v.into_iter().filter(|id| known.contains(id)).collect();
-        }
-        if let Some(v) = c
-            .electricity_usd_per_kwh
-            .and_then(|v| finite_nonneg(v, 10.0))
-        {
-            cfg.costs.electricity_usd_per_kwh = v;
-        }
-        if let Some(v) = c
-            .watts_while_generating
-            .and_then(|v| finite_nonneg(v, 10_000.0))
-        {
-            cfg.costs.watts_while_generating = v;
-        }
-        if let Some(v) = c
-            .hardware_cost_usd
-            .and_then(|v| finite_nonneg(v, 10_000_000.0))
-        {
-            cfg.costs.hardware_cost_usd = v;
-        }
-    }
-    if let Some(a) = body.app {
-        if let Some(v) = a
-            .stampede_tokens_per_sec
-            .and_then(|v| finite_nonneg(v, 1_000_000.0))
-        {
-            cfg.app.stampede_tokens_per_sec = v;
-        }
-    }
-    if let Err(e) = config::save(&app.paths.config_file, &cfg) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not save settings: {e:#}"),
-        )
-            .into_response();
-    }
-    *app.config.write() = cfg;
-    Json(settings_json(&app)).into_response()
+    let amortized: f64 = machines
+        .iter()
+        .filter_map(|m| m["amortized"].as_f64())
+        .sum();
+    let mut v = serde_json::to_value(&report).unwrap_or_default();
+    v["hardware"] = json!({ "amortized": amortized, "machines": machines, "has_fleet": !fleet.machines.is_empty(), "days": (to - from).num_days() + 1 });
+    Json(v).into_response()
 }

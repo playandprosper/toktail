@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-pub const HEADER: [&str; 14] = [
+pub const HEADER: [&str; 16] = [
     "request_id",
     "timestamp",
     "local_date",
@@ -32,6 +32,8 @@ pub const HEADER: [&str; 14] = [
     "output_tokens_per_sec",
     "usage_source",
     "prompt_sha256",
+    "host",
+    "record",
 ];
 
 /// One finished request, ready to be appended.
@@ -51,6 +53,11 @@ pub struct Record {
     /// "reported" (LM Studio's own count), "estimated" (counted stream deltas) or "none".
     pub usage_source: &'static str,
     pub prompt_sha256: String,
+    /// Which watched host served it.
+    pub host: String,
+    /// Saved prompt/response files, as a path stem under the capture folder
+    /// ("studio/2026/10/11/2026-10-11-14-03-22"). Empty when not captured.
+    pub record: String,
 }
 
 /// Generation time: from first token to end for streams, whole request otherwise.
@@ -86,6 +93,8 @@ pub struct Row {
     pub gen_ms: u64,
     pub source: Arc<str>,
     pub fp: Option<[u8; 32]>,
+    pub host: Arc<str>,
+    pub record: Option<Box<str>>,
 }
 
 impl Row {
@@ -99,7 +108,10 @@ impl Row {
     pub fn fp_hex(&self) -> String {
         self.fp.map(hex::encode).unwrap_or_default()
     }
-    fn to_csv_fields(&self) -> [String; 14] {
+    pub fn tokens_per_sec(&self) -> Option<f64> {
+        tps(self.output, self.gen_ms)
+    }
+    fn to_csv_fields(&self) -> [String; 16] {
         [
             self.request_id.clone(),
             self.timestamp()
@@ -118,6 +130,8 @@ impl Row {
                 .unwrap_or_default(),
             self.source.to_string(),
             self.fp_hex(),
+            self.host.to_string(),
+            self.record.as_deref().unwrap_or("").to_string(),
         ]
     }
 }
@@ -151,6 +165,10 @@ struct CsvRow {
     usage_source: String,
     #[serde(default)]
     prompt_sha256: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    record: String,
 }
 
 #[derive(Default)]
@@ -190,6 +208,8 @@ pub struct Ledger {
     dir: PathBuf,
     data: RwLock<Data>,
     write_lock: Mutex<()>,
+    /// Host for rows written before Toktail tracked more than one host.
+    default_host: String,
 }
 
 pub fn file_name_for(date: NaiveDate) -> String {
@@ -207,15 +227,133 @@ fn meta(path: &Path) -> Option<(u64, Option<SystemTime>)> {
 }
 
 impl Ledger {
-    pub fn open(dir: PathBuf) -> Result<Arc<Ledger>> {
+    pub fn open(dir: PathBuf, default_host: &str) -> Result<Arc<Ledger>> {
         std::fs::create_dir_all(&dir)?;
         let l = Arc::new(Ledger {
             dir,
             data: RwLock::new(Data::default()),
             write_lock: Mutex::new(()),
+            default_host: default_host.to_string(),
         });
+        l.migrate_headers();
         l.refresh(true);
         Ok(l)
+    }
+
+    /// Files from before the `host` and `record` columns get them added once,
+    /// so every file has the same header. Old rows belong to the default host.
+    fn migrate_headers(&self) {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for e in rd.filter_map(|e| e.ok()) {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !is_ledger_file(&name) {
+                continue;
+            }
+            let path = e.path();
+            let header_ok = csv::Reader::from_path(&path)
+                .and_then(|mut r| r.headers().cloned())
+                .map(|h| h.iter().eq(HEADER.iter().copied()))
+                .unwrap_or(true);
+            if header_ok {
+                continue;
+            }
+            let mut tmp = Data::default();
+            match parse_file(&path, &mut tmp, &self.default_host) {
+                Ok((rows, _)) => {
+                    if let Err(e) = write_rows(&path, rows.iter()) {
+                        log::warn!("{name}: could not add the host column: {e:#}");
+                    } else {
+                        log::info!("{name}: added host and record columns");
+                    }
+                }
+                Err(e) => log::warn!("{name}: {e:#}"),
+            }
+        }
+    }
+
+    /// Removes rows by request id, rewriting only the files that hold them.
+    /// Returns how many rows were removed.
+    pub fn delete_rows(&self, ids: &HashSet<String>) -> Result<usize> {
+        self.refresh(true);
+        let _w = self.write_lock.lock();
+        let mut removed = 0;
+        let targets: Vec<(String, Vec<Row>)> = {
+            let data = self.data.read();
+            data.files
+                .iter()
+                .filter(|(_, f)| f.rows.iter().any(|r| ids.contains(&r.request_id)))
+                .map(|(n, f)| {
+                    (
+                        n.clone(),
+                        f.rows
+                            .iter()
+                            .filter(|r| !ids.contains(&r.request_id))
+                            .cloned()
+                            .collect(),
+                    )
+                })
+                .collect()
+        };
+        for (name, keep) in targets {
+            let before = self
+                .data
+                .read()
+                .files
+                .get(&name)
+                .map_or(0, |f| f.rows.len());
+            removed += before - keep.len();
+            write_rows(&self.dir.join(&name), keep.iter())?;
+        }
+        drop(_w);
+        self.refresh(true);
+        Ok(removed)
+    }
+
+    /// Clears the `record` column of these rows (their files were deleted
+    /// but the counts stay). Returns how many rows changed.
+    pub fn forget_records(&self, ids: &HashSet<String>) -> Result<usize> {
+        self.refresh(true);
+        let _w = self.write_lock.lock();
+        let mut changed = 0;
+        let targets: Vec<(String, Vec<Row>)> = {
+            let data = self.data.read();
+            data.files
+                .iter()
+                .filter(|(_, f)| {
+                    f.rows
+                        .iter()
+                        .any(|r| r.record.is_some() && ids.contains(&r.request_id))
+                })
+                .map(|(n, f)| {
+                    let rows = f
+                        .rows
+                        .iter()
+                        .map(|r| {
+                            let mut r = r.clone();
+                            if r.record.is_some() && ids.contains(&r.request_id) {
+                                r.record = None;
+                                changed += 1;
+                            }
+                            r
+                        })
+                        .collect();
+                    (n.clone(), rows)
+                })
+                .collect()
+        };
+        for (name, rows) in targets {
+            write_rows(&self.dir.join(&name), rows.iter())?;
+        }
+        drop(_w);
+        self.refresh(true);
+        Ok(changed)
+    }
+
+    /// One row by request id.
+    pub fn find(&self, id: &str) -> Option<Row> {
+        self.with_data(|d| d.rows().find(|r| r.request_id == id).cloned())
     }
 
     pub fn dir(&self) -> &Path {
@@ -262,6 +400,8 @@ impl Ledger {
                     .unwrap_or_default(),
                 rec.usage_source,
                 &rec.prompt_sha256,
+                &rec.host,
+                &rec.record,
             ])?;
             w.flush()?;
         }
@@ -283,6 +423,7 @@ impl Ledger {
             let model = data.intern(&rec.model);
             let endpoint = data.intern(&rec.endpoint);
             let source = data.intern(rec.usage_source);
+            let host = data.intern(&rec.host);
             let ts = rec.timestamp.fixed_offset();
             let row = Row {
                 request_id: rec.request_id.clone(),
@@ -302,6 +443,8 @@ impl Ledger {
                 gen_ms: gen,
                 source,
                 fp: parse_fp(&rec.prompt_sha256),
+                host,
+                record: (!rec.record.is_empty()).then(|| rec.record.clone().into_boxed_str()),
             };
             let f = data.files.entry(name).or_default();
             f.rows.push(row);
@@ -352,7 +495,7 @@ impl Ledger {
             if fresh {
                 continue;
             }
-            match parse_file(&path, &mut data) {
+            match parse_file(&path, &mut data, &self.default_host) {
                 Ok((rows, bad)) => {
                     if bad > 0 {
                         log::warn!("{name}: skipped {bad} unreadable rows");
@@ -377,7 +520,22 @@ fn parse_fp(s: &str) -> Option<[u8; 32]> {
     v.try_into().ok()
 }
 
-fn parse_file(path: &Path, data: &mut Data) -> Result<(Vec<Row>, usize)> {
+/// Writes rows (with the current header) to `path` atomically.
+fn write_rows<'a>(path: &Path, rows: impl Iterator<Item = &'a Row>) -> Result<()> {
+    let tmp = path.with_extension("csv.tmp");
+    {
+        let mut w = csv::Writer::from_path(&tmp)?;
+        w.write_record(HEADER)?;
+        for r in rows {
+            w.write_record(r.to_csv_fields())?;
+        }
+        w.flush()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn parse_file(path: &Path, data: &mut Data, default_host: &str) -> Result<(Vec<Row>, usize)> {
     let mut rdr = csv::ReaderBuilder::new().flexible(true).from_path(path)?;
     let mut rows = Vec::new();
     let mut bad = 0;
@@ -423,6 +581,13 @@ fn parse_file(path: &Path, data: &mut Data) -> Result<(Vec<Row>, usize)> {
             gen_ms: gen_ms(duration_ms, ttft),
             source: data.intern(source),
             fp: parse_fp(&r.prompt_sha256),
+            host: data.intern(if r.host.trim().is_empty() {
+                default_host
+            } else {
+                r.host.trim()
+            }),
+            record: (!r.record.trim().is_empty())
+                .then(|| r.record.trim().to_string().into_boxed_str()),
         });
     }
     Ok((rows, bad))
@@ -435,6 +600,7 @@ pub struct Filter {
     pub from: Option<NaiveDate>,
     pub to: Option<NaiveDate>,
     pub models: Option<HashSet<String>>,
+    pub hosts: Option<HashSet<String>>,
 }
 
 impl Filter {
@@ -442,6 +608,7 @@ impl Filter {
         self.from.is_none_or(|f| r.date >= f)
             && self.to.is_none_or(|t| r.date <= t)
             && self.models.as_ref().is_none_or(|m| m.contains(&*r.model))
+            && self.hosts.as_ref().is_none_or(|h| h.contains(&*r.host))
     }
 }
 
@@ -478,24 +645,37 @@ impl Totals {
 #[derive(Debug, Serialize)]
 pub struct DailyEntry {
     pub date: NaiveDate,
+    pub host: String,
     pub model: String,
     #[serde(flatten)]
     pub totals: Totals,
 }
 
-/// Totals per (local date, model).
+/// Totals per (local date, host, model), so the portal can split by either.
 pub fn daily(data: &Data, f: &Filter) -> Vec<DailyEntry> {
-    let mut map: BTreeMap<(NaiveDate, Arc<str>), Totals> = BTreeMap::new();
+    let mut map: BTreeMap<(NaiveDate, Arc<str>, Arc<str>), Totals> = BTreeMap::new();
     for r in data.rows().filter(|r| f.matches(r)) {
-        map.entry((r.date, r.model.clone())).or_default().add(r);
+        map.entry((r.date, r.host.clone(), r.model.clone()))
+            .or_default()
+            .add(r);
     }
     map.into_iter()
-        .map(|((date, model), totals)| DailyEntry {
+        .map(|((date, host, model), totals)| DailyEntry {
             date,
+            host: host.to_string(),
             model: model.to_string(),
             totals,
         })
         .collect()
+}
+
+/// Today's totals per host, for the menu bar and the host strip.
+pub fn day_by_host(data: &Data, day: NaiveDate) -> BTreeMap<String, Totals> {
+    let mut map: BTreeMap<String, Totals> = BTreeMap::new();
+    for r in data.rows().filter(|r| r.date == day) {
+        map.entry(r.host.to_string()).or_default().add(r);
+    }
+    map
 }
 
 #[derive(Debug, Serialize)]
@@ -557,7 +737,9 @@ pub fn heatmap(data: &Data, f: &Filter) -> Vec<HeatCell> {
 
 #[derive(Debug, Serialize)]
 pub struct RecentRow {
+    pub request_id: String,
     pub timestamp: String,
+    pub host: String,
     pub model: String,
     pub endpoint: String,
     pub streamed: bool,
@@ -569,17 +751,21 @@ pub struct RecentRow {
     pub tokens_per_sec: Option<f64>,
     pub source: String,
     pub prompt_sha256: String,
+    /// True when the prompt and response were saved.
+    pub captured: bool,
+    /// Their path stem under the capture folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record: Option<String>,
 }
 
-pub fn recent(data: &Data, f: &Filter, limit: usize) -> Vec<RecentRow> {
-    let mut rows: Vec<&Row> = data.rows().filter(|r| f.matches(r)).collect();
-    rows.sort_by_key(|r| std::cmp::Reverse(r.ts_ms));
-    rows.into_iter()
-        .take(limit)
-        .map(|r| RecentRow {
+impl From<&Row> for RecentRow {
+    fn from(r: &Row) -> Self {
+        RecentRow {
+            request_id: r.request_id.clone(),
             timestamp: r
                 .timestamp()
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+            host: r.host.to_string(),
             model: r.model.to_string(),
             endpoint: r.endpoint.to_string(),
             streamed: r.streamed,
@@ -591,8 +777,66 @@ pub fn recent(data: &Data, f: &Filter, limit: usize) -> Vec<RecentRow> {
             tokens_per_sec: tps(r.output, r.gen_ms).map(|t| (t * 10.0).round() / 10.0),
             source: r.source.to_string(),
             prompt_sha256: r.fp_hex(),
-        })
-        .collect()
+            captured: r.record.is_some(),
+            record: r.record.as_deref().map(String::from),
+        }
+    }
+}
+
+pub fn recent(data: &Data, f: &Filter, limit: usize) -> Vec<RecentRow> {
+    let mut rows: Vec<&Row> = data.rows().filter(|r| f.matches(r)).collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.ts_ms));
+    rows.into_iter().take(limit).map(RecentRow::from).collect()
+}
+
+/// A page of requests for the prompt browser, newest first (or by `sort`).
+pub fn page(
+    data: &Data,
+    f: &Filter,
+    keep: impl Fn(&Row) -> bool,
+    sort: &str,
+    offset: usize,
+    limit: usize,
+) -> (usize, Vec<RecentRow>) {
+    let mut rows: Vec<&Row> = data.rows().filter(|r| f.matches(r) && keep(r)).collect();
+    match sort {
+        "oldest" => rows.sort_by_key(|r| r.ts_ms),
+        "output" => rows.sort_by_key(|r| std::cmp::Reverse(r.output)),
+        "input" => rows.sort_by_key(|r| std::cmp::Reverse(r.input)),
+        "fastest" => rows.sort_by(|a, b| {
+            b.tokens_per_sec()
+                .unwrap_or(0.0)
+                .total_cmp(&a.tokens_per_sec().unwrap_or(0.0))
+        }),
+        "slowest" => rows.sort_by(|a, b| {
+            a.tokens_per_sec()
+                .unwrap_or(f64::MAX)
+                .total_cmp(&b.tokens_per_sec().unwrap_or(f64::MAX))
+        }),
+        "longest" => rows.sort_by_key(|r| std::cmp::Reverse(r.duration_ms)),
+        "combined" => rows.sort_by_key(|r| std::cmp::Reverse(r.input + r.output)),
+        _ => rows.sort_by_key(|r| std::cmp::Reverse(r.ts_ms)),
+    }
+    let total = rows.len();
+    (
+        total,
+        rows.into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(RecentRow::from)
+            .collect(),
+    )
+}
+
+/// Where `value` falls among `values` (0 = lowest, 100 = highest).
+pub fn percentile_rank(values: &mut [f64], value: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let below = values.partition_point(|v| *v < value);
+    let equal = values[below..].partition_point(|v| *v <= value);
+    Some(((below as f64 + equal as f64 / 2.0) / values.len() as f64 * 100.0).clamp(0.0, 100.0))
 }
 
 #[derive(Debug, Serialize)]
@@ -701,13 +945,55 @@ mod tests {
             ttft_ms: Some(500),
             usage_source: "reported",
             prompt_sha256: fp.into(),
+            host: "studio".into(),
+            record: String::new(),
         }
+    }
+
+    #[test]
+    fn records_hosts_paging_and_forgetting() {
+        let dir = std::env::temp_dir().join(format!("tl-test-{}", uuid::Uuid::new_v4()));
+        let l = Ledger::open(dir.clone(), "studio").unwrap();
+        let mut a = rec("qwen", 100, 50, "");
+        a.record = "studio/2026/10/11/2026-10-11-14-03-22".into();
+        let mut b = rec("gemma", 300, 10, "");
+        b.host = "mini".into();
+        l.append(&a).unwrap();
+        l.append(&b).unwrap();
+        let f = Filter {
+            hosts: Some(["mini".to_string()].into_iter().collect()),
+            ..Default::default()
+        };
+        let (n, rows) = l.with_data(|d| page(d, &f, |_| true, "newest", 0, 10));
+        assert_eq!((n, rows[0].host.as_str()), (1, "mini"));
+        let (n, rows) = l.with_data(|d| {
+            page(
+                d,
+                &Filter::default(),
+                |r| r.record.is_some(),
+                "combined",
+                0,
+                10,
+            )
+        });
+        assert_eq!(n, 1);
+        assert_eq!(
+            rows[0].record.as_deref(),
+            Some("studio/2026/10/11/2026-10-11-14-03-22")
+        );
+        let ids: HashSet<String> = [a.request_id.clone()].into_iter().collect();
+        assert_eq!(l.forget_records(&ids).unwrap(), 1);
+        let row = l.find(&a.request_id).unwrap();
+        assert!(row.record.is_none());
+        assert_eq!(row.output, 50, "the counts stay");
+        let by = l.with_data(|d| day_by_host(d, Local::now().date_naive()));
+        assert_eq!(by["mini"].input, 300);
     }
 
     #[test]
     fn append_then_read_back_and_detect_external_edits() {
         let dir = std::env::temp_dir().join(format!("tl-test-{}", uuid::Uuid::new_v4()));
-        let l = Ledger::open(dir.clone()).unwrap();
+        let l = Ledger::open(dir.clone(), "studio").unwrap();
         let fp = "ab".repeat(32);
         l.append(&rec("qwen", 100, 50, &fp)).unwrap();
         l.append(&rec("llama, \"quoted\"", 10, 5, &fp)).unwrap();
@@ -719,7 +1005,7 @@ mod tests {
         assert_eq!(by[0].totals.gen_ms, 1500);
 
         // A fresh ledger (cold cache) reads the same numbers from disk.
-        let l2 = Ledger::open(dir.clone()).unwrap();
+        let l2 = Ledger::open(dir.clone(), "studio").unwrap();
         let (n, reps) = l2.with_data(|d| repeats(d, &Filter::default(), 10));
         assert_eq!(n, 1);
         assert_eq!(reps[0].count, 2);
@@ -741,6 +1027,27 @@ mod tests {
         let csv =
             String::from_utf8(l.with_data(|d| export_csv(d, &Filter::default())).unwrap()).unwrap();
         assert!(csv.starts_with("request_id,timestamp"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    #[test]
+    fn old_files_get_host_and_record_columns() {
+        let dir = std::env::temp_dir().join(format!("tl-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tokens-2026-09.csv"),
+            "request_id,timestamp,local_date,model,endpoint,streamed,status,input_tokens,output_tokens,duration_ms,ttft_ms,output_tokens_per_sec,usage_source,prompt_sha256\n\
+             a,2026-09-01T10:00:00.000-07:00,2026-09-01,m,/v1/chat/completions,true,200,10,5,100,10,55.56,reported,\n",
+        )
+        .unwrap();
+        let l = Ledger::open(dir.clone(), "studio").unwrap();
+        let text = std::fs::read_to_string(dir.join("tokens-2026-09.csv")).unwrap();
+        assert!(text.lines().next().unwrap().ends_with("host,record"));
+        assert_eq!(&*l.find("a").unwrap().host, "studio");
         std::fs::remove_dir_all(dir).ok();
     }
 }

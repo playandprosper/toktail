@@ -225,6 +225,38 @@ pub fn content_deltas(v: &Value) -> u64 {
     n
 }
 
+/// The text a streamed event carries: (answer, reasoning).
+pub fn delta_text(v: &Value, content: &mut String, reasoning: &mut String) {
+    let s = |val: Option<&Value>| val.and_then(Value::as_str).map(str::to_string);
+    if let Some(choices) = v.get("choices").and_then(Value::as_array) {
+        for c in choices {
+            let d = c.get("delta");
+            if let Some(t) = s(d.and_then(|d| d.get("content"))).or_else(|| s(c.get("text"))) {
+                content.push_str(&t);
+            }
+            if let Some(t) = s(d.and_then(|d| d.get("reasoning_content")))
+                .or_else(|| s(d.and_then(|d| d.get("reasoning"))))
+            {
+                reasoning.push_str(&t);
+            }
+        }
+    }
+    match v.get("type").and_then(Value::as_str) {
+        Some("response.output_text.delta") => {
+            content.push_str(&s(v.get("delta")).unwrap_or_default())
+        }
+        Some("response.reasoning_text.delta") => {
+            reasoning.push_str(&s(v.get("delta")).unwrap_or_default())
+        }
+        Some("content_block_delta") => {
+            let d = v.get("delta");
+            content.push_str(&s(d.and_then(|d| d.get("text"))).unwrap_or_default());
+            reasoning.push_str(&s(d.and_then(|d| d.get("thinking"))).unwrap_or_default());
+        }
+        _ => {}
+    }
+}
+
 /// Splits an SSE byte stream into events and tracks usage as they pass.
 /// Events are returned verbatim (bytes untouched) unless they are the
 /// usage-only chunk Toktail asked for on the client's behalf.
@@ -236,6 +268,8 @@ pub struct SseTracker {
     pub first_token_at: Option<Instant>,
     /// Drop the final usage-only chunk because the client never asked for it.
     strip_injected_usage: bool,
+    /// When saving responses: the streamed answer and reasoning text.
+    pub text: Option<(String, String)>,
 }
 
 impl SseTracker {
@@ -247,7 +281,14 @@ impl SseTracker {
             deltas: 0,
             first_token_at: None,
             strip_injected_usage,
+            text: None,
         }
+    }
+
+    /// Also collect the streamed text (for saving responses).
+    pub fn collect_text(mut self) -> Self {
+        self.text = Some((String::new(), String::new()));
+        self
     }
 
     /// Feed a chunk from upstream; returns the bytes to forward to the client.
@@ -304,6 +345,9 @@ impl SseTracker {
             self.first_token_at = Some(Instant::now());
         }
         self.deltas += d;
+        if let Some((c, r)) = self.text.as_mut() {
+            delta_text(&v, c, r);
+        }
         if self.strip_injected_usage {
             let empty_choices = v
                 .get("choices")

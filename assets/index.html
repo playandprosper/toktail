@@ -25,146 +25,282 @@
 
 <div class="wrap" id="app">
   <header class="top">
-    <img class="logo" src="/pip.svg" alt="Pip the Token Fox">
-    <div class="brand">
-      <div class="wordmark">Toktail</div>
-      <div class="term" aria-label="Every token leaves a trail"><span class="prompt">$</span> tail -f ~/tokens<span class="caret"></span></div>
-    </div>
+    <a class="brandlink" href="#/dashboard" aria-label="Toktail dashboard">
+      <img class="logo" src="/pip.svg" alt="">
+      <span class="brand">
+        <span class="wordmark">Toktail</span>
+        <span class="term" aria-label="Every token leaves a trail"><span class="prompt">$</span> tail -f ~/tokens<span class="caret"></span></span>
+      </span>
+    </a>
+    <nav class="nav" id="nav" aria-label="Pages">
+      <a href="#/dashboard" data-page="dashboard">Dashboard</a>
+      <a href="#/prompts" data-page="prompts">Prompts</a>
+      <a href="#/savings" data-page="savings">Savings</a>
+      <a href="#/settings" data-page="settings">Settings</a>
+    </nav>
     <div class="status">
-      <span class="pill" id="pill-proxy"><span class="dot"></span><span>Proxy</span></span>
+      <a class="pill clickable" id="pill-hosts" href="#/settings/hosts"><span class="dot"></span><span>Hosts</span></a>
       <span class="pill" id="pill-s3"><span class="dot"></span><span>S3</span></span>
-      <button class="small" id="btn-sync" type="button">Sync to S3 now</button>
+      <button class="small" id="btn-sync" type="button" hidden>Sync now</button>
       <button class="small" id="btn-theme" type="button">Dark mode</button>
-      <button class="small" id="btn-settings" type="button">Settings</button>
     </div>
   </header>
 
-  <div class="filters" role="toolbar" aria-label="Filters">
-    <div class="seg" id="ranges" role="group" aria-label="Date range">
-      <button type="button" data-r="today">Today</button>
-      <button type="button" data-r="7">7 days</button>
-      <button type="button" data-r="30">30 days</button>
-      <button type="button" data-r="90">90 days</button>
-      <button type="button" data-r="mtd">This month</button>
-      <button type="button" data-r="all">All time</button>
-      <button type="button" data-r="custom">Custom</button>
-    </div>
-    <div class="custom" id="custom">
-      <input type="date" id="from" aria-label="From"> <span class="label-sm">to</span> <input type="date" id="to" aria-label="To">
-    </div>
-    <div class="seg" id="metric" role="group" aria-label="Token type">
-      <button type="button" data-m="output">Output tokens</button>
-      <button type="button" data-m="input">Input tokens</button>
-    </div>
-    <div class="chips" id="chips" role="group" aria-label="Models"></div>
-  </div>
+  <!-- ============================================================ dashboard -->
+  <main class="page" data-page="dashboard" id="page-dashboard">
+    <section class="hosts-strip" id="hosts-strip" aria-label="Hosts"></section>
 
-  <section class="hero" id="hero" aria-label="Summary">
-    <div>
-      <p class="hero-lede" id="hero-lede"></p>
-      <div class="hero-num" id="hero-num">0</div>
-      <p class="hero-unit" id="hero-unit"></p>
-    </div>
-    <div class="stats" id="stats"></div>
-  </section>
-
-  <div class="grid2">
-    <section class="card" id="card-daily">
-      <div class="card-head">
-        <div><h2 id="daily-title">Tokens per day by model</h2><div class="sub" id="daily-sub"></div></div>
-        <div class="actions">
-          <button class="small" id="btn-replay" type="button" title="Pip runs along the chart and lights up each day">Replay the trail</button>
-          <button class="small" data-export="daily" type="button">Export SVG</button>
+    <div class="filters" role="toolbar" aria-label="Filters">
+      <div class="seg" id="ranges" role="group" aria-label="Date range">
+        <button type="button" data-r="today">Today</button>
+        <button type="button" data-r="7">7 days</button>
+        <button type="button" data-r="30">30 days</button>
+        <button type="button" data-r="90">90 days</button>
+        <button type="button" data-r="mtd">This month</button>
+        <button type="button" data-r="all">All time</button>
+        <button type="button" data-r="custom">Custom</button>
+      </div>
+      <div class="custom" id="custom">
+        <input type="date" id="from" aria-label="From"> <span class="label-sm">to</span> <input type="date" id="to" aria-label="To">
+      </div>
+      <div class="metric-ctl" id="metric-ctl">
+        <span class="label-sm">Tokens in <span class="mk">◆</span> charts</span>
+        <div class="seg" id="metric" role="group" aria-label="Which tokens the marked charts show">
+          <button type="button" data-m="combined">Combined</button>
+          <button type="button" data-m="output">Output</button>
+          <button type="button" data-m="input">Input</button>
         </div>
       </div>
-      <div class="legend" id="legend-daily"></div>
-      <div class="chart" id="chart-daily"></div>
-    </section>
-    <section class="card">
-      <div class="card-head"><div><h2>Pip noticed</h2><div class="sub">Worked out from your CSV for this range</div></div></div>
-      <ul class="insights" id="insights"></ul>
-    </section>
-  </div>
-
-  <section class="card costs" id="card-costs" hidden>
-    <div class="card-head">
-      <div><h2>What your tokens would cost in the cloud</h2><div class="sub" id="costs-sub"></div></div>
-      <div class="actions">
-        <label class="label-sm" for="baseline">Compare with</label>
-        <select id="baseline"></select>
-        <button class="small" data-export="costbars" type="button">Export SVG</button>
+      <div class="seg" id="split" role="group" aria-label="Break charts down by">
+        <button type="button" data-s="model">By model</button>
+        <button type="button" data-s="host">By host</button>
       </div>
+      <div class="chips" id="chips" role="group" aria-label="Models"></div>
     </div>
-    <p class="lead" id="costs-lead"></p>
-    <p class="why" id="costs-why"></p>
-    <div class="costs-grid">
+
+    <section class="hero" id="hero" aria-label="Summary">
+      <div class="hero-main" id="hero-main">
+        <p class="hero-lede" id="hero-lede"></p>
+        <div class="hero-num" id="hero-num">0</div>
+        <p class="hero-unit" id="hero-unit"></p>
+      </div>
+      <div class="stats" id="stats"></div>
+    </section>
+
+    <div class="grid2">
+      <section class="card metric-aware" id="card-daily">
+        <div class="card-head">
+          <div><h2 id="daily-title">Tokens per day</h2><div class="sub" id="daily-sub"></div></div>
+          <div class="actions">
+            <button class="small" id="btn-replay" type="button" title="Pip runs along the chart and lights up each day">Replay the trail</button>
+            <button class="small" data-export="daily" type="button">Export SVG</button>
+          </div>
+        </div>
+        <div class="legend" id="legend-daily"></div>
+        <div class="chart" id="chart-daily"></div>
+      </section>
+      <section class="card" id="card-insights">
+        <div class="card-head"><div><h2>Pip noticed</h2><div class="sub">Worked out from your CSV for this range</div></div></div>
+        <ul class="insights" id="insights"></ul>
+      </section>
+    </div>
+
+    <section class="card costs" id="card-costs" hidden>
+      <div class="card-head">
+        <div><h2>Cloud price against what your hosts cost</h2><div class="sub" id="costs-sub"></div></div>
+        <div class="actions">
+          <label class="label-sm" for="baseline">Compare with</label>
+          <select id="baseline"></select>
+          <button class="small" data-export="costbars" type="button">Export SVG</button>
+        </div>
+      </div>
+      <p class="lead" id="costs-lead"></p>
+      <p class="why" id="costs-why"></p>
+      <div class="cost-vs" id="cost-vs"></div>
+      <div class="costs-grid">
+        <div>
+          <div class="legend" id="legend-costbars"></div>
+          <div class="chart" id="chart-costbars"></div>
+        </div>
+        <div>
+          <div class="card-head" style="margin:0 0 4px"><div><h2 id="costcum-title">Running total</h2><div class="sub">Cloud price against your hosts' hardware share and electricity, day by day</div></div>
+            <div class="actions"><button class="small" data-export="costcum" type="button">Export SVG</button></div></div>
+          <div class="legend" id="legend-costcum"></div>
+          <div class="chart" id="chart-costcum"></div>
+        </div>
+      </div>
+      <div class="tbl" id="costs-table" style="margin-top:16px"></div>
+      <div class="notes" id="costs-notes"></div>
+    </section>
+
+    <div class="grid2b">
+      <section class="card metric-aware" id="card-models">
+        <div class="card-head">
+          <div><h2 id="models-title">Share</h2><div class="sub" id="models-sub"></div></div>
+          <div class="actions"><button class="small" data-export="models" type="button">Export SVG</button></div>
+        </div>
+        <div class="chart" id="chart-models"></div>
+      </section>
+      <section class="card" id="card-speed">
+        <div class="card-head">
+          <div><h2>Generation speed</h2><div class="sub" id="speed-sub">Output tokens per second, per day</div></div>
+          <div class="actions"><button class="small" data-export="speed" type="button">Export SVG</button></div>
+        </div>
+        <div class="legend" id="legend-speed"></div>
+        <div class="chart" id="chart-speed"></div>
+      </section>
+    </div>
+
+    <div class="grid2b">
+      <section class="card" id="card-cumulative">
+        <div class="card-head">
+          <div><h2>Running total</h2><div class="sub">Combined, input and output tokens added up across the range</div></div>
+          <div class="actions"><button class="small" data-export="cumulative" type="button">Export SVG</button></div>
+        </div>
+        <div class="legend" id="legend-cum"></div>
+        <div class="chart" id="chart-cumulative"></div>
+      </section>
+      <section class="card metric-aware" id="card-heat">
+        <div class="card-head">
+          <div><h2 id="heat-title">When your hosts work</h2><div class="sub">Weekday and hour of day, local time</div></div>
+          <div class="actions"><button class="small" data-export="heat" type="button">Export SVG</button></div>
+        </div>
+        <div class="chart" id="chart-heat"></div>
+      </section>
+    </div>
+
+    <section class="card" id="card-table">
+      <div class="card-head">
+        <div class="tabs" role="tablist" id="tabs">
+          <button type="button" role="tab" data-t="daily" aria-selected="true">Daily</button>
+          <button type="button" role="tab" data-t="recent" aria-selected="false">Recent requests</button>
+          <button type="button" role="tab" data-t="repeats" aria-selected="false">Repeated prompts</button>
+        </div>
+        <div class="actions">
+          <button class="small" id="btn-table-csv" type="button">Download this table</button>
+          <button class="small" id="btn-raw-csv" type="button">Download raw CSV</button>
+        </div>
+      </div>
+      <div class="tbl" id="table"></div>
+    </section>
+
+    <div class="foot" id="foot"></div>
+  </main>
+
+  <!-- ============================================================ prompts -->
+  <main class="page" data-page="prompts" id="page-prompts" hidden>
+    <div class="page-head">
       <div>
-        <div class="legend" id="legend-costbars"></div>
-        <div class="chart" id="chart-costbars"></div>
+        <h1>Prompts</h1>
+        <p class="page-sub" id="prompts-sub">Every saved prompt and response, with how it performed.</p>
       </div>
-      <div>
-        <div class="card-head" style="margin:0 0 4px"><div><h2 id="costcum-title">Running total</h2><div class="sub">Cloud price against your electricity, day by day</div></div>
-          <div class="actions"><button class="small" data-export="costcum" type="button">Export SVG</button></div></div>
-        <div class="legend" id="legend-costcum"></div>
-        <div class="chart" id="chart-costcum"></div>
+      <div class="seg" id="prompts-mode" role="group" aria-label="Prompts view">
+        <button type="button" data-v="records">Records</button>
+        <button type="button" data-v="chat">New chat</button>
       </div>
     </div>
-    <div class="tbl" id="costs-table" style="margin-top:16px"></div>
-    <div class="notes" id="costs-notes"></div>
-  </section>
+    <div class="banner" id="prompts-banner" hidden></div>
 
-  <div class="grid2b">
-    <section class="card" id="card-models">
-      <div class="card-head">
-        <div><h2 id="models-title">Share by model</h2><div class="sub" id="models-sub"></div></div>
-        <div class="actions"><button class="small" data-export="models" type="button">Export SVG</button></div>
+    <section id="records-view">
+      <div class="rec-filters card" id="rec-filters">
+        <input type="search" id="rec-search" placeholder="Search model, title, tag, note or fingerprint" aria-label="Search records">
+        <select id="rec-host" aria-label="Host"></select>
+        <select id="rec-model" aria-label="Model"></select>
+        <select id="rec-range" aria-label="Date range">
+          <option value="all">All time</option><option value="today">Today</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option><option value="365">1 year</option>
+        </select>
+        <select id="rec-sort" aria-label="Sort">
+          <option value="newest">Newest first</option><option value="oldest">Oldest first</option><option value="combined">Most tokens</option><option value="output">Most output</option><option value="input">Most input</option><option value="fastest">Fastest</option><option value="slowest">Slowest</option><option value="longest">Longest</option>
+        </select>
+        <label class="inline"><input type="checkbox" id="rec-starred"> Starred</label>
+        <label class="inline" title="Include requests whose prompt and response weren't saved"><input type="checkbox" id="rec-all"> Unsaved too</label>
       </div>
-      <div class="chart" id="chart-models"></div>
-    </section>
-    <section class="card" id="card-speed">
-      <div class="card-head">
-        <div><h2>Generation speed</h2><div class="sub">Output tokens per second, per model, per day</div></div>
-        <div class="actions"><button class="small" data-export="speed" type="button">Export SVG</button></div>
+      <div class="rec-layout">
+        <section class="card rec-list" id="rec-list-card">
+          <div class="card-head">
+            <div><h2 id="rec-count">Records</h2><div class="sub" id="rec-count-sub"></div></div>
+            <div class="actions">
+              <button class="small" id="rec-select-all" type="button">Select page</button>
+              <button class="small danger" id="rec-bulk-delete" type="button" disabled>Delete selected</button>
+            </div>
+          </div>
+          <div class="rec-items" id="rec-items" role="listbox" aria-label="Records"></div>
+          <div class="rec-more"><button class="small" id="rec-more" type="button" hidden>Load more</button></div>
+        </section>
+        <section class="card rec-detail" id="rec-detail" aria-live="polite">
+          <div class="empty">Pick a record to see its prompt, response and how it performed.</div>
+        </section>
       </div>
-      <div class="legend" id="legend-speed"></div>
-      <div class="chart" id="chart-speed"></div>
     </section>
-  </div>
 
-  <div class="grid2b">
-    <section class="card" id="card-cumulative">
-      <div class="card-head">
-        <div><h2>Running total</h2><div class="sub">Input and output tokens added up across the range</div></div>
-        <div class="actions"><button class="small" data-export="cumulative" type="button">Export SVG</button></div>
+    <section id="chat-view" hidden>
+      <div class="chat card" id="chat-card">
+        <div class="chat-bar">
+          <label class="label-sm" for="chat-host">Host</label>
+          <select id="chat-host"></select>
+          <label class="label-sm" for="chat-model">Model</label>
+          <select id="chat-model"></select>
+          <label class="label-sm" for="chat-temp">Temperature</label>
+          <input type="number" id="chat-temp" min="0" max="2" step="0.1" value="0.7">
+          <button class="small" id="chat-system-btn" type="button">System prompt</button>
+          <button class="small" id="chat-clear" type="button">New conversation</button>
+        </div>
+        <textarea id="chat-system" class="chat-system" placeholder="Optional system prompt" hidden></textarea>
+        <div class="chat-log" id="chat-log" aria-live="polite"></div>
+        <form class="chat-input" id="chat-form">
+          <textarea id="chat-text" rows="2" placeholder="Message your model. Enter sends, Shift+Enter adds a line." aria-label="Message"></textarea>
+          <button type="submit" class="primary" id="chat-send">Send</button>
+        </form>
+        <div class="chat-foot label-sm" id="chat-foot">Sent through Toktail, so every token is counted.</div>
       </div>
-      <div class="legend" id="legend-cum"></div>
-      <div class="chart" id="chart-cumulative"></div>
     </section>
-    <section class="card" id="card-heat">
-      <div class="card-head">
-        <div><h2 id="heat-title">When your host works</h2><div class="sub">Weekday and hour of day, local time</div></div>
-        <div class="actions"><button class="small" data-export="heat" type="button">Export SVG</button></div>
-      </div>
-      <div class="chart" id="chart-heat"></div>
-    </section>
-  </div>
+  </main>
 
-  <section class="card">
-    <div class="card-head">
-      <div class="tabs" role="tablist" id="tabs">
-        <button type="button" role="tab" data-t="daily" aria-selected="true">Daily by model</button>
-        <button type="button" role="tab" data-t="recent" aria-selected="false">Recent requests</button>
-        <button type="button" role="tab" data-t="repeats" aria-selected="false">Repeated prompts</button>
+  <!-- ============================================================ savings -->
+  <main class="page" data-page="savings" id="page-savings" hidden>
+    <div class="page-head">
+      <div>
+        <h1>Savings</h1>
+        <p class="page-sub">What your own hardware saves against public API prices, month by month, over its lifecycle.</p>
       </div>
       <div class="actions">
-        <button class="small" id="btn-table-csv" type="button">Download this table</button>
-        <button class="small" id="btn-raw-csv" type="button">Download raw CSV</button>
+        <select id="sav-baseline" aria-label="Compare with"></select>
+        <button class="primary" id="hw-add" type="button">Add hardware</button>
       </div>
     </div>
-    <div class="tbl" id="table"></div>
-  </section>
+    <section class="sav-hero card" id="sav-hero"></section>
+    <section class="machines" id="machines"></section>
+    <section class="card" id="card-sav-monthly">
+      <div class="card-head">
+        <div><h2>Month by month</h2><div class="sub" id="sav-monthly-sub">Cloud price of your tokens against hardware share and electricity</div></div>
+        <div class="actions">
+          <div class="seg" id="sav-period" role="group" aria-label="Period">
+            <button type="button" data-p="monthly">Monthly</button>
+            <button type="button" data-p="yearly">Yearly</button>
+          </div>
+          <button class="small" data-export="savings" type="button">Export SVG</button>
+        </div>
+      </div>
+      <div class="legend" id="legend-savings"></div>
+      <div class="chart" id="chart-savings"></div>
+      <div class="tbl" id="sav-table" style="margin-top:14px"></div>
+      <div class="notes" id="sav-notes"></div>
+    </section>
+  </main>
 
-  <div class="foot" id="foot"></div>
+  <!-- ============================================================ settings -->
+  <main class="page" data-page="settings" id="page-settings" hidden>
+    <div class="page-head">
+      <div>
+        <h1>Settings</h1>
+        <p class="page-sub" id="settings-sub">Changes apply right away. Secrets go to your Mac's Keychain, never to a file.</p>
+      </div>
+    </div>
+    <div class="settings-layout">
+      <nav class="settings-nav" id="settings-nav" aria-label="Settings sections"></nav>
+      <div class="settings-body" id="settings-body"></div>
+    </div>
+  </main>
 </div>
 
 <div class="trail" id="trail" aria-label="Pip's trail">
@@ -172,20 +308,23 @@
   <div class="trail-tag">Every token leaves a trail.</div>
 </div>
 
-<dialog class="settings" id="settings" aria-labelledby="settings-title">
-  <form method="dialog" id="settings-form">
-    <header><img src="/pip.svg" alt=""><h2 id="settings-title">Settings</h2></header>
-    <div class="body" id="settings-body"></div>
-    <footer>
-      <button type="button" id="settings-cancel">Cancel</button>
-      <button type="submit" class="primary" id="settings-save">Save settings</button>
-    </footer>
+<dialog class="modal" id="modal" aria-labelledby="modal-title">
+  <form method="dialog" id="modal-form">
+    <header><img src="/pip.svg" alt=""><h2 id="modal-title"></h2></header>
+    <div class="body" id="modal-body"></div>
+    <footer id="modal-foot"></footer>
   </form>
 </dialog>
 
 <div id="tip" role="status" aria-live="polite"></div>
 <div class="toast" id="toast" role="status"></div>
 <script src="/pip.js"></script>
+<script src="/common.js"></script>
 <script src="/dashboard.js"></script>
+<script src="/prompts.js"></script>
+<script src="/savings.js"></script>
+<script src="/settings.js"></script>
+<script src="/stage.js"></script>
+<script src="/main.js"></script>
 </body>
 </html>

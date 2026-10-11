@@ -7,8 +7,8 @@ Thanks for helping Pip count tokens.
 ```sh
 git clone https://github.com/playandprosper/toktail
 cd toktail
-cargo test
-TOKTAIL_HOME=/tmp/toktail-dev cargo run -- --headless
+make demo        # sample data and pretend traffic
+make test
 ```
 
 `--headless` runs the proxy, the portal and the S3 mirror without the menu
@@ -24,8 +24,7 @@ portal. `TOKTAIL_HOME` keeps your development data away from your real CSV.
 - The portal stays local. No CDNs, no web fonts, no analytics; everything it
   needs is embedded in the binary.
 - Respect `prefers-reduced-motion`. Pip can sit still.
-- Before opening a pull request: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`
-  and `cargo test`.
+- Before opening a pull request: `make fmt lint test`.
 
 ## Prices
 

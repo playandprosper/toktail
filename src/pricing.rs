@@ -99,7 +99,7 @@ impl PublicModel {
         r
     }
 
-    fn cost_of(&self, r: &Row) -> (f64, f64, f64) {
+    pub fn cost_of(&self, r: &Row) -> (f64, f64, f64) {
         let (i, o) = self.rates(r.date, r.input);
         (
             r.input as f64 * i / 1e6,
@@ -210,7 +210,7 @@ pub struct CostReport {
     pub daily: Vec<DayCost>,
 }
 
-fn is_embedding(r: &Row) -> bool {
+pub fn is_embedding(r: &Row) -> bool {
     r.endpoint.contains("embedding")
 }
 
