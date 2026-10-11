@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Transparent reverse proxy in front of LM Studio.
 //!
-//! Clients keep talking to port 1234; TokenLedger forwards every request to
+//! Clients keep talking to port 1234; Toktail forwards every request to
 //! LM Studio unchanged and, for inference endpoints, reads the token usage
 //! from the response on its way back. Only counts, timings, the model name
 //! and a SHA-256 fingerprint of the prompt are recorded. Request and response
@@ -131,8 +132,8 @@ fn forward_response_headers(src: &HeaderMap) -> HeaderMap {
 fn bad_gateway(upstream: &str, e: impl std::fmt::Display) -> Response {
     let body = serde_json::json!({
         "error": {
-            "message": format!("TokenLedger could not reach LM Studio at {upstream}: {e}"),
-            "type": "tokenledger_upstream_unreachable"
+            "message": format!("Toktail could not reach LM Studio at {upstream}: {e}"),
+            "type": "toktail_upstream_unreachable"
         }
     });
     (StatusCode::BAD_GATEWAY, axum::Json(body)).into_response()
@@ -161,6 +162,8 @@ async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
     };
 
     let tracked = kind.and_then(|kind| prepare(kind, &path, &mut body_bytes, started));
+    // Counts this request as in flight (for Pip) until the guard is dropped.
+    let in_flight = tracked.as_ref().map(|_| ctx.app.live.begin());
 
     let url = format!("{}{}", ctx.upstream, path_q);
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
@@ -194,7 +197,7 @@ async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
     };
 
     if is_sse {
-        stream_and_count(ctx, t, status, headers, resp)
+        stream_and_count(ctx, t, status, headers, resp, in_flight)
     } else {
         // Non-streamed JSON (or an error body): read it whole, count, return it.
         let bytes = match resp.bytes().await {
@@ -209,6 +212,7 @@ async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
         }
         let duration = t.started.elapsed();
         record(&ctx.app, &t, model, status.as_u16(), u, 0, None, duration);
+        drop(in_flight);
         let mut r = Response::new(Body::from(bytes));
         *r.status_mut() = status;
         *r.headers_mut() = headers;
@@ -271,6 +275,7 @@ fn stream_and_count(
     status: StatusCode,
     headers: HeaderMap,
     resp: reqwest::Response,
+    in_flight: Option<crate::live::ActiveGuard>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
@@ -281,7 +286,11 @@ fn stream_and_count(
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(c) => {
+                    let before = tracker.deltas;
                     let out = tracker.push(&c);
+                    if tracker.deltas > before {
+                        ctx.app.live.add(tracker.deltas - before, 0);
+                    }
                     if !out.is_empty() && tx.send(Ok(Bytes::from(out))).await.is_err() {
                         client_gone = true;
                         break;
@@ -320,6 +329,7 @@ fn stream_and_count(
             ttft,
             duration,
         );
+        drop(in_flight);
     });
     let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
@@ -348,6 +358,9 @@ fn record(
     } else {
         (0, 0, "none")
     };
+    // Live meter: streamed deltas were counted as they passed; add the rest
+    // (the reported total may differ from the delta count) and the prompt.
+    app.live.add(output.saturating_sub(deltas), input);
     let rec = Record {
         request_id: uuid::Uuid::new_v4().to_string(),
         timestamp: Local::now(),

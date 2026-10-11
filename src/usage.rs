@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Pure functions for reading token usage out of LM Studio traffic and for
 //! fingerprinting prompts. Nothing here does I/O, so it is unit-tested below.
 
@@ -226,7 +227,7 @@ pub fn content_deltas(v: &Value) -> u64 {
 
 /// Splits an SSE byte stream into events and tracks usage as they pass.
 /// Events are returned verbatim (bytes untouched) unless they are the
-/// usage-only chunk TokenLedger asked for on the client's behalf.
+/// usage-only chunk Toktail asked for on the client's behalf.
 pub struct SseTracker {
     buf: Vec<u8>,
     pub usage: Usage,

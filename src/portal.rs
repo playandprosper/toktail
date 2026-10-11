@@ -1,9 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The local dashboard ("portal"). Bound to 127.0.0.1 only, with a Host
 //! header check so other websites can't reach it through DNS rebinding.
 //! All page assets are embedded; nothing is loaded from the internet.
 
 use crate::app::App;
+use crate::config;
 use crate::ledger::{self, Filter};
+use crate::pricing;
 use axum::extract::{Query, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -17,6 +20,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
+const PIP_SVG: &str = include_str!("../assets/pip.svg");
+const APP_CSS: &str = include_str!("../assets/app.css");
+const PIP_JS: &str = include_str!("../assets/pip.js");
+const DASHBOARD_JS: &str = include_str!("../assets/dashboard.js");
+pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
@@ -29,6 +37,32 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/repeats", get(repeats))
         .route("/api/export.csv", get(export_csv))
         .route("/api/sync", post(sync_now))
+        .route("/pip.svg", get(pip_svg))
+        .route(
+            "/app.css",
+            get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS) }),
+        )
+        .route(
+            "/pip.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    PIP_JS,
+                )
+            }),
+        )
+        .route(
+            "/dashboard.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    DASHBOARD_JS,
+                )
+            }),
+        )
+        .route("/api/live", get(live))
+        .route("/api/costs", get(costs))
+        .route("/api/settings", get(get_settings).post(set_settings))
         .layer(middleware::from_fn_with_state(app.clone(), local_only))
         .with_state(app)
 }
@@ -72,7 +106,7 @@ async fn local_only(State(app): State<Arc<App>>, req: Request, next: Next) -> Re
     if !host_ok || !origin_ok {
         return (
             StatusCode::FORBIDDEN,
-            "TokenLedger's portal only answers on this Mac.",
+            "Toktail's portal only answers on this Mac.",
         )
             .into_response();
     }
@@ -126,7 +160,7 @@ async fn index() -> Html<&'static str> {
 }
 
 async fn ping() -> Json<serde_json::Value> {
-    Json(json!({ "app": "tokenledger", "version": env!("CARGO_PKG_VERSION") }))
+    Json(json!({ "app": "toktail", "version": env!("CARGO_PKG_VERSION") }))
 }
 
 async fn meta(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
@@ -145,7 +179,7 @@ async fn meta(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
             last = Some(last.map_or(r.date, |l| l.max(r.date)));
         }
         let mut models: Vec<_> = per.into_iter().collect();
-        models.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        models.sort_by_key(|m| std::cmp::Reverse(m.1 .0));
         let models: Vec<_> = models
             .into_iter()
             .map(|(m, (o, i, q))| json!({"model": m, "output": o, "input": i, "requests": q}))
@@ -156,6 +190,9 @@ async fn meta(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
     let cfg = app.config.read().clone();
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "repository": REPOSITORY,
+        "portal": { "intro_animation": cfg.portal.intro_animation, "pip_roams": cfg.portal.pip_roams },
+        "costs_enabled": cfg.costs.show_comparison,
         "today": Local::now().date_naive(),
         "utc_offset_minutes": Local::now().offset().local_minus_utc() / 60,
         "models": models,
@@ -203,7 +240,7 @@ async fn export_csv(State(app): State<Arc<App>>, Query(q): Query<Q>) -> Response
     match app.ledger.with_data(|d| ledger::export_csv(d, &f)) {
         Ok(bytes) => {
             let name = format!(
-                "tokenledger-{}-to-{}.csv",
+                "toktail-{}-to-{}.csv",
                 f.from
                     .map(|d| d.to_string())
                     .unwrap_or_else(|| "start".into()),
@@ -231,4 +268,165 @@ async fn sync_now(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
         app.sync_now.notify_one();
     }
     Json(json!({ "triggered": enabled }))
+}
+
+async fn pip_svg() -> Response {
+    ([(header::CONTENT_TYPE, "image/svg+xml")], PIP_SVG).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct LiveQ {
+    seconds: Option<usize>,
+}
+
+/// Pip's pulse: live tokens/sec and mood. Polled about once a second.
+async fn live(State(app): State<Arc<App>>, Query(q): Query<LiveQ>) -> Json<serde_json::Value> {
+    let (snap, state) = app.pip(q.seconds.unwrap_or(120));
+    Json(json!({
+        "state": state,
+        "per_second": snap.per_second,
+        "tokens_per_sec": snap.tokens_per_sec,
+        "active_requests": snap.active_requests,
+        "output_last_minute": snap.output_last_minute,
+        "input_last_minute": snap.input_last_minute,
+        "seconds_since_activity": snap.seconds_since_activity,
+        "stampede_tps": app.stampede_tps(),
+        "typical_tps": app.typical_tps(),
+    }))
+}
+
+async fn costs(State(app): State<Arc<App>>, Query(q): Query<Q>) -> Response {
+    let f = q.filter();
+    let cfg = app.config.read().costs.clone();
+    let book = app.prices.read().clone();
+    Json(
+        app.ledger
+            .with_data(|d| pricing::report(d, &f, &book, &cfg)),
+    )
+    .into_response()
+}
+
+fn settings_json(app: &App) -> serde_json::Value {
+    let cfg = app.config.read().clone();
+    let book = app.prices.read();
+    json!({
+        "portal": { "intro_animation": cfg.portal.intro_animation, "pip_roams": cfg.portal.pip_roams },
+        "costs": {
+            "show_comparison": cfg.costs.show_comparison,
+            "baseline": cfg.costs.baseline,
+            "compare": book.compared(&cfg.costs),
+            "electricity_usd_per_kwh": cfg.costs.electricity_usd_per_kwh,
+            "watts_while_generating": cfg.costs.watts_while_generating,
+            "hardware_cost_usd": cfg.costs.hardware_cost_usd,
+        },
+        "app": { "stampede_tokens_per_sec": cfg.app.stampede_tokens_per_sec },
+        "prices": {
+            "as_of": book.as_of,
+            "origin": book.origin,
+            "models": book.models.iter().map(|m| json!({
+                "id": m.id, "provider": m.provider, "name": m.name,
+                "input": m.input, "output": m.output, "per_request": m.per_request, "default": m.default,
+            })).collect::<Vec<_>>(),
+        },
+        "config_file": app.paths.config_file.display().to_string(),
+    })
+}
+
+async fn get_settings(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    Json(settings_json(&app))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SettingsIn {
+    portal: Option<PortalIn>,
+    costs: Option<CostsIn>,
+    app: Option<AppIn>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct PortalIn {
+    intro_animation: Option<bool>,
+    pip_roams: Option<bool>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct CostsIn {
+    show_comparison: Option<bool>,
+    baseline: Option<String>,
+    compare: Option<Vec<String>>,
+    electricity_usd_per_kwh: Option<f64>,
+    watts_while_generating: Option<f64>,
+    hardware_cost_usd: Option<f64>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct AppIn {
+    stampede_tokens_per_sec: Option<f64>,
+}
+
+fn finite_nonneg(v: f64, max: f64) -> Option<f64> {
+    (v.is_finite() && v >= 0.0 && v <= max).then_some(v)
+}
+
+/// Applies settings changed in the portal and writes them to config.toml.
+async fn set_settings(State(app): State<Arc<App>>, Json(body): Json<SettingsIn>) -> Response {
+    let known: Vec<String> = app
+        .prices
+        .read()
+        .models
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    let mut cfg = app.config.read().clone();
+    if let Some(p) = body.portal {
+        if let Some(v) = p.intro_animation {
+            cfg.portal.intro_animation = v;
+        }
+        if let Some(v) = p.pip_roams {
+            cfg.portal.pip_roams = v;
+        }
+    }
+    if let Some(c) = body.costs {
+        if let Some(v) = c.show_comparison {
+            cfg.costs.show_comparison = v;
+        }
+        if let Some(v) = c.baseline.filter(|b| known.contains(b)) {
+            cfg.costs.baseline = v;
+        }
+        if let Some(v) = c.compare {
+            cfg.costs.compare = v.into_iter().filter(|id| known.contains(id)).collect();
+        }
+        if let Some(v) = c
+            .electricity_usd_per_kwh
+            .and_then(|v| finite_nonneg(v, 10.0))
+        {
+            cfg.costs.electricity_usd_per_kwh = v;
+        }
+        if let Some(v) = c
+            .watts_while_generating
+            .and_then(|v| finite_nonneg(v, 10_000.0))
+        {
+            cfg.costs.watts_while_generating = v;
+        }
+        if let Some(v) = c
+            .hardware_cost_usd
+            .and_then(|v| finite_nonneg(v, 10_000_000.0))
+        {
+            cfg.costs.hardware_cost_usd = v;
+        }
+    }
+    if let Some(a) = body.app {
+        if let Some(v) = a
+            .stampede_tokens_per_sec
+            .and_then(|v| finite_nonneg(v, 1_000_000.0))
+        {
+            cfg.app.stampede_tokens_per_sec = v;
+        }
+    }
+    if let Err(e) = config::save(&app.paths.config_file, &cfg) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not save settings: {e:#}"),
+        )
+            .into_response();
+    }
+    *app.config.write() = cfg;
+    Json(settings_json(&app)).into_response()
 }

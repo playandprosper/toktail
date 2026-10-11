@@ -1,10 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The S3 secret access key lives in the macOS Keychain, never in config.toml.
-//! `TOKENLEDGER_S3_SECRET_KEY` in the environment overrides it (useful for testing).
+//! `TOKTAIL_S3_SECRET_KEY` in the environment overrides it (useful for testing).
 
 use anyhow::Result;
 
-pub const KEYCHAIN_SERVICE: &str = "TokenLedger S3";
-pub const ENV_SECRET: &str = "TOKENLEDGER_S3_SECRET_KEY";
+pub const KEYCHAIN_SERVICE: &str = "Toktail S3";
+/// Where the first release (TokenLedger) kept the key; read as a fallback.
+const LEGACY_KEYCHAIN_SERVICE: &str = "TokenLedger S3";
+pub const ENV_SECRET: &str = "TOKTAIL_S3_SECRET_KEY";
 
 pub fn get_s3_secret(access_key_id: &str) -> Option<String> {
     if let Ok(s) = std::env::var(ENV_SECRET) {
@@ -12,18 +15,19 @@ pub fn get_s3_secret(access_key_id: &str) -> Option<String> {
             return Some(s);
         }
     }
-    keychain_get(access_key_id)
+    keychain_get(KEYCHAIN_SERVICE, access_key_id)
+        .or_else(|| keychain_get(LEGACY_KEYCHAIN_SERVICE, access_key_id))
 }
 
 #[cfg(target_os = "macos")]
-fn keychain_get(account: &str) -> Option<String> {
-    security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, account)
+fn keychain_get(service: &str, account: &str) -> Option<String> {
+    security_framework::passwords::get_generic_password(service, account)
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn keychain_get(_account: &str) -> Option<String> {
+fn keychain_get(_service: &str, _account: &str) -> Option<String> {
     None
 }
 

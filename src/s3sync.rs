@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Mirrors the monthly CSV files to an S3-compatible bucket.
 //!
 //! Only files whose size or modification time changed since the last
@@ -91,7 +92,7 @@ fn bucket(cfg: &S3Config) -> Result<Box<Bucket>> {
         bail!("set [s3] access_key_id in config.toml");
     }
     let secret = secrets::get_s3_secret(cfg.access_key_id.trim())
-        .ok_or_else(|| anyhow!("no S3 secret key; run `TokenLedger --set-s3-secret`"))?;
+        .ok_or_else(|| anyhow!("no S3 secret key; run `Toktail --set-s3-secret`"))?;
     let region = Region::Custom {
         region: if cfg.region.trim().is_empty() {
             "auto".into()
@@ -189,7 +190,7 @@ mod tests {
     use super::object_key;
     #[test]
     fn keys() {
-        assert_eq!(object_key("tokenledger/", "a.csv"), "tokenledger/a.csv");
+        assert_eq!(object_key("toktail/", "a.csv"), "toktail/a.csv");
         assert_eq!(object_key("/x", "a.csv"), "x/a.csv");
         assert_eq!(object_key("", "a.csv"), "a.csv");
     }

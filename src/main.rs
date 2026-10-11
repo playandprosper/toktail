@@ -1,16 +1,24 @@
-//! TokenLedger — counts the tokens your LM Studio host is rendering.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Play and Prosper and the Toktail contributors.
+//
+//! Toktail — every token leaves a trail.
 //!
-//!   TokenLedger                  menu bar app (default)
-//!   TokenLedger --headless       no menu bar; proxy, portal and S3 only
-//!   TokenLedger --set-s3-secret  store the S3 secret key in the Keychain
-//!   TokenLedger fingerprint      read a request JSON on stdin, print its prompt_sha256
-//!   TokenLedger --version
+//! Pip the Token Fox sits between your apps and LM Studio, counts every
+//! token that passes, writes it to CSV, and draws it with its tail.
+//!
+//!   Toktail                  menu bar app (default)
+//!   Toktail --headless       no menu bar; proxy, portal and S3 only
+//!   Toktail --set-s3-secret  store the S3 secret key in the Keychain
+//!   Toktail fingerprint      read a request JSON on stdin, print its prompt_sha256
+//!   Toktail --version
 
 mod app;
 mod config;
 mod ledger;
+mod live;
 mod login;
 mod portal;
+mod pricing;
 mod proxy;
 mod s3sync;
 mod secrets;
@@ -28,7 +36,7 @@ fn main() {
         .init();
     if let Err(e) = real_main() {
         log::error!("{e:#}");
-        eprintln!("TokenLedger: {e:#}");
+        eprintln!("Toktail: {e:#}");
         std::process::exit(1);
     }
 }
@@ -38,14 +46,15 @@ fn real_main() -> Result<()> {
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
     if has("--version") || has("-V") {
-        println!("TokenLedger {}", env!("CARGO_PKG_VERSION"));
+        println!("Toktail {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if has("--help") || has("-h") {
         println!(
-            "TokenLedger {}\n\n  TokenLedger                  menu bar app\n  TokenLedger --headless       run without the menu bar\n  TokenLedger --set-s3-secret  store the S3 secret key in the Keychain\n  TokenLedger fingerprint      print prompt_sha256 for a request JSON on stdin\n\nConfig: {}",
+            "Toktail {} — every token leaves a trail.\n\n  Toktail                  menu bar app\n  Toktail --headless       run without the menu bar\n  Toktail --set-s3-secret  store the S3 secret key in the Keychain\n  Toktail fingerprint      print prompt_sha256 for a request JSON on stdin\n\nConfig: {}\nHome:   {}",
             env!("CARGO_PKG_VERSION"),
-            config::base_dir().join("config.toml").display()
+            config::base_dir().join("config.toml").display(),
+            portal::REPOSITORY
         );
         return Ok(());
     }
@@ -70,14 +79,14 @@ fn real_main() -> Result<()> {
     }
     let headless = has("--headless");
 
-    // One instance only. If the portal port answers as TokenLedger, a copy is
+    // One instance only. If the portal port answers as Toktail, a copy is
     // already running: open its portal and leave.
     let portal_addr = format!("127.0.0.1:{}", cfg.portal.port);
     let portal_listener = match std::net::TcpListener::bind(&portal_addr) {
         Ok(l) => l,
         Err(e) => {
             if already_running(&portal_addr) {
-                log::info!("TokenLedger is already running; opening its portal");
+                log::info!("Toktail is already running; opening its portal");
                 if !headless {
                     let _ = open_url(&format!("http://{portal_addr}/"));
                 }
@@ -98,10 +107,11 @@ fn real_main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
-        .thread_name("tokenledger")
+        .thread_name("toktail")
         .build()?;
 
     let ledger = ledger::Ledger::open(paths.data_dir.clone())?;
+    let paths_base = paths.base.clone();
     log::info!("CSV ledger: {}", paths.data_dir.display());
     let app = Arc::new(app::App {
         config: RwLock::new(cfg),
@@ -110,6 +120,8 @@ fn real_main() -> Result<()> {
         status: RwLock::new(app::Status::default()),
         sync_now: tokio::sync::Notify::new(),
         rt: runtime.handle().clone(),
+        live: live::Live::new(),
+        prices: RwLock::new(pricing::PriceBook::load(&paths_base)),
     });
 
     runtime.spawn(proxy::run(app.clone()));
@@ -145,7 +157,7 @@ fn already_running(addr: &str) -> bool {
     }
     let mut buf = String::new();
     let _ = s.read_to_string(&mut buf);
-    buf.contains("\"tokenledger\"")
+    buf.contains("\"toktail\"")
 }
 
 fn open_url(url: &str) -> std::io::Result<std::process::Child> {

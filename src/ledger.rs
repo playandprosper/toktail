@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The CSV ledger: the single source of truth.
 //!
 //! One append-only file per month, `tokens-YYYY-MM.csv`, one row per
@@ -517,7 +518,7 @@ pub fn day_by_model(data: &Data, day: NaiveDate) -> Vec<ModelTotals> {
             totals,
         })
         .collect();
-    v.sort_by(|a, b| b.totals.output.cmp(&a.totals.output));
+    v.sort_by_key(|m| std::cmp::Reverse(m.totals.output));
     v
 }
 

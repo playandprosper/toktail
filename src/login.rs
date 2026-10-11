@@ -1,15 +1,22 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Launch at login via a per-user LaunchAgent
-//! (~/Library/LaunchAgents/com.tokenledger.app.plist).
+//! (~/Library/LaunchAgents/com.playandprosper.toktail.plist).
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-pub const LABEL: &str = "com.tokenledger.app";
+pub const LABEL: &str = "com.playandprosper.toktail";
+/// The first release's agent; removed so the app never starts twice.
+const LEGACY_LABEL: &str = "com.tokenledger.app";
 
 fn plist_path() -> Option<PathBuf> {
+    agent_path(LABEL)
+}
+
+fn agent_path(label: &str) -> Option<PathBuf> {
     dirs::home_dir().map(|h| {
         h.join("Library/LaunchAgents")
-            .join(format!("{LABEL}.plist"))
+            .join(format!("{label}.plist"))
     })
 }
 
@@ -23,9 +30,9 @@ fn xml_escape(s: &str) -> String {
 fn plist_contents() -> Result<String> {
     let exe = std::env::current_exe()?.canonicalize()?;
     let home = dirs::home_dir().context("no home directory")?;
-    let log_dir = home.join("Library/Logs/TokenLedger");
+    let log_dir = home.join("Library/Logs/Toktail");
     std::fs::create_dir_all(&log_dir).ok();
-    let log = log_dir.join("tokenledger.log");
+    let log = log_dir.join("toktail.log");
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -63,6 +70,9 @@ pub fn is_enabled() -> bool {
 pub fn set_enabled(enabled: bool) -> Result<()> {
     if !cfg!(target_os = "macos") {
         return Ok(());
+    }
+    if let Some(old) = agent_path(LEGACY_LABEL).filter(|p| p.exists()) {
+        let _ = std::fs::remove_file(&old);
     }
     let path = plist_path().context("no home directory")?;
     if enabled {

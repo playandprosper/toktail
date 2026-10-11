@@ -1,23 +1,45 @@
-//! Menu bar item: today's count, per-model breakdown, portal, S3, quit.
+// SPDX-License-Identifier: Apache-2.0
+//! Pip in the menu bar: napping when idle, running while tokens stream
+//! (faster with throughput), sprinting during a stampede. The menu shows
+//! today's count, the per-model breakdown, the portal, S3 and quit.
 
 use crate::app::{ago, fmt_compact, fmt_thousands, App};
-use crate::{config, ledger, login, s3sync};
+use crate::live::PipState;
+use crate::{config, ledger, login, portal, s3sync};
 use chrono::Local;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+const ICON_W: u32 = 96;
+const ICON_H: u32 = 72;
+const RUN_FRAMES: [&[u8]; 4] = [
+    include_bytes!("../assets/tray/run0.rgba"),
+    include_bytes!("../assets/tray/run1.rgba"),
+    include_bytes!("../assets/tray/run2.rgba"),
+    include_bytes!("../assets/tray/run3.rgba"),
+];
+const SLEEP_FRAME: &[u8] = include_bytes!("../assets/tray/sleep.rgba");
+
+/// Icon updates: ~16 per second; menu text: every 2 seconds.
+const ANIM_EVERY: Duration = Duration::from_millis(60);
+const REFRESH_EVERY_TICKS: u32 = 33;
+
 enum UserEvent {
     Menu(MenuEvent),
-    Tick,
+    Anim,
+    Refresh,
 }
 
 struct Ui {
     tray: TrayIcon,
+    run: Vec<Icon>,
+    sleep: Icon,
+    pip_line: MenuItem,
     today: MenuItem,
     requests: MenuItem,
     by_model: Submenu,
@@ -28,9 +50,16 @@ struct Ui {
     s3_status: MenuItem,
     proxy_status: MenuItem,
     login: CheckMenuItem,
+    about: MenuItem,
     quit: MenuItem,
     model_lines: Vec<String>,
     last_title: String,
+    // Animation state
+    shown: Option<usize>, // None = sleeping frame
+    frame: usize,
+    since_frame: Duration,
+    last_anim: Instant,
+    state: PipState,
 }
 
 pub fn run(app: Arc<App>) -> ! {
@@ -48,10 +77,19 @@ pub fn run(app: Arc<App>) -> ! {
         let _ = menu_proxy.lock().send_event(UserEvent::Menu(e));
     }));
     let tick_proxy = event_loop.create_proxy();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(5));
-        if tick_proxy.send_event(UserEvent::Tick).is_err() {
-            break;
+    std::thread::spawn(move || {
+        let mut n = 0u32;
+        loop {
+            std::thread::sleep(ANIM_EVERY);
+            n = n.wrapping_add(1);
+            let ev = if n.is_multiple_of(REFRESH_EVERY_TICKS) {
+                UserEvent::Refresh
+            } else {
+                UserEvent::Anim
+            };
+            if tick_proxy.send_event(ev).is_err() {
+                break;
+            }
         }
     });
 
@@ -69,8 +107,14 @@ pub fn run(app: Arc<App>) -> ! {
                     std::process::exit(1);
                 }
             },
-            Event::UserEvent(UserEvent::Tick) => {
+            Event::UserEvent(UserEvent::Anim) => {
                 if let Some(u) = ui.as_mut() {
+                    u.animate(&app);
+                }
+            }
+            Event::UserEvent(UserEvent::Refresh) => {
+                if let Some(u) = ui.as_mut() {
+                    u.animate(&app);
                     u.refresh(&app);
                 }
             }
@@ -84,8 +128,28 @@ pub fn run(app: Arc<App>) -> ! {
     })
 }
 
+fn icon(bytes: &[u8]) -> anyhow::Result<Icon> {
+    Ok(Icon::from_rgba(bytes.to_vec(), ICON_W, ICON_H)?)
+}
+
+/// What Pip says in the first line of the menu.
+pub fn pip_says(state: PipState, tps: f64) -> String {
+    match state {
+        PipState::Idle => "Pip is napping. Nothing to count. Nap time!".into(),
+        PipState::Processing => format!(
+            "Nom nom nom… {} tokens/sec!",
+            fmt_thousands(tps.round() as u64)
+        ),
+        PipState::Stampede => format!(
+            "Holy tokens! We've got a stampede! ({} tokens/sec)",
+            fmt_thousands(tps.round() as u64)
+        ),
+    }
+}
+
 impl Ui {
     fn new(app: &Arc<App>) -> anyhow::Result<Ui> {
+        let pip_line = MenuItem::new("Pip is waking up…", false, None);
         let today = MenuItem::new("Today: —", false, None);
         let requests = MenuItem::new("Requests today: —", false, None);
         let by_model = Submenu::new("Today by model", true);
@@ -102,10 +166,17 @@ impl Ui {
             login::is_enabled(),
             None,
         );
-        let quit = MenuItem::new("Quit TokenLedger", true, None);
+        let about = MenuItem::new(
+            format!("About Toktail {}…", env!("CARGO_PKG_VERSION")),
+            true,
+            None,
+        );
+        let quit = MenuItem::new("Quit Toktail", true, None);
 
         let menu = Menu::new();
         menu.append_items(&[
+            &pip_line,
+            &PredefinedMenuItem::separator(),
             &today,
             &requests,
             &by_model,
@@ -119,22 +190,29 @@ impl Ui {
             &proxy_status,
             &PredefinedMenuItem::separator(),
             &login,
+            &about,
             &quit,
         ])?;
 
-        let (rgba, w, h) = icon_rgba();
-        let icon = Icon::from_rgba(rgba, w, h)?;
+        let run = RUN_FRAMES
+            .iter()
+            .map(|b| icon(b))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let sleep = icon(SLEEP_FRAME)?;
         let builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("TokenLedger");
+            .with_tooltip("Toktail");
         #[cfg(target_os = "macos")]
-        let builder = builder.with_icon_templated(icon);
+        let builder = builder.with_icon_templated(sleep.clone());
         #[cfg(not(target_os = "macos"))]
-        let builder = builder.with_icon(icon);
+        let builder = builder.with_icon(sleep.clone());
         let tray = builder.build()?;
 
         Ok(Ui {
             tray,
+            run,
+            sleep,
+            pip_line,
             today,
             requests,
             by_model,
@@ -145,13 +223,61 @@ impl Ui {
             s3_status,
             proxy_status,
             login,
+            about,
             quit,
             model_lines: Vec::new(),
             last_title: String::new(),
+            shown: None,
+            frame: 0,
+            since_frame: Duration::ZERO,
+            last_anim: Instant::now(),
+            state: PipState::Idle,
         })
     }
 
+    fn set_icon(&self, icon: &Icon) {
+        #[cfg(target_os = "macos")]
+        let r = self.tray.set_icon_templated(Some(icon.clone()));
+        #[cfg(not(target_os = "macos"))]
+        let r = self.tray.set_icon(Some(icon.clone()));
+        if let Err(e) = r {
+            log::debug!("tray icon: {e}");
+        }
+    }
+
+    /// Advances Pip's run cycle. Frame time shrinks as throughput grows.
+    fn animate(&mut self, app: &Arc<App>) {
+        let (snap, state) = app.pip(10);
+        self.state = state;
+        let now = Instant::now();
+        let dt = now - self.last_anim;
+        self.last_anim = now;
+        let period = match state {
+            PipState::Idle => {
+                if self.shown.is_some() {
+                    self.set_icon(&self.sleep);
+                    self.shown = None;
+                }
+                return;
+            }
+            PipState::Processing => Duration::from_millis(
+                (200.0 - snap.tokens_per_sec.min(200.0) * 0.6).max(80.0) as u64,
+            ),
+            PipState::Stampede => Duration::from_millis(55),
+        };
+        self.since_frame += dt;
+        if self.shown.is_none() || self.since_frame >= period {
+            self.since_frame = Duration::ZERO;
+            self.frame = (self.frame + 1) % self.run.len();
+            self.set_icon(&self.run[self.frame]);
+            self.shown = Some(self.frame);
+        }
+    }
+
     fn refresh(&mut self, app: &Arc<App>) {
+        let (snap, state) = app.pip(10);
+        self.pip_line.set_text(pip_says(state, snap.tokens_per_sec));
+
         let day = Local::now().date_naive();
         let per_model = app.ledger.with_data(|d| ledger::day_by_model(d, day));
         let (inp, out, req) = per_model.iter().fold((0, 0, 0), |a, m| {
@@ -210,7 +336,7 @@ impl Ui {
                 Some(title.clone())
             });
             let _ = self.tray.set_tooltip(Some(format!(
-                "TokenLedger — {} tokens out today",
+                "Toktail — {} tokens out today. Every token leaves a trail.",
                 fmt_thousands(out)
             )));
             self.last_title = title;
@@ -252,6 +378,8 @@ impl Ui {
             open(&app.ledger.dir().display().to_string(), false);
         } else if id == self.edit_config.id() {
             open(&app.paths.config_file.display().to_string(), true);
+        } else if id == self.about.id() {
+            open(portal::REPOSITORY, false);
         } else if id == self.sync.id() {
             app.sync_now.notify_one();
             self.s3_status.set_text("S3: syncing…");
@@ -271,7 +399,7 @@ impl Ui {
                 }
             }
         } else if id == self.quit.id() {
-            self.quit.set_text("Quitting… (final S3 sync)");
+            self.quit.set_text("Pip is tidying up… (final S3 sync)");
             app.rt.block_on(s3sync::final_sync(app));
             std::process::exit(0);
         }
@@ -297,19 +425,25 @@ fn open(target: &str, as_text: bool) {
     }
 }
 
-/// A 36×36 template icon (three rising bars). Black + alpha only, so macOS
-/// tints it for light/dark menu bars.
-fn icon_rgba() -> (Vec<u8>, u32, u32) {
-    let (w, h) = (36u32, 36u32);
-    let mut px = vec![0u8; (w * h * 4) as usize];
-    let bars = [(5u32, 14u32), (15, 22), (25, 30)]; // (x, height)
-    for (x0, height) in bars {
-        for y in (h - 3 - height)..(h - 3) {
-            for x in x0..x0 + 7 {
-                let i = ((y * w + x) * 4) as usize;
-                px[i + 3] = 255;
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frames_are_the_right_size() {
+        for f in RUN_FRAMES.iter().chain([&SLEEP_FRAME]) {
+            assert_eq!(f.len() as u32, ICON_W * ICON_H * 4);
+            assert!(f.chunks(4).any(|p| p[3] > 200), "frame has visible pixels");
         }
     }
-    (px, w, h)
+
+    #[test]
+    fn pip_lines() {
+        assert!(pip_says(PipState::Idle, 0.0).contains("Nap time"));
+        assert_eq!(
+            pip_says(PipState::Processing, 2847.2),
+            "Nom nom nom… 2,847 tokens/sec!"
+        );
+        assert!(pip_says(PipState::Stampede, 900.0).starts_with("Holy tokens!"));
+    }
 }

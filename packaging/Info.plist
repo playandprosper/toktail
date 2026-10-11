@@ -3,27 +3,31 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>TokenLedger</string>
+    <string>Toktail</string>
     <key>CFBundleDisplayName</key>
-    <string>TokenLedger</string>
+    <string>Toktail</string>
     <key>CFBundleIdentifier</key>
-    <string>com.tokenledger.app</string>
+    <string>com.playandprosper.toktail</string>
     <key>CFBundleExecutable</key>
-    <string>TokenLedger</string>
+    <string>Toktail</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>
     <string>__VERSION__</string>
     <key>CFBundleShortVersionString</key>
     <string>__VERSION__</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Licensed under the Apache License 2.0. Every token leaves a trail.</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
-    <!-- Menu bar only: no Dock icon, no app menu. -->
+    <!-- Menu bar only: no Dock icon, no app menu. Pip lives in the menu bar. -->
     <key>LSUIElement</key>
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>TokenLedger mirrors its CSV files to the S3-compatible storage you configured, which may be on your local network.</string>
+    <string>Toktail mirrors its CSV files to the S3-compatible storage you configured, which may be on your local network.</string>
 </dict>
 </plist>

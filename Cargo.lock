@@ -2893,35 +2893,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokenledger"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "bytes",
- "chrono",
- "csv",
- "dirs 6.0.0",
- "env_logger",
- "futures-util",
- "hex",
- "http-body-util",
- "log",
- "parking_lot",
- "reqwest 0.13.5",
- "rust-s3",
- "security-framework",
- "serde",
- "serde_json",
- "sha2",
- "tao",
- "tokio",
- "toml 0.9.12+spec-1.1.0",
- "tray-icon",
- "uuid",
-]
-
-[[package]]
 name = "tokio"
 version = "1.53.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2980,6 +2951,34 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "toktail"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "chrono",
+ "csv",
+ "dirs 6.0.0",
+ "env_logger",
+ "futures-util",
+ "hex",
+ "log",
+ "parking_lot",
+ "reqwest 0.13.5",
+ "rust-s3",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tao",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tray-icon",
+ "uuid",
 ]
 
 [[package]]
