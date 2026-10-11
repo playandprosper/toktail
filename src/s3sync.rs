@@ -1,0 +1,196 @@
+//! Mirrors the monthly CSV files to an S3-compatible bucket.
+//!
+//! Only files whose size or modification time changed since the last
+//! successful upload are sent. The local CSV stays the source of truth;
+//! the bucket is a copy that gets overwritten with whatever is on disk.
+
+use crate::app::App;
+use crate::config::S3Config;
+use crate::secrets;
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::Local;
+use s3::creds::Credentials;
+use s3::{Bucket, Region};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SyncState {
+    files: BTreeMap<String, Stamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Stamp {
+    len: u64,
+    mtime_ms: u128,
+}
+
+pub async fn run(app: Arc<App>) {
+    let cfg = app.config.read().s3.clone();
+    app.status.write().s3.enabled = cfg.enabled;
+    if !cfg.enabled {
+        log::info!("S3 mirror disabled in config.toml");
+        return;
+    }
+    let every = Duration::from_secs(cfg.sync_interval_minutes.max(1) * 60);
+    loop {
+        sync_once(&app).await;
+        tokio::select! {
+            _ = tokio::time::sleep(every) => {}
+            _ = app.sync_now.notified() => {}
+        }
+    }
+}
+
+/// Runs one sync, recording the outcome for the menu and dashboard.
+pub async fn sync_once(app: &Arc<App>) {
+    let cfg = app.config.read().s3.clone();
+    if !cfg.enabled {
+        return;
+    }
+    {
+        let mut s = app.status.write();
+        if s.s3.in_progress {
+            return;
+        }
+        s.s3.in_progress = true;
+    }
+    let result = upload_changed(app, &cfg).await;
+    let mut s = app.status.write();
+    s.s3.in_progress = false;
+    match result {
+        Ok(n) => {
+            if n > 0 {
+                log::info!("S3: uploaded {n} file(s)");
+            }
+            s.s3.last_ok = Some(Local::now());
+            s.s3.last_error = None;
+            s.s3.files_uploaded_total += n as u64;
+        }
+        Err(e) => {
+            log::warn!("S3 sync failed: {e:#}");
+            s.s3.last_error = Some(format!("{e:#}"));
+        }
+    }
+}
+
+/// Last chance at quit, bounded so quitting never hangs on a slow network.
+pub async fn final_sync(app: &Arc<App>) {
+    if app.config.read().s3.enabled {
+        let _ = tokio::time::timeout(Duration::from_secs(15), sync_once(app)).await;
+    }
+}
+
+fn bucket(cfg: &S3Config) -> Result<Box<Bucket>> {
+    if cfg.endpoint.trim().is_empty() || cfg.bucket.trim().is_empty() {
+        bail!("set [s3] endpoint and bucket in config.toml");
+    }
+    if cfg.access_key_id.trim().is_empty() {
+        bail!("set [s3] access_key_id in config.toml");
+    }
+    let secret = secrets::get_s3_secret(cfg.access_key_id.trim())
+        .ok_or_else(|| anyhow!("no S3 secret key; run `TokenLedger --set-s3-secret`"))?;
+    let region = Region::Custom {
+        region: if cfg.region.trim().is_empty() {
+            "auto".into()
+        } else {
+            cfg.region.trim().into()
+        },
+        endpoint: cfg.endpoint.trim().trim_end_matches('/').into(),
+    };
+    let creds = Credentials::new(
+        Some(cfg.access_key_id.trim()),
+        Some(&secret),
+        None,
+        None,
+        None,
+    )?;
+    let b = Bucket::new(cfg.bucket.trim(), region, creds)?;
+    Ok(if cfg.path_style {
+        b.with_path_style()
+    } else {
+        b
+    })
+}
+
+pub fn object_key(prefix: &str, name: &str) -> String {
+    let p = prefix.trim().trim_start_matches('/');
+    if p.is_empty() {
+        name.to_string()
+    } else if p.ends_with('/') {
+        format!("{p}{name}")
+    } else {
+        format!("{p}/{name}")
+    }
+}
+
+async fn upload_changed(app: &Arc<App>, cfg: &S3Config) -> Result<usize> {
+    let bucket = bucket(cfg)?;
+    let state_path = app.paths.sync_state.clone();
+    let mut state: SyncState = std::fs::read(&state_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+
+    let dir = app.ledger.dir().to_path_buf();
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .with_context(|| format!("listing {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("tokens-") && n.ends_with(".csv"))
+        .collect();
+    names.sort();
+
+    let mut uploaded = 0;
+    for name in names {
+        let path = dir.join(&name);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let stamp = Stamp {
+            len: meta.len(),
+            mtime_ms: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+        };
+        if state.files.get(&name) == Some(&stamp) {
+            continue;
+        }
+        let mut content = tokio::fs::read(&path).await?;
+        // Never upload half a row if a request is being written right now.
+        if let Some(last_nl) = content.iter().rposition(|&b| b == b'\n') {
+            content.truncate(last_nl + 1);
+        } else {
+            continue;
+        }
+        let key = object_key(&cfg.prefix, &name);
+        bucket
+            .put_object_with_content_type(&key, &content, "text/csv")
+            .await
+            .with_context(|| format!("uploading {key}"))?;
+        uploaded += 1;
+        if content.len() as u64 == stamp.len {
+            state.files.insert(name, stamp);
+        }
+        let tmp = state_path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&state)?)?;
+        std::fs::rename(&tmp, &state_path)?;
+    }
+    Ok(uploaded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::object_key;
+    #[test]
+    fn keys() {
+        assert_eq!(object_key("tokenledger/", "a.csv"), "tokenledger/a.csv");
+        assert_eq!(object_key("/x", "a.csv"), "x/a.csv");
+        assert_eq!(object_key("", "a.csv"), "a.csv");
+    }
+}

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>TokenLedger</string>
+    <key>CFBundleDisplayName</key>
+    <string>TokenLedger</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.tokenledger.app</string>
+    <key>CFBundleExecutable</key>
+    <string>TokenLedger</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <!-- Menu bar only: no Dock icon, no app menu. -->
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>TokenLedger mirrors its CSV files to the S3-compatible storage you configured, which may be on your local network.</string>
+</dict>
+</plist>

@@ -1,0 +1,42 @@
+[package]
+name = "tokenledger"
+version = "0.1.0"
+edition = "2021"
+description = "Counts the tokens your LM Studio host is rendering, per model per day, into CSV mirrored to S3."
+license = "MIT"
+
+[[bin]]
+name = "TokenLedger"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+csv = "1"
+dirs = "6"
+futures-util = "0.3"
+hex = "0.4"
+http-body-util = "0.1"
+log = "0.4"
+env_logger = "0.11"
+parking_lot = "0.12"
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }
+rust-s3 = { version = "0.38", default-features = false, features = ["tokio-native-tls", "fail-on-err"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "signal"] }
+toml = "0.9"
+uuid = { version = "1", features = ["v4"] }
+tray-icon = "0.26"
+tao = "0.37"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
