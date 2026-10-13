@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+// A Windows tray app has no console window of its own; command-line use
+// attaches to the terminal it was started from (see `attach_console`).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 // Copyright 2026 Play and Prosper and the Toktail contributors.
 //
 //! Toktail — every token leaves a trail.
@@ -6,7 +9,7 @@
 //! Pip the Token Fox sits between your apps and LM Studio, counts every
 //! token that passes, writes it to CSV, and draws it with its tail.
 //!
-//!   Toktail                  menu bar app (default)
+//!   Toktail                  menu bar / system tray app (default)
 //!   Toktail --headless       no menu bar; proxy, portal and S3 only
 //!   Toktail --demo           sample data and pretend traffic, to see Pip in action
 //!   Toktail --set-s3-secret  store the S3 secret key in the Keychain
@@ -14,21 +17,31 @@
 //!   Toktail --version
 
 mod app;
+mod budgets;
 mod config;
 mod crypto;
 mod demo;
 mod hardware;
+mod intelligence;
 mod ledger;
 mod live;
 mod login;
+mod pip_agent;
+mod platform;
 mod portal;
+mod portal_insights;
 mod portal_records;
 mod portal_settings;
 mod pricing;
 mod proxy;
 mod records;
+mod retrieval;
 mod s3sync;
 mod secrets;
+mod stats;
+#[cfg(test)]
+mod test_support;
+#[cfg(feature = "desktop")]
 mod tray;
 mod usage;
 
@@ -38,9 +51,27 @@ use std::io::Read;
 use std::sync::Arc;
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_secs()
-        .init();
+    attach_console();
+    let mut logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    logger.format_timestamp_secs();
+    // Started at login on Windows or Linux there's no terminal: log to a file
+    // (macOS's LaunchAgent already sends output to ~/Library/Logs/Toktail).
+    if !cfg!(target_os = "macos") && !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        if let Some(path) = login::log_file() {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                logger.target(env_logger::Target::Pipe(Box::new(f)));
+            }
+        }
+    }
+    logger.init();
     if let Err(e) = real_main() {
         log::error!("{e:#}");
         eprintln!("Toktail: {e:#}");
@@ -58,7 +89,7 @@ fn real_main() -> Result<()> {
     }
     if has("--help") || has("-h") {
         println!(
-            "Toktail {} — every token leaves a trail.\n\n  Toktail                  menu bar app\n  Toktail --headless       run without the menu bar\n  Toktail --demo           try it with sample data and pretend traffic\n  Toktail --set-s3-secret  store the S3 secret key in the Keychain\n  Toktail fingerprint      print prompt_sha256 for a request JSON on stdin\n\nConfig: {}\nHome:   {}",
+            "Toktail {} — every token leaves a trail.\n\n  Toktail                  menu bar / system tray app\n  Toktail --headless       run without the menu bar (servers, Linux)\n  Toktail --demo           try it with sample data and pretend traffic\n  Toktail --set-s3-secret  store the S3 secret key in the Keychain / Credential Manager\n  Toktail fingerprint      print prompt_sha256 for a request JSON on stdin\n\nConfig: {}\nHome:   {}",
             env!("CARGO_PKG_VERSION"),
             config::base_dir().join("config.toml").display(),
             portal::REPOSITORY
@@ -92,7 +123,7 @@ fn real_main() -> Result<()> {
     if has("--set-s3-secret") {
         return secrets::prompt_and_store(&cfg.s3.access_key_id);
     }
-    let headless = has("--headless");
+    let headless = has("--headless") || !cfg!(feature = "desktop");
 
     // One instance only. If the portal port answers as Toktail, a copy is
     // already running: open its portal and leave.
@@ -113,7 +144,10 @@ fn real_main() -> Result<()> {
         }
     };
 
-    if !demo && cfg!(target_os = "macos") && (first_run || cfg.app.launch_at_login) {
+    // macOS and Windows start the menu bar / tray app at login by default;
+    // on Linux only when the desktop app runs (servers use systemd instead).
+    let login_here = cfg!(any(target_os = "macos", windows)) || !headless;
+    if !demo && login_here && (first_run || cfg.app.launch_at_login) {
         if let Err(e) = login::set_enabled(cfg.app.launch_at_login) {
             log::warn!("launch at login: {e:#}");
         }
@@ -154,6 +188,13 @@ fn real_main() -> Result<()> {
         crypto: crypto::Crypto::new(),
         records: records::Records::new(),
         hardware: RwLock::new(hardware::Fleet::load(&paths_base)),
+        activity: live::Activity::new(),
+        alerts: budgets::Alerts::new(),
+        retrieval: retrieval::Index::new(),
+        chat_client: reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()?,
+        shutting_down: std::sync::atomic::AtomicBool::new(false),
     });
     app.load_host_tokens();
     app.configure_crypto();
@@ -163,11 +204,15 @@ fn real_main() -> Result<()> {
     {
         let _guard = runtime.enter();
         records::start(app.clone());
+        if demo {
+            demo::seed_captures(&app);
+        }
     }
 
     runtime.spawn(proxy::run(app.clone()));
     runtime.spawn(portal::serve(app.clone(), portal_listener));
     runtime.spawn(s3sync::run(app.clone()));
+    runtime.spawn(budgets::run(app.clone()));
 
     if demo {
         runtime.spawn(demo::fake_lmstudios());
@@ -183,13 +228,25 @@ fn real_main() -> Result<()> {
 
     if headless {
         runtime.block_on(async {
+            #[cfg(unix)]
+            {
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("install SIGTERM handler");
+                tokio::select! { _=tokio::signal::ctrl_c()=>{},_=term.recv()=>{} }
+            }
+            #[cfg(not(unix))]
             let _ = tokio::signal::ctrl_c().await;
             log::info!("shutting down");
+            records::shutdown(&app).await;
             s3sync::final_sync(&app).await;
         });
         return Ok(());
     }
-    tray::run(app)
+    #[cfg(feature = "desktop")]
+    tray::run(app);
+    #[cfg(not(feature = "desktop"))]
+    Ok(())
 }
 
 fn already_running(addr: &str) -> bool {
@@ -210,10 +267,16 @@ fn already_running(addr: &str) -> bool {
 }
 
 fn open_url(url: &str) -> std::io::Result<std::process::Child> {
-    let cmd = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    std::process::Command::new(cmd).arg(url).spawn()
+    platform::open(url)
+}
+
+/// On Windows, print to the terminal Toktail was started from (for
+/// `--help`, `fingerprint`, `--set-s3-secret`, `--headless`). Elsewhere a
+/// no-op.
+fn attach_console() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
 }

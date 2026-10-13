@@ -8,12 +8,16 @@ const Settings = (() => {
   let st = null;
   const SECTIONS = [
     ["hosts", "Hosts"], ["capture", "Saving prompts"], ["encryption", "Encryption"], ["s3", "S3 mirror"],
-    ["pip", "Pip & menu bar"], ["costs", "Cost comparison"], ["hardware", "Hardware"],
+    ["budgets", "Budgets & alerts"], ["pip", "Pip & menu bar"], ["costs", "Cost comparison"], ["hardware", "Hardware"], ["api", "Metrics & API"],
   ];
 
+  let bud = null;
+  /** Where secrets go on this computer, in words. */
+  const vault = () => (st && st.secret_store) || "Keychain";
   async function show(section) {
-    try { st = await getJSON("/api/settings"); } catch (e) { return toast("Couldn't load settings: " + e.message); }
+    try { [st, bud] = await Promise.all([getJSON("/api/settings"), getJSON("/api/budgets")]); } catch (e) { return toast("Couldn't load settings: " + e.message); }
     S.settings = st;
+    $("settings-sub").textContent = "Changes apply right away. Secrets go to your " + vault() + ", never to a file.";
     render();
     if (section) {
       const t = $("set-" + section);
@@ -47,8 +51,8 @@ const Settings = (() => {
     const nav = $("settings-nav"); nav.textContent = "";
     for (const [id, name] of SECTIONS) nav.append(h("a", { href: "#/settings/" + id, text: name }));
     const body = $("settings-body"); body.textContent = "";
-    body.append(hostsSection(), captureSection(), encryptionSection(), s3Section(), pipSection(), costsSection(), hardwareSection());
-    body.append(h("p", { class: "label-sm", text: "Settings live in " + st.config_file + ". Secrets are in your Keychain. Your CSV is in " + st.data_dir + "." }));
+    body.append(hostsSection(), captureSection(), encryptionSection(), s3Section(), budgetsSection(), pipSection(), costsSection(), hardwareSection(), apiSection());
+    body.append(h("p", { class: "label-sm" }, "Settings live in " + st.config_file + ". Secrets are in your " + (st.secret_store || "Keychain") + ". Your CSV is in " + st.data_dir + ". ", h("button", { type: "button", class: "small", text: "Open the folder", onclick: () => getJSON("/api/open-data-folder", { method: "POST" }).catch((e) => toast(e.message)) })));
     if ((typeof Stage !== "undefined")) Stage.platformsChanged();
   }
 
@@ -79,7 +83,7 @@ const Settings = (() => {
     const form = h("div", { class: "host-form" });
     const name = textField("Name", "What the dashboard calls it", x.name, "Mac Studio");
     const url = textField("LM Studio's address", "Its server address and port, like http://127.0.0.1:1235 or http://studio.local:1234", x.url, "http://127.0.0.1:1235");
-    const tok = secretField("API token", x.has_token ? "Saved in your Keychain. Type a new one to replace it." : "Only if this LM Studio asks for one. Kept in your Keychain, never in a file.", { saved: x.has_token, hint: x.token_hint });
+    const tok = secretField("API token", x.has_token ? "Saved in your " + vault() + ". Type a new one to replace it." : "Only if this LM Studio asks for one. " + "Kept in your " + vault() + ", never in a file.", { saved: x.has_token, hint: x.token_hint });
     const clear = x.has_token ? toggleField("Remove the saved token", null, false) : null;
     const port = numberField("Toktail listens on port", "Apps call this port instead of LM Studio's.", x.listen_port, "1", "", 1, 65535);
     const lan = toggleField("Let other devices on your network use it", "Off means only apps on this Mac can reach this port.", x.allow_lan);
@@ -171,7 +175,7 @@ const Settings = (() => {
       modeBox.append(h("label", { class: "radio" }, r, h("span", {}, h("b", { text: t }), h("small", { text: d }))));
     }
     sec.append(modeBox);
-    const pw = secretField("Encryption password", "Kept in your Keychain. Needed for One password, and to seal the key file below.", e.password, "At least 8 characters");
+    const pw = secretField("Encryption password", "" + "Kept in your " + vault() + ". Needed for One password, and to seal the key file below.", e.password, "At least 8 characters");
     pw.input.autocomplete = "new-password";
     const fresh = e.has_key_check ? toggleField("Start fresh with a new password", "Only if you've lost the old one. Files saved with the old password stay unreadable until it's set back.", false) : null;
     const pwBox = h("div", { class: "sub-box" }, pw.row);
@@ -190,14 +194,14 @@ const Settings = (() => {
     ksBox.append(ksRadios);
     const op = h("div", { class: "ks-fields", "data-ks": "1password" });
     const opVault = textField("1Password vault", "Toktail creates one item per key here.", e.onepassword_vault, "Toktail");
-    const opTok = secretField("Service account token", "Optional: without it, Toktail uses the 1Password app's sign-in. Kept in your Keychain.", e.onepassword_token, "ops_…");
+    const opTok = secretField("Service account token", "Optional: without it, Toktail uses the 1Password app's sign-in. " + "Kept in your " + vault() + ".", e.onepassword_token, "ops_…");
     op.append(opVault.row, opTok.row);
     const vt = h("div", { class: "ks-fields", "data-ks": "vault" });
     const vAddr = textField("Vault address", null, e.vault_addr, "https://vault.example.com:8200");
     const vMount = textField("KV v2 mount", null, e.vault_mount, "secret");
     const vPath = textField("Path", "Keys go under <mount>/data/<path>/<key id>.", e.vault_path, "toktail");
     const vNs = textField("Namespace", "Vault Enterprise only. Leave empty otherwise.", e.vault_namespace, "");
-    const vTok = secretField("Vault token", "Needs create, read and delete on that path. Kept in your Keychain.", e.vault_token, "hvs.…");
+    const vTok = secretField("Vault token", "Needs create, read and delete on that path. " + "Kept in your " + vault() + ".", e.vault_token, "hvs.…");
     vt.append(vAddr.row, vMount.row, vPath.row, vNs.row, vTok.row);
     ksBox.append(op, vt);
     sec.append(ksBox);
@@ -247,7 +251,7 @@ const Settings = (() => {
     const prefix = textField("Folder (prefix)", null, s.prefix, "toktail/");
     const ps = toggleField("Path-style URLs", "Usually on for MinIO and other self-hosted servers.", s.path_style);
     const key = textField("Access key ID", null, s.access_key_id, "");
-    const secret = secretField("Secret access key", "Kept in your Keychain.", s.secret, "");
+    const secret = secretField("Secret access key", "" + "Kept in your " + vault() + ".", s.secret, "");
     const every = numberField("Sync every", null, s.sync_interval_minutes, "1", "minutes", 1, 1440);
     sec.append(en.row, ep.row, region.row, bucket.row, prefix.row, ps.row, key.row, secret.row, every.row);
     const testMsg = h("span", { class: "test-msg" });
@@ -301,6 +305,75 @@ const Settings = (() => {
     return sec;
   }
 
+  // ---------------------------------------------------------------- budgets and alerts
+  /** "50M", "2.5 billion", "120,000" -> tokens. */
+  function parseTokens(t) {
+    const m = /^\s*([\d.,]+)\s*([kmbt]|thousand|million|billion|trillion)?\s*$/i.exec(String(t || ""));
+    if (!m) return NaN;
+    const n = parseFloat(m[1].replace(/,/g, ""));
+    const mult = { k: 1e3, thousand: 1e3, m: 1e6, million: 1e6, b: 1e9, billion: 1e9, t: 1e12, trillion: 1e12 }[(m[2] || "").toLowerCase()] || 1;
+    return Math.round(n * mult);
+  }
+  function budgetsSection() {
+    const sec = section("budgets", "Budgets and alerts", "A budget is a token limit per day, week (Monday to Sunday) or month, for every host or just one, every model or just one. The dashboard shows how far along each one is and where it's heading; Pip taps you on the shoulder at 80% and again at 100%.");
+    const list = h("div", {});
+    const head = h("div", { class: "budget-edit budget-head" }, ...["Name", "Host", "Model", "Tokens", "Per", "Limit", "Notify", ""].map((t) => span(t, "")));
+    const hosts = [["", "All hosts"]].concat((S.meta ? S.meta.hosts : st.hosts).filter((x) => !x.removed).map((x) => [x.id, x.name]));
+    const models = [["", "All models"]].concat((S.meta ? S.meta.models : []).map((m) => [m.model, m.model]));
+    const rows = [];
+    const addRow = (b) => {
+      const name = h("input", { type: "text", value: b.name || "", placeholder: "Daily tokens", "aria-label": "Name" });
+      const host = h("select", { "aria-label": "Host" }); for (const [v, t] of hosts) host.append(h("option", { value: v, text: t })); host.value = b.host || "";
+      const model = h("select", { "aria-label": "Model" }); for (const [v, t] of models) model.append(h("option", { value: v, text: t }));
+      if (b.model && ![...model.options].some((o) => o.value === b.model)) model.append(h("option", { value: b.model, text: b.model }));
+      model.value = b.model || "";
+      const metric = h("select", { "aria-label": "Which tokens" }); for (const [v, t] of [["combined", "Combined"], ["output", "Output"], ["input", "Input"]]) metric.append(h("option", { value: v, text: t })); metric.value = b.metric || "combined";
+      const period = h("select", { "aria-label": "Period" }); for (const [v, t] of [["day", "Day"], ["week", "Week"], ["month", "Month"]]) period.append(h("option", { value: v, text: t })); period.value = b.period || "day";
+      const limit = h("input", { type: "text", value: b.limit ? compact(b.limit) : "", placeholder: "50M", "aria-label": "Limit (tokens)", title: "Tokens. 50M, 2.5B and 120,000 all work." });
+      const notify = h("input", { type: "checkbox", class: "switch", "aria-label": "Notify" }); notify.checked = b.notify !== false;
+      const rm = h("button", { type: "button", class: "small danger", text: "Remove" });
+      const row = h("div", { class: "budget-edit" }, name, host, model, metric, period, limit, notify, rm);
+      const r = { row, read: () => ({ id: b.id || "", name: name.value.trim() || "Budget", host: host.value, model: model.value, metric: metric.value, period: period.value, limit: parseTokens(limit.value), notify: notify.checked }) };
+      rm.onclick = () => { rows.splice(rows.indexOf(r), 1); row.remove(); };
+      rows.push(r);
+      list.append(row);
+    };
+    for (const b of (bud && bud.budgets) || []) addRow(b);
+    const add = h("button", { type: "button", class: "small", text: "Add a budget", onclick: () => addRow({ name: rows.length ? "Monthly tokens" : "Daily tokens", period: rows.length ? "month" : "day", limit: rows.length ? 1e9 : 50e6 }) });
+    const sync = () => { head.hidden = !rows.length; };
+    add.addEventListener("click", sync);
+    list.addEventListener("click", () => setTimeout(sync));
+    sync();
+    sec.append(head, list, h("div", { class: "row-end" }, add));
+    const al = (bud && bud.alerts) || { budgets: true, host_down: true, stampede: false };
+    const aBud = toggleField("Notify me about budgets", "A macOS notification at 80% and at 100% of any budget with Notify on. Elsewhere it shows in the portal and the log.", al.budgets);
+    const aDown = toggleField("Notify me when a host stops answering", "After a minute without an answer, and again when it comes back.", al.host_down);
+    const aStamp = toggleField("Notify me about stampedes", "Four or more requests at once, or three times your usual speed. At most once every 10 minutes.", al.stampede);
+    sec.append(h("h3", { text: "Alerts" }), aBud.row, aDown.row, aStamp.row);
+    saveRow(sec, "Save", async (msg) => {
+      const list2 = rows.map((r) => r.read());
+      const bad = list2.find((b) => !(b.limit > 0));
+      if (bad) throw new Error(bad.name + ": set a limit like 50M or 2.5B.");
+      bud = await postJSON("/api/budgets", { budgets: list2, alerts: { budgets: aBud.input.checked, host_down: aDown.input.checked, stampede: aStamp.input.checked } });
+      msg.dataset.ok = "1"; msg.textContent = "✓ Saved. " + (list2.length ? list2.length + " budget" + (list2.length === 1 ? "" : "s") + " on the dashboard." : "No budgets.");
+      S.dataKey = "";
+    });
+    return sec;
+  }
+
+  // ---------------------------------------------------------------- metrics and API
+  function apiSection() {
+    const sec = section("api", "Metrics and API", "Everything the portal shows comes from a local JSON API, and Toktail also speaks Prometheus. Both answer only on this computer.");
+    const base = location.origin;
+    sec.append(field("Prometheus", "Scrape this from a Prometheus or Grafana Agent running on this computer: tokens, requests and errors per host and model, live tokens/sec, requests in flight, host health and budget use.", h("code", { class: "metrics-url", text: base + "/metrics" }), { stack: true }));
+    const scrape = "scrape_configs:\n  - job_name: toktail\n    static_configs:\n      - targets: ['" + location.host + "']";
+    sec.append(h("details", { class: "params" }, h("summary", { text: "prometheus.yml example" }), h("pre", { text: scrape })));
+    const eps = [["/api/meta", "hosts, models, totals and status"], ["/api/daily?from=&to=&hosts=&models=", "tokens per day, host and model"], ["/api/live", "live tokens/sec, mood, requests in flight and just finished"], ["/api/models/stats", "per-model speed, wait, errors and cloud value"], ["/api/budgets", "budgets with use and projection"], ["/api/pip/usage?period=last%20month&host=studio", "exact totals, the same numbers Pip uses"], ["/api/pip/facts?q=…", "what Pip would look up for a question"], ["/api/export.csv", "the raw CSV for a range"]];
+    const t = table([{ h: "Endpoint", l: true, v: (r) => h("a", { href: r[0], target: "_blank", rel: "noopener", text: r[0] }) }, { h: "What", l: true, v: (r) => r[1] }], eps);
+    sec.append(h("h3", { text: "JSON endpoints" }), h("div", { class: "tbl" }, t));
+    return sec;
+  }
+
   // ---------------------------------------------------------------- hardware
   function hardwareSection() {
     const sec = section("hardware", "Hardware", "The machines themselves (serial numbers, prices, purchase dates) are on the Savings page.");
@@ -312,3 +385,4 @@ const Settings = (() => {
 
   return { show };
 })();
+

@@ -27,6 +27,69 @@ pub struct Config {
     /// The LM Studio servers Toktail watches, up to `MAX_HOSTS`. Each gets its
     /// own proxy port; point an app at a host's port to have it counted.
     pub hosts: Vec<HostConfig>,
+    /// Token budgets: a limit per day, week or month, for everything or one
+    /// host or model. Toktail warns at 80% and again at 100%.
+    pub budgets: Vec<BudgetConfig>,
+    pub alerts: AlertsConfig,
+}
+
+/// One token budget.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BudgetConfig {
+    /// Short id, unique among budgets.
+    pub id: String,
+    pub name: String,
+    /// A host id, or empty for every host.
+    pub host: String,
+    /// A model name, or empty for every model.
+    pub model: String,
+    /// "combined", "input" or "output".
+    pub metric: String,
+    /// "day", "week" (Monday to Sunday) or "month".
+    pub period: String,
+    /// Tokens allowed per period.
+    pub limit: u64,
+    /// Send a notification at 80% and at 100%.
+    pub notify: bool,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        BudgetConfig {
+            id: String::new(),
+            name: "Daily tokens".into(),
+            host: String::new(),
+            model: String::new(),
+            metric: "combined".into(),
+            period: "day".into(),
+            limit: 10_000_000,
+            notify: true,
+        }
+    }
+}
+
+/// When Toktail taps you on the shoulder (macOS notifications).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertsConfig {
+    /// Budgets crossing 80% and 100% (per budget, see `notify`).
+    pub budgets: bool,
+    /// A host's LM Studio stops answering, and when it comes back.
+    pub host_down: bool,
+    /// A stampede starts (four or more requests at once, or three times your
+    /// usual speed).
+    pub stampede: bool,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        AlertsConfig {
+            budgets: true,
+            host_down: true,
+            stampede: false,
+        }
+    }
 }
 
 /// How many LM Studio hosts one Toktail can watch.
@@ -50,7 +113,12 @@ impl Default for HostConfig {
     fn default() -> Self {
         HostConfig {
             id: "local".into(),
-            name: "This Mac".into(),
+            name: if cfg!(target_os = "macos") {
+                "This Mac"
+            } else {
+                "This PC"
+            }
+            .into(),
             upstream: "http://127.0.0.1:1235".into(),
             listen: "127.0.0.1:1234".into(),
             enabled: true,

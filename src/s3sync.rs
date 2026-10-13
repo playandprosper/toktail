@@ -166,6 +166,18 @@ pub async fn get_object(app: &App, key: &str) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// HEAD preserves the distinction between a confirmed 404 and an unavailable mirror.
+pub async fn exists_object(app: &App, key: &str) -> Result<bool> {
+    let b = current_bucket(app)?;
+    match b.head_object(key).await {
+        Ok((_, 404)) => Ok(false),
+        Ok((_, code)) if (200..300).contains(&code) => Ok(true),
+        Ok((_, code)) => bail!("S3 HEAD returned HTTP {code}"),
+        Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(false),
+        Err(e) => Err(anyhow!(e)),
+    }
+}
+
 /// Deletes one object (missing objects are fine).
 pub async fn delete_object(app: &App, key: &str) -> Result<()> {
     let b = current_bucket(app)?;

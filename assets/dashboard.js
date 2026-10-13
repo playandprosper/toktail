@@ -56,14 +56,16 @@ const Dashboard = (() => {
       const key = q + "|" + S.metric + "|" + S.split;
       S.animate = key !== S.dataKey && !reduced();
       S.dataKey = key;
-      const [daily, heat, recent, repeats, costs] = await Promise.all([
+      const [daily, heat, recent, repeats, costs, signals, budgets] = await Promise.all([
         getJSON("/api/daily?" + q),
         getJSON("/api/heatmap?" + q),
         getJSON("/api/recent?" + qs({ limit: 300 })),
         getJSON("/api/repeats?" + qs({ limit: 50 })),
         S.meta.costs_enabled ? getJSON("/api/costs?" + q) : Promise.resolve(null),
+        getJSON("/api/signals?" + q),
+        getJSON("/api/budgets").catch(() => null),
       ]);
-      Object.assign(S, { daily, heat, recent, repeats, costs });
+      Object.assign(S, { daily, heat, recent, repeats, costs, signals, budgets });
       render();
     } catch (e) {
       toast("Couldn't load your data: " + e.message);
@@ -81,7 +83,7 @@ const Dashboard = (() => {
     const keyOf = (e) => (byHost ? e.host : e.model);
     const order = byHost ? S.meta.hosts.map((x) => x.id) : S.meta.models.map((m) => m.model).filter((m) => !S.hidden.has(m));
     const present = new Set(S.daily.map(keyOf));
-    const series = order.filter((k) => present.has(k));
+    let series = order.filter((k) => present.has(k));
     for (const k of present) if (!series.includes(k)) series.push(k);
     const byDay = new Map(days.map((d) => [d, new Map()]));
     const blank = () => ({ input: 0, output: 0, requests: 0, gen_out: 0, gen_ms: 0, errors: 0, estimated: 0 });
@@ -99,12 +101,24 @@ const Dashboard = (() => {
       for (const f in cell) cell[f] += e[f] || 0;
       dm.set(k, cell);
     }
+    const allSeries = [...series], allByDay = new Map([...byDay].map(([d,m]) => [d,new Map(m)]));
+    if (series.length > SLOTS) {
+      series.sort((a,b) => mv(perSeries.get(b),S.metric)-mv(perSeries.get(a),S.metric));
+      const rest = series.slice(SLOTS - 1), other = blank();
+      for (const k of rest) for (const f in other) other[f] += perSeries.get(k)[f] || 0;
+      perSeries.set("__other__",other);
+      for (const m of byDay.values()) {
+        const cell = blank(); for (const k of rest) { const e=m.get(k); if(e) { for(const f in cell) cell[f]+=e[f]||0; m.delete(k); } }
+        if (cell.requests) m.set("__other__",cell);
+      }
+      series=series.slice(0,SLOTS - 1).concat("__other__");
+    }
     const dayTotal = (d, key) => { let s = 0; for (const e of byDay.get(d).values()) s += mv(e, key); return s; };
-    return { from, to, days, series, byDay, tot, perSeries, dayTotal, byHost };
+    return { from, to, days, series, byDay, tot, perSeries, dayTotal, byHost, allSeries, allByDay };
   }
-  const sColor = (D, k) => (D.byHost ? hostColor(k) : color(k));
-  const sVar = (D, k) => (D.byHost ? hostColorVar(k) : colorVar(k));
-  const sName = (D, k) => (D.byHost ? hostName(k) : k);
+  const sColor = (D, k) => (k === "__other__" ? css("--other") : D.byHost ? hostColor(k) : color(k));
+  const sVar = (D, k) => (k === "__other__" ? "--other" : D.byHost ? hostColorVar(k) : colorVar(k));
+  const sName = (D, k) => (k === "__other__" ? (D.byHost?"Other hosts":"Other models") : D.byHost ? hostName(k) : k);
 
   // ================================================================ render
   function render() {
@@ -113,6 +127,8 @@ const Dashboard = (() => {
     renderHosts();
     renderFilters();
     renderHero(D);
+    renderFeed();
+    renderBudgets();
     renderDaily(D);
     renderInsights(D);
     renderCosts(D);
@@ -199,6 +215,89 @@ const Dashboard = (() => {
     }
   }
 
+  // ---------------------------------------------------------------- right now: flights and the feed
+  /** Takes the activity from a /api/live poll (any page), so nothing is missed. */
+  function ingestLive(L) {
+    const a = L && L.activity;
+    if (!a) return;
+    S.flights = a.in_flight || [];
+    const fresh = (a.finished || []).filter((f) => f.seq > (S.liveSeq || 0));
+    if (fresh.length) {
+      S.feed = fresh.reverse().map((f) => ({ ...f, isNew: S.liveSeq > 0 })).concat((S.feed || []).map((f) => ({ ...f, isNew: false }))).slice(0, 60);
+      S.liveSeq = a.seq;
+    }
+    if (a.seq < (S.liveSeq || 0)) S.liveSeq = a.seq; // Toktail restarted
+    if (S.page === "dashboard") renderFeed(!fresh.length);
+  }
+  const inScope = (x) => !S.hosts || !S.hosts.size || S.hosts.has(x.host);
+  /** Redraws the flights; the finished list too unless `flightsOnly`. */
+  function renderFeed(flightsOnly) {
+    const fl = $("flights"), feed = $("feed");
+    if (!fl) return;
+    const flights = (S.flights || []).filter(inScope).sort((a, b) => b.elapsed_ms - a.elapsed_ms);
+    fl.textContent = "";
+    if (!flights.length) {
+      fl.append(h("div", { class: "empty" }, h("img", { src: "/pip.svg", alt: "", width: 34, height: 34 }), span("Nothing streaming right now. Pip is listening.", "")));
+    }
+    for (const f of flights.slice(0, 8)) {
+      const pre = f.output === 0;
+      const row = h("div", { class: "flight" + (pre ? " prefill" : ""), style: "--hc:" + hostColor(f.host) },
+        h("div", { class: "who" }, h("b", { text: hostName(f.host) }), h("code", { text: f.model })),
+        h("div", { class: "nums" }, pre ? span("reading the prompt…", "state") : document.createTextNode(fmt(f.output)), pre ? null : h("small", { text: " tokens" + (f.tokens_per_sec ? " · " + f.tokens_per_sec.toFixed(1) + " tok/s" : "") })),
+        h("div", { class: "bar" }, h("i")),
+        h("div", { class: "state", text: (f.elapsed_ms / 1000).toFixed(1) + " s" + (f.ttft_ms != null ? " · first token after " + fmt(f.ttft_ms) + " ms" : "") + " · " + f.endpoint.replace(/^\/(v1|api\/v\d)\//, "") }));
+      fl.append(row);
+    }
+    if (flights.length > 8) fl.append(h("div", { class: "label-sm", text: "and " + (flights.length - 8) + " more in flight" }));
+    $("live-sub").textContent = flights.length ? flights.length + " request" + (flights.length === 1 ? "" : "s") + " streaming now" : "Requests streaming through your hosts, and the ones that just finished";
+    if (!feed || S.feedPaused || (flightsOnly && feed.childElementCount)) return;
+    feed.textContent = "";
+    const items = (S.feed || []).filter(inScope).slice(0, 30);
+    if (!items.length) feed.append(h("li", { class: "label-sm" }, span("", ""), span("Finished requests show up here as they land.", "what"), span("", "")));
+    for (const f of items) {
+      const t = new Date(f.finished_at);
+      const tags = [];
+      if (f.status >= 400) tags.push(span(f.status === 499 ? "client left" : String(f.status), "tag err"));
+      if (f.outcome === "refused") tags.push(span("refused", "tag err"));
+      else if (["structured", "substantial", "tool_call"].includes(f.signal)) tags.push(span(f.signal.replace("_", " "), "tag"));
+      const what = h("span", { class: "what" }, swatchText(hostName(f.host), hostColorVar(f.host)), h("b", { text: f.model }), ...tags);
+      const n = h("span", { class: "n" }, document.createTextNode(fmt(f.input + f.output)), h("small", { text: " · " + fmt(f.output) + " out" + (f.tokens_per_sec ? " · " + f.tokens_per_sec.toFixed(0) + " tok/s" : "") }));
+      const li = h("li", { class: f.isNew ? "new" : "", title: fmt(f.input) + " in, " + fmt(f.output) + " out, " + (f.duration_ms / 1000).toFixed(2) + " s" + (f.ttft_ms != null ? ", first token " + fmt(f.ttft_ms) + " ms" : "") }, h("time", { text: t.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }) }), what, n);
+      li.addEventListener("click", () => { location.hash = "#/prompts/" + f.request_id; });
+      li.style.cursor = "pointer";
+      feed.append(li);
+      f.isNew = false;
+    }
+  }
+
+  // ---------------------------------------------------------------- budgets
+  function renderBudgets() {
+    const box = $("budgets");
+    if (!box) return;
+    box.textContent = "";
+    const list = (S.budgets && S.budgets.budgets) || [];
+    const scoped = list.filter((b) => !b.host || !S.hosts || !S.hosts.size || S.hosts.has(b.host));
+    const when = { day: "today", week: "this week", month: "this month" };
+    const periods = [...new Set(list.map((b) => when[b.period] || b.period))];
+    $("budgets-sub").textContent = list.length ? "Used " + (periods.length > 1 ? periods.slice(0, -1).join(", ") + " and " + periods[periods.length - 1] : periods[0]) + "; the tick is where the pace ends up" : "Token limits per day, week or month";
+    if (!scoped.length) {
+      box.append(h("div", { class: "empty" },
+        h("p", { text: list.length ? "No budgets for this selection." : "No budgets yet. Set a daily, weekly or monthly limit and Pip will tap you on the shoulder at 80% and at 100%." }),
+        list.length ? null : h("a", { class: "btn", href: "#/settings/budgets", text: "Set a budget" })));
+      return;
+    }
+    for (const b of scoped) {
+      const pct = Math.round(b.ratio * 100), proj = Math.min(1.25, b.projected_ratio);
+      const row = h("div", { class: "budget-row " + b.state, title: fmt(b.used) + " of " + fmt(b.limit) + " " + b.metric + " tokens, " + b.period_start + " to " + b.period_end + ". At this pace: " + fmt(b.projected) + "." },
+        h("div", { class: "bh" }, h("b", { text: b.name }), span(pct + "%", "")),
+        h("div", { class: "budget-track", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "100", "aria-valuenow": String(Math.min(100, pct)), "aria-label": b.name },
+          h("i", { class: "used", style: "width:" + Math.min(100, b.ratio * 100).toFixed(1) + "%" }),
+          b.projected > b.used ? h("i", { class: "proj", style: "left:" + Math.min(100, proj * 100).toFixed(1) + "%" }) : null),
+        h("div", { class: "label-sm", text: compact(b.used) + " of " + compact(b.limit) + " " + b.metric + " · " + b.scope + " · pace " + compact(b.projected) + (b.state === "over" ? " · over the limit" : b.projected_ratio >= 1 ? " · on track to go over" : "") }));
+      box.append(row);
+    }
+  }
+
   // ---------------------------------------------------------------- filters
   function renderFilters() {
     for (const b of $("ranges").children) b.setAttribute("aria-pressed", String(b.dataset.r === S.range));
@@ -206,21 +305,56 @@ const Dashboard = (() => {
     for (const b of $("metric").children) b.setAttribute("aria-pressed", String(b.dataset.m === S.metric));
     for (const b of $("split").children) b.setAttribute("aria-pressed", String(b.dataset.s === S.split));
     $("split").hidden = S.meta.hosts.length < 2;
-    const chips = $("chips");
+    const chips = $("chips"), wasOpen = chips.querySelector("details")?.open;
+    const oldSearch = chips.querySelector("input[type=search]")?.value || "";
     chips.textContent = "";
-    for (const m of S.meta.models) {
-      const c = h("span", { class: "chip", tabindex: "0", role: "button", "aria-pressed": String(!S.hidden.has(m.model)), title: fmt(m.combined) + " combined tokens all time (" + fmt(m.input) + " in, " + fmt(m.output) + " out)" });
+    const toggle = (model) => {
+      if (S.hidden.has(model)) S.hidden.delete(model);
+      else if (S.hidden.size < S.meta.models.length - 1) S.hidden.add(model);
+      load();
+    };
+    // The busiest models as chips; the long tail behind "more".
+    const SHOWN = S.meta.models.length > 12 ? 9 : 12;
+    for (const m of S.meta.models.slice(0, SHOWN)) {
+      const c = h("span", { class: "chip", tabindex: "0", role: "button", "aria-pressed": String(!S.hidden.has(m.model)), title: fmt(m.combined) + " combined tokens all time (" + fmt(m.input) + " in, " + fmt(m.output) + " out). Click to hide or show." });
       c.append(h("i", { class: "sw", style: "background:var(" + colorVar(m.model) + ")" }), document.createTextNode(m.model));
-      const toggle = () => {
-        if (S.hidden.has(m.model)) S.hidden.delete(m.model);
-        else if (S.hidden.size < S.meta.models.length - 1) S.hidden.add(m.model);
-        load();
-      };
-      c.onclick = toggle;
-      c.onkeydown = (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); toggle(); } };
+      c.onclick = () => toggle(m.model);
+      c.onkeydown = (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); toggle(m.model); } };
       chips.append(c);
     }
+    if (S.meta.models.length > SHOWN) {
+      const rest = S.meta.models.length - SHOWN;
+      const chosen = S.meta.models.filter((m) => !S.hidden.has(m.model)).length;
+      const details = h("details", { class: "model-picker" });
+      const summary = h("summary", { class: "chip more", text: "+" + rest + " more · " + chosen + " of " + S.meta.models.length + " shown" });
+      details.open = !!wasOpen;
+      const pop = h("div", { class: "model-popover" });
+      const search = h("input", { type: "search", placeholder: "Find a model…", "aria-label": "Find a model" });
+      search.value = oldSearch;
+      const rows = h("div", { class: "model-options" });
+      const draw = () => {
+        rows.textContent = "";
+        const q = search.value.toLowerCase();
+        const models = S.meta.models.filter((m) => m.model.toLowerCase().includes(q));
+        for (const m of models.slice(0, 120)) {
+          const input = h("input", { type: "checkbox", "aria-label": m.model });
+          input.checked = !S.hidden.has(m.model);
+          input.onchange = () => toggle(m.model);
+          rows.append(h("label", { class: "model-option" }, input, h("i", { class: "sw", style: "background:var(" + colorVar(m.model) + ")" }), h("span", { text: m.model }), h("small", { text: compact(m.combined) })));
+        }
+        if (models.length > 120) rows.append(h("p", { class: "label-sm", text: "Showing 120 of " + models.length + ". Narrow the search." }));
+      };
+      const all = h("button", { type: "button", class: "small", text: "Show all" });
+      const top = h("button", { type: "button", class: "small", text: "Top 5 only" });
+      all.onclick = () => { S.hidden.clear(); load(); };
+      top.onclick = () => { S.hidden = new Set(S.meta.models.slice(5).map((m) => m.model)); load(); };
+      search.oninput = draw; draw();
+      pop.append(search, h("div", { class: "actions" }, all, top), rows);
+      details.append(summary, pop);
+      chips.append(details);
+    }
   }
+
   /** Marks the cards the token toggle changes, so it's clear what it does. */
   function markMetric() {
     for (const card of document.querySelectorAll("#page-dashboard .card")) {
@@ -240,18 +374,38 @@ const Dashboard = (() => {
   }
 
   // ---------------------------------------------------------------- hero
+  /** An exact count from the server (a string, so trillions stay exact), or the chart sum. */
+  function exact(field, fallback) {
+    const v = S.signals && S.signals[field];
+    try { return BigInt(v != null ? v : Math.round(fallback || 0)); } catch (e) { return BigInt(Math.round(fallback || 0)); }
+  }
+  const big = (b) => b.toLocaleString();
   function renderHero(D) {
     const key = S.metric;
     $("hero-lede").textContent = scopeName() + " rendered, " + rangeName() + ",";
     const numEl = $("hero-num");
     const fit = () => fitText(numEl, Math.min(112, Math.max(56, innerWidth * 0.085)), 30);
-    countUp(numEl, mv(D.tot, key), 1100, fit);
+    const value = exact(key, mv(D.tot, key));
+    if (value <= BigInt(Number.MAX_SAFE_INTEGER)) countUp(numEl, Number(value), 1100, fit);
+    else { numEl.dataset.v = "0"; numEl.textContent = big(value); }
+    numEl.title = big(value) + " " + METRIC_NAME[key] + " tokens, exactly";
     fit();
+    const inp = exact("input", D.tot.input), out = exact("output", D.tot.output), comb = exact("combined", D.tot.input + D.tot.output);
     const u = $("hero-unit"); u.textContent = "";
-    const w = words(mv(D.tot, key));
-    if (key === "combined") u.append(bold(w ? w + " " : ""), document.createTextNode("combined tokens: "), bold(fmt(D.tot.input)), document.createTextNode(" read in and "), bold(fmt(D.tot.output)), document.createTextNode(" written out, across "), bold(fmt(D.tot.requests)), document.createTextNode(" requests."));
-    else if (key === "output") u.append(bold(w ? w + " " : ""), document.createTextNode("output tokens, reading "), bold(fmt(D.tot.input)), document.createTextNode(" input tokens across "), bold(fmt(D.tot.requests)), document.createTextNode(" requests (" + fmt(D.tot.input + D.tot.output) + " combined)."));
-    else u.append(bold(w ? w + " " : ""), document.createTextNode("input tokens, writing back "), bold(fmt(D.tot.output)), document.createTextNode(" output tokens across "), bold(fmt(D.tot.requests)), document.createTextNode(" requests (" + fmt(D.tot.input + D.tot.output) + " combined)."));
+    const w = words(Number(value));
+    if (key === "combined") u.append(bold(w ? w + " " : ""), document.createTextNode("combined tokens: "), bold(big(inp)), document.createTextNode(" read in and "), bold(big(out)), document.createTextNode(" written out, across "), bold(fmt(D.tot.requests)), document.createTextNode(" requests."));
+    else if (key === "output") u.append(bold(w ? w + " " : ""), document.createTextNode("output tokens, reading "), bold(big(inp)), document.createTextNode(" input tokens across "), bold(fmt(D.tot.requests)), document.createTextNode(" requests (" + big(comb) + " combined)."));
+    else u.append(bold(w ? w + " " : ""), document.createTextNode("input tokens, writing back "), bold(big(out)), document.createTextNode(" output tokens across "), bold(fmt(D.tot.requests)), document.createTextNode(" requests (" + big(comb) + " combined)."));
+
+    // Signals: what's worth a look in this range, and a door to Pip.
+    const signals = $("signal-strip"); signals.textContent = "";
+    const refused = h("button", { class: "signal-card refused", type: "button", title: "Open the refusals on the Prompts page" }, h("b", { text: fmt(S.signals?.refused || 0) }), h("span", { text: "Refusals" }), h("small", { text: "Answers a model declined to give" }));
+    const noteworthy = h("button", { class: "signal-card noteworthy", type: "button", title: "Open code, structured and long answers on the Prompts page" }, h("b", { text: fmt(S.signals?.noteworthy || 0) }), h("span", { text: "Worth a closer look" }), h("small", { text: "Code, structured or substantial answers" }));
+    const ask = h("button", { class: "signal-card ask-pip", type: "button" }, h("img", { src: "/pip.svg", alt: "" }), h("span", {}, "Ask Pip about your trail", h("kbd", { text: "/" })), h("small", { text: "Your own model, with exact numbers from your CSV" }));
+    refused.onclick = () => Prompts.filter("refused");
+    noteworthy.onclick = () => Prompts.filter("noteworthy");
+    ask.onclick = () => PipChat.open();
+    signals.append(refused, noteworthy, ask);
 
     const n = D.days.length, today = S.meta.today;
     const todayIn = D.byDay.has(today);
@@ -276,11 +430,22 @@ const Dashboard = (() => {
 
   // ---------------------------------------------------------------- daily stacked columns
   let dailyGeom = null; // kept for the trail replay
+  function chartData(D) {
+    if(D.days.length<=90)return D;
+    const monthly=D.days.length>180, byDay=new Map(), blank=()=>({input:0,output:0,requests:0,gen_out:0,gen_ms:0,errors:0,estimated:0});
+    for(const d of D.days) {
+      const date=new Date(d+"T12:00:00Z");const key=monthly?d.slice(0,8)+"01":addDays(d,-((date.getUTCDay()+6)%7));
+      if(!byDay.has(key))byDay.set(key,new Map());const bin=byDay.get(key);
+      for(const [k,e]of D.byDay.get(d)){const cell=bin.get(k)||blank();for(const f in cell)cell[f]+=e[f]||0;bin.set(k,cell);}
+    }
+    return {...D,days:[...byDay.keys()],byDay,period:monthly?"month":"week",dayTotal:(d,key)=>[...byDay.get(d).values()].reduce((n,e)=>n+mv(e,key),0)};
+  }
   function renderDaily(D) {
+    D=chartData(D);
     const box = $("chart-daily");
     const key = S.metric;
-    $("daily-title").textContent = METRIC_TITLE[key] + " tokens per day, by " + (D.byHost ? "host" : "model");
-    $("daily-sub").textContent = fmt(mv(D.tot, key)) + " " + METRIC_NAME[key] + " tokens " + rangeName() + ". The line is the 7-day average.";
+    $("daily-title").textContent = METRIC_TITLE[key] + " tokens per "+(D.period||"day")+", by " + (D.byHost ? "host" : "model");
+    $("daily-sub").textContent = fmt(mv(D.tot, key)) + " " + METRIC_NAME[key] + " tokens " + rangeName() + ". The line is the moving average.";
     dailyGeom = null;
     if (!D.series.length) { legend($("legend-daily"), []); return emptyState(box, "Nothing counted in this range yet. Send a request through one of your hosts' Toktail ports and Pip will add it here."); }
     const W = Math.max(320, box.clientWidth), H = W > 700 ? 360 : 270;
@@ -335,12 +500,12 @@ const Dashboard = (() => {
         hl.setAttribute("x", m.l + band * i); hl.setAttribute("opacity", 0.08);
         const per = D.byDay.get(d);
         const rows = D.series.filter((k) => per.has(k)).map((k) => ({ color: sColor(D, k), label: sName(D, k), value: fmt(mv(per.get(k), key)), v: mv(per.get(k), key) })).sort((a, b) => b.v - a.v);
-        showTip(e, longDay(d), rows.length ? rows : [{ label: "No requests", value: "" }], { label: "Total " + METRIC_NAME[key] + (n >= 7 ? ", 7-day avg " + compact(ma[i]) : ""), value: fmt(totals[i]) });
+        showTip(e, longDay(d), rows.length ? rows : [{ label: "No requests", value: "" }], { label: "Total " + METRIC_NAME[key] + (n >= 7 ? ", 7-"+(D.period||"day")+" avg " + compact(ma[i]) : ""), value: fmt(totals[i]) });
       });
       r.addEventListener("pointerleave", () => { hl.setAttribute("opacity", 0); hideTip(); });
     });
     const items = D.series.map((k) => ({ label: sName(D, k), color: sColor(D, k) }));
-    if (n >= 7) items.push({ label: "7-day average", color: css("--ink"), line: true });
+    if (n >= 7) items.push({ label: "7-"+(D.period||"day")+" average", color: css("--ink"), line: true });
     legend($("legend-daily"), items.length >= 2 ? items : []);
     dailyGeom = { svg, W, H, xc, y, base: y(0), totals, days: D.days };
   }
@@ -460,7 +625,7 @@ const Dashboard = (() => {
       if (odd.length) add("!", ["Out of the ordinary: ", ...odd.flatMap((o, k) => [k ? ", " : "", bold(dayLabel(o.d)), " (" + (o.v > med ? (o.v / med).toFixed(1) + "× a typical day" : "unusually quiet") + ")"]), "."]);
       else add("✓", ["Steady going. A typical day is " + compact(med) + " " + word + " tokens and nothing stood out."]);
     }
-    const ps = [...D.perSeries.entries()].sort((a, b) => mv(b[1], key) - mv(a[1], key));
+    const ps = [...D.perSeries.entries()].filter(([k])=>k!=="__other__").sort((a, b) => mv(b[1], key) - mv(a[1], key));
     if (ps.length > 1 && mv(D.tot, key) > 0) add("◆", [bold(sName(D, ps[0][0])), " did " + Math.round((mv(ps[0][1], key) / mv(D.tot, key)) * 100) + "% of the work across " + ps.length + (D.byHost ? " hosts." : " models.")]);
     const speeds = ps.filter(([, v]) => v.gen_ms > 0 && v.gen_out > 50).map(([k, v]) => [k, v.gen_out / (v.gen_ms / 1000)]).sort((a, b) => b[1] - a[1]);
     if (speeds.length > 1) add("⚡", ["Fastest is ", bold(sName(D, speeds[0][0])), " at " + speeds[0][1].toFixed(1) + " tok/s. Slowest is ", bold(sName(D, speeds[speeds.length - 1][0])), " at " + speeds[speeds.length - 1][1].toFixed(1) + " tok/s."]);
@@ -649,7 +814,11 @@ const Dashboard = (() => {
     currentTable = { cols, rows, name };
     markMetric();
     if (!rows.length) return emptyState(box, S.tab === "repeats" ? "No prompt was sent twice in this range." : "No rows in this range.");
-    box.append(table(cols, rows));
+    let page=0;
+    const draw=()=>{
+      box.textContent="";box.append(table(cols,rows.slice(page*50,(page+1)*50)));
+      if(rows.length>50){const prev=h("button",{class:"small",type:"button",text:"Previous"}),next=h("button",{class:"small",type:"button",text:"Next"});prev.disabled=page===0;next.disabled=(page+1)*50>=rows.length;prev.onclick=()=>{page--;draw();};next.onclick=()=>{page++;draw();};box.append(h("div",{class:"table-pagination"},prev,h("span",{class:"label-sm",text:fmt(page*50+1)+"–"+fmt(Math.min(rows.length,(page+1)*50))+" of "+fmt(rows.length)}),next));}
+    };draw();
   }
   function exportTableCsv() {
     const { cols, rows, name } = currentTable;
@@ -716,11 +885,18 @@ const Dashboard = (() => {
     $("btn-table-csv").addEventListener("click", exportTableCsv);
     $("btn-raw-csv").addEventListener("click", () => { location.href = "/api/export.csv?" + qs(); });
     $("btn-replay").addEventListener("click", () => Stage.replay(dailyGeom));
+    $("btn-live-pause").addEventListener("click", (e) => {
+      S.feedPaused = !S.feedPaused;
+      e.currentTarget.setAttribute("aria-pressed", String(S.feedPaused));
+      e.currentTarget.textContent = S.feedPaused ? "Resume feed" : "Pause feed";
+      if (!S.feedPaused) renderFeed();
+    });
     $("baseline").addEventListener("change", async (e) => {
       try { await postJSON("/api/settings", { costs: { baseline: e.target.value } }); S.dataKey = ""; load(); }
       catch (err) { toast("Couldn't change the comparison: " + err.message); }
     });
   }
 
-  return { init, load, render, updateLive, rangeName, get geom() { return dailyGeom; } };
+  return { derive, chartData, init, load, render, updateLive, ingestLive, renderFeed, rangeName, scopeName, get geom() { return dailyGeom; } };
 })();
+

@@ -26,6 +26,7 @@ pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/api/records", get(list))
         .route("/api/records/delete", post(bulk_delete))
+        .route("/api/records/reconcile", post(reconcile))
         .route("/api/records/{id}", get(detail).delete(delete_one))
         .route("/api/records/{id}/note", post(set_note))
         .route("/api/records/{id}/{kind}", get(content))
@@ -41,6 +42,8 @@ struct ListQ {
     limit: Option<usize>,
     /// Free text: model, fingerprint, request id, title, tag or note.
     search: Option<String>,
+    outcome: Option<String>,
+    signal: Option<String>,
     starred: Option<bool>,
     /// "saved" (default): only rows with saved files; "all": every request.
     scope: Option<String>,
@@ -68,7 +71,25 @@ async fn list(State(app): State<Arc<App>>, Query(lq): Query<ListQ>) -> Response 
     let limit = lq.limit.unwrap_or(50).min(500);
     let offset = lq.offset.unwrap_or(0);
     let sort = lq.sort.clone().unwrap_or_else(|| "newest".into());
+    let text_hits = if let Some(q) = search.as_ref() {
+        crate::retrieval::warm(&app).await;
+        app.retrieval.matching_ids(q)
+    } else {
+        HashSet::new()
+    };
     let keep = |r: &Row| {
+        if lq.outcome.as_ref().is_some_and(|s| &r.outcome != s) {
+            return false;
+        }
+        if lq.signal.as_ref().is_some_and(|s| {
+            if s == "noteworthy" {
+                !["structured", "substantial", "tool_call"].contains(&r.signal.as_str())
+            } else {
+                &r.signal != s
+            }
+        }) {
+            return false;
+        }
         if only_saved && r.record.is_none() {
             return false;
         }
@@ -77,7 +98,8 @@ async fn list(State(app): State<Arc<App>>, Query(lq): Query<ListQ>) -> Response 
             return false;
         }
         if let Some(q) = &search {
-            let hit = r.model.to_lowercase().contains(q.as_str())
+            let hit = text_hits.contains(&r.request_id)
+                || r.model.to_lowercase().contains(q.as_str())
                 || r.host.to_lowercase().contains(q.as_str())
                 || r.request_id.starts_with(q.as_str())
                 || (q.len() >= 6 && r.fp_hex().starts_with(q.as_str()))
@@ -100,7 +122,7 @@ async fn list(State(app): State<Arc<App>>, Query(lq): Query<ListQ>) -> Response 
         .into_iter()
         .map(|r| {
             let note = r.record.as_deref().and_then(|s| notes.get(s)).cloned();
-            json!({ "row": r, "note": note })
+            json!({ "preview": app.retrieval.preview(&r.request_id), "row": r, "note": note })
         })
         .collect();
     Json(json!({ "total": total, "offset": offset, "rows": rows, "saving": app.config.read().capture.enabled })).into_response()
@@ -333,18 +355,25 @@ async fn bulk_delete(State(app): State<Arc<App>>, Json(b): Json<BulkIn>) -> Resp
 async fn delete_many(app: &Arc<App>, ids: Vec<String>, history: bool) -> Response {
     let mut files = 0;
     let mut errors = Vec::new();
+    let mut successful = HashSet::new();
     for id in &ids {
         if let Some(stem) = app.ledger.find(id).and_then(|r| r.record.map(String::from)) {
             match records::delete_files(app, &stem).await {
-                Ok(()) => files += 1,
+                Ok(()) => {
+                    files += 1;
+                    successful.insert(id.clone());
+                }
                 Err(e) => errors.push(format!("{id}: {e:#}")),
             }
+        } else {
+            successful.insert(id.clone());
         }
     }
+    let cleared = successful.clone();
     let mut rows = 0;
     if !history {
         // Keep the counts, but the row no longer points at files.
-        let set: HashSet<String> = ids.iter().cloned().collect();
+        let set = successful.clone();
         let a = app.clone();
         if let Ok(Err(e)) = tokio::task::spawn_blocking(move || a.ledger.forget_records(&set)).await
         {
@@ -352,7 +381,7 @@ async fn delete_many(app: &Arc<App>, ids: Vec<String>, history: bool) -> Respons
         }
     }
     if history {
-        let set: HashSet<String> = ids.into_iter().collect();
+        let set = successful;
         let a = app.clone();
         match tokio::task::spawn_blocking(move || a.ledger.delete_rows(&set)).await {
             Ok(Ok(n)) => rows = n,
@@ -363,6 +392,10 @@ async fn delete_many(app: &Arc<App>, ids: Vec<String>, history: bool) -> Respons
     if app.config.read().s3.enabled {
         app.sync_now.notify_one();
     }
+    for id in cleared {
+        app.retrieval.remove(&id);
+    }
+    let _ = records::collect_blobs(app).await;
     Json(json!({ "deleted_files": files, "deleted_rows": rows, "errors": errors })).into_response()
 }
 
@@ -437,5 +470,12 @@ async fn chat(State(app): State<Arc<App>>, Json(c): Json<ChatIn>) -> Response {
             format!("Couldn't reach Toktail's port for {} ({url}): {e}", h.name),
         )
             .into_response(),
+    }
+}
+
+async fn reconcile(State(app): State<Arc<App>>) -> Response {
+    match records::reconcile(&app, None).await {
+        Ok(n) => Json(json!({"removed":n})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

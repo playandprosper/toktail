@@ -270,6 +270,12 @@ pub struct SseTracker {
     strip_injected_usage: bool,
     /// When saving responses: the streamed answer and reasoning text.
     pub text: Option<(String, String)>,
+    /// Most bytes kept of each of the answer and the reasoning.
+    text_cap: usize,
+    /// Characters of answer text seen, including any past `text_cap`.
+    pub content_chars: u64,
+    pub refusal: bool,
+    pub tool_call: bool,
 }
 
 impl SseTracker {
@@ -282,12 +288,17 @@ impl SseTracker {
             first_token_at: None,
             strip_injected_usage,
             text: None,
+            text_cap: 0,
+            content_chars: 0,
+            refusal: false,
+            tool_call: false,
         }
     }
 
     /// Also collect the streamed text (for saving responses).
-    pub fn collect_text(mut self) -> Self {
+    pub fn collect_text(mut self, cap: usize) -> Self {
         self.text = Some((String::new(), String::new()));
+        self.text_cap = cap;
         self
     }
 
@@ -336,6 +347,21 @@ impl SseTracker {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return true;
         };
+        self.refusal |= v
+            .pointer("/delta/stop_reason")
+            .is_some_and(|s| s == "refusal")
+            || v.pointer("/choices/0/delta/refusal")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+            || v["type"] == "response.refusal.delta"
+            || v.pointer("/choices/0/finish_reason")
+                .is_some_and(|s| s == "content_filter");
+        self.tool_call |= v["type"] == "response.function_call_arguments.delta"
+            || v.pointer("/item/type")
+                .is_some_and(|s| s == "function_call")
+            || v.pointer("/choices/0/delta/tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty());
         scan_usage(&v, &mut self.usage);
         if self.model.is_none() {
             self.model = response_model(&v);
@@ -346,7 +372,22 @@ impl SseTracker {
         }
         self.deltas += d;
         if let Some((c, r)) = self.text.as_mut() {
-            delta_text(&v, c, r);
+            // Count every character, keep at most `text_cap` bytes of each.
+            let (mut dc, mut dr) = (String::new(), String::new());
+            delta_text(&v, &mut dc, &mut dr);
+            self.content_chars += dc.chars().count() as u64;
+            for (buf, add) in [(c, dc), (r, dr)] {
+                let room = self.text_cap.saturating_sub(buf.len());
+                if room >= add.len() {
+                    buf.push_str(&add);
+                } else if room > 0 {
+                    let mut n = room;
+                    while !add.is_char_boundary(n) {
+                        n -= 1;
+                    }
+                    buf.push_str(&add[..n]);
+                }
+            }
         }
         if self.strip_injected_usage {
             let empty_choices = v

@@ -6,9 +6,11 @@
 //! In memory only. The CSV stays the record of what happened; this is the
 //! pulse of what is happening right now.
 
+use chrono::{DateTime, Local};
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -162,6 +164,189 @@ pub fn pip_state(s: &Snapshot, stampede_tps: f64) -> PipState {
     }
 }
 
+// ------------------------------------------------------------ activity
+
+/// What is streaming right now, request by request, and what just finished.
+/// The portal's live feed reads this every second. Counts and timings only:
+/// never prompt or response text.
+pub struct Activity {
+    next: AtomicU64,
+    inner: Mutex<ActivityInner>,
+}
+
+#[derive(Default)]
+struct ActivityInner {
+    flying: BTreeMap<u64, Flight>,
+    done: VecDeque<Finished>,
+    seq: u64,
+}
+
+struct Flight {
+    host: String,
+    model: String,
+    endpoint: String,
+    streamed: bool,
+    started: Instant,
+    started_at: DateTime<Local>,
+    output: u64,
+    first_token: Option<Instant>,
+}
+
+/// A request in flight, as the portal sees it.
+#[derive(Debug, Clone, Serialize)]
+pub struct FlightView {
+    pub id: u64,
+    pub host: String,
+    pub model: String,
+    pub endpoint: String,
+    pub streamed: bool,
+    pub started_at: String,
+    pub elapsed_ms: u64,
+    /// Output tokens streamed so far (about one per delta).
+    pub output: u64,
+    pub ttft_ms: Option<u64>,
+    /// Output tokens per second since the first token.
+    pub tokens_per_sec: Option<f64>,
+}
+
+/// A request that just finished.
+#[derive(Debug, Clone, Serialize)]
+pub struct Finished {
+    pub seq: u64,
+    pub request_id: String,
+    pub host: String,
+    pub model: String,
+    pub endpoint: String,
+    pub status: u16,
+    pub input: u64,
+    pub output: u64,
+    pub duration_ms: u64,
+    pub ttft_ms: Option<u64>,
+    pub tokens_per_sec: Option<f64>,
+    pub outcome: String,
+    pub signal: String,
+    pub finished_at: String,
+}
+
+const KEEP_FINISHED: usize = 300;
+
+/// Removes its request from the in-flight list when dropped, however it ends.
+pub struct FlightGuard {
+    activity: Arc<Activity>,
+    id: u64,
+}
+
+impl FlightGuard {
+    /// Streamed output so far, and when the first token arrived.
+    pub fn progress(&self, output: u64, first_token: Option<Instant>) {
+        if let Some(f) = self.activity.inner.lock().flying.get_mut(&self.id) {
+            f.output = output;
+            if f.first_token.is_none() {
+                f.first_token = first_token;
+            }
+        }
+    }
+    /// The model, once the response names it.
+    pub fn set_model(&self, model: &str) {
+        if let Some(f) = self.activity.inner.lock().flying.get_mut(&self.id) {
+            if f.model != model {
+                f.model = model.to_string();
+            }
+        }
+    }
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        self.activity.inner.lock().flying.remove(&self.id);
+    }
+}
+
+impl Activity {
+    pub fn new() -> Arc<Activity> {
+        Arc::new(Activity {
+            next: AtomicU64::new(1),
+            inner: Mutex::new(ActivityInner::default()),
+        })
+    }
+
+    pub fn begin(
+        self: &Arc<Self>,
+        host: &str,
+        model: Option<&str>,
+        endpoint: &str,
+        streamed: bool,
+    ) -> FlightGuard {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.inner.lock().flying.insert(
+            id,
+            Flight {
+                host: host.to_string(),
+                model: model.unwrap_or("unknown").to_string(),
+                endpoint: endpoint.to_string(),
+                streamed,
+                started: Instant::now(),
+                started_at: Local::now(),
+                output: 0,
+                first_token: None,
+            },
+        );
+        FlightGuard {
+            activity: self.clone(),
+            id,
+        }
+    }
+
+    /// Records a finished request; `seq` is filled in here.
+    pub fn finish(&self, mut f: Finished) {
+        let mut i = self.inner.lock();
+        i.seq += 1;
+        f.seq = i.seq;
+        i.done.push_back(f);
+        while i.done.len() > KEEP_FINISHED {
+            i.done.pop_front();
+        }
+    }
+
+    /// Everything in flight, and up to `limit` finished requests newer than `since`.
+    pub fn snapshot(&self, since: u64, limit: usize) -> (Vec<FlightView>, Vec<Finished>, u64) {
+        let i = self.inner.lock();
+        let now = Instant::now();
+        let flying = i
+            .flying
+            .iter()
+            .map(|(id, f)| {
+                let ttft = f.first_token.map(|t| t.duration_since(f.started));
+                let gen = f.first_token.map(|t| now.duration_since(t).as_secs_f64());
+                FlightView {
+                    id: *id,
+                    host: f.host.clone(),
+                    model: f.model.clone(),
+                    endpoint: f.endpoint.clone(),
+                    streamed: f.streamed,
+                    started_at: f.started_at.to_rfc3339(),
+                    elapsed_ms: now.duration_since(f.started).as_millis() as u64,
+                    output: f.output,
+                    ttft_ms: ttft.map(|d| d.as_millis() as u64),
+                    tokens_per_sec: gen
+                        .filter(|g| *g > 0.25 && f.output > 0)
+                        .map(|g| f.output as f64 / g),
+                }
+            })
+            .collect();
+        let mut done: Vec<Finished> = i
+            .done
+            .iter()
+            .rev()
+            .filter(|f| f.seq > since)
+            .take(limit)
+            .cloned()
+            .collect();
+        done.reverse();
+        (flying, done, i.seq)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +373,34 @@ mod tests {
         let guards: Vec<_> = (0..4).map(|_| live.begin()).collect();
         assert_eq!(pip_state(&live.snapshot(5), 0.0), PipState::Stampede);
         drop(guards);
+    }
+
+    #[test]
+    fn activity_tracks_flights_and_finishes() {
+        let a = Activity::new();
+        let g = a.begin("studio", Some("qwen"), "/v1/chat/completions", true);
+        g.progress(12, Some(Instant::now()));
+        let (fl, done, seq) = a.snapshot(0, 10);
+        assert_eq!((fl.len(), fl[0].output, done.len(), seq), (1, 12, 0, 0));
+        drop(g);
+        a.finish(Finished {
+            seq: 0,
+            request_id: "r".into(),
+            host: "studio".into(),
+            model: "qwen".into(),
+            endpoint: "/v1/chat/completions".into(),
+            status: 200,
+            input: 5,
+            output: 12,
+            duration_ms: 100,
+            ttft_ms: Some(10),
+            tokens_per_sec: Some(133.0),
+            outcome: "complete".into(),
+            signal: "brief".into(),
+            finished_at: String::new(),
+        });
+        let (fl, done, seq) = a.snapshot(0, 10);
+        assert_eq!((fl.len(), done.len(), seq), (0, 1, 1));
+        assert!(a.snapshot(1, 10).1.is_empty(), "nothing newer than seq 1");
     }
 }

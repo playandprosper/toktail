@@ -187,7 +187,7 @@ const Stage = (() => {
   async function brain() {
     for (;;) {
       await sleep(350);
-      if (!pip || phase !== "trail" || busy || document.hidden) continue;
+      if (!pip || phase !== "trail" || busy || PipChat.isOpen() || document.hidden) continue;
       if (reduced() || !roams()) {
         if (spot.kind !== "ground") await toGround();
         continue;
@@ -279,7 +279,7 @@ const Stage = (() => {
   // ================================================================ the trail
   async function trailLoop() {
     for (;;) {
-      if (phase !== "trail" || busy || spot.kind !== "ground" || document.hidden) { await sleep(200); continue; }
+      if (phase !== "trail" || busy || PipChat.isOpen() || spot.kind !== "ground" || document.hidden) { await sleep(200); continue; }
       const st = state;
       if (st === "idle" || reduced() || !roams()) { await sleep(300); continue; }
       const L = S.live || { tokens_per_sec: 0 };
@@ -302,7 +302,8 @@ const Stage = (() => {
   async function poll() {
     clearTimeout(liveTimer);
     try {
-      const L = await getJSON("/api/live?seconds=60");
+      const L = await getJSON("/api/live?seconds=60&since=" + (S.liveSeq || 0));
+      if (typeof Dashboard !== "undefined") Dashboard.ingestLive(L);
       S.live = L;
       const next = L.state;
       if (next !== state) {
@@ -339,15 +340,26 @@ const Stage = (() => {
   const QUIPS = [
     () => S.lastData ? "This range: " + compact(S.lastData.tot.input + S.lastData.tot.output) + " tokens, in and out. Yum." : "Every token leaves a trail.",
     () => "All time: " + fmt(S.meta ? S.meta.models.reduce((s, m) => s + m.combined, 0) : 0) + " tokens. I counted every one.",
-    () => "Every token leaves a trail.",
+    () => "Press / and ask me anything about your trail.",
     () => S.live && S.live.typical_tps ? "Your usual speed is " + S.live.typical_tps.toFixed(1) + " tok/s." : "Waiting for tokens…",
-    () => "Point at a card and I'll hop over.",
+    () => { const f = (S.flights || []).length; return f ? f + " request" + (f === 1 ? "" : "s") + " streaming right now. Nom!" : "Point at a card and I'll hop over."; },
+    () => S.meta && S.meta.models[0] ? "Busiest model ever: " + S.meta.models[0].model + "." : "Every token leaves a trail.",
+    () => "Double-click me to chat.",
   ];
-  let quip = 0;
+  let quip = 0, clickTimer = 0;
+  /** One click: a fact about your tokens. Two: open the chat. */
   function onPipClick() {
     if (phase !== "trail") return;
-    pip.say(QUIPS[quip++ % QUIPS.length](), 3600);
-    if (!reduced() && !pip.leapT) pip.hop();
+    clearTimeout(clickTimer);
+    clickTimer = setTimeout(() => {
+      pip.say(QUIPS[quip++ % QUIPS.length](), 3600);
+      if (!reduced() && !pip.leapT) pip.hop();
+    }, 230);
+  }
+  function onPipDouble() {
+    if (phase !== "trail") return;
+    clearTimeout(clickTimer);
+    PipChat.open();
   }
 
   // ================================================================ replay
@@ -408,10 +420,15 @@ const Stage = (() => {
     pip.onStep = (x, y, s) => Pip.step(x, y, s);
     const root = pip.svg.querySelector(".pip-root");
     root.addEventListener("click", onPipClick);
+    root.addEventListener("dblclick", onPipDouble);
     pip.svg.setAttribute("tabindex", "0");
     pip.svg.setAttribute("role", "button");
-    pip.svg.setAttribute("aria-label", "Pip the Token Fox");
-    pip.svg.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPipClick(); } });
+    pip.svg.removeAttribute("aria-hidden");
+    pip.svg.setAttribute("aria-label", "Pip the Token Fox. Enter for a token fact, C to chat.");
+    pip.svg.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPipClick(); }
+      else if (e.key === "c" || e.key === "C") { e.preventDefault(); PipChat.open(); }
+    });
     addEventListener("pointermove", (e) => {
       pointer.x = e.clientX; pointer.y = e.clientY; pointer.t = performance.now();
       const c = cardAt(e.clientX, e.clientY);
@@ -446,3 +463,4 @@ const Stage = (() => {
     },
   };
 })();
+

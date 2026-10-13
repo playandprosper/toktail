@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-pub const HEADER: [&str; 16] = [
+pub const HEADER: [&str; 23] = [
     "request_id",
     "timestamp",
     "local_date",
@@ -34,6 +34,13 @@ pub const HEADER: [&str; 16] = [
     "prompt_sha256",
     "host",
     "record",
+    "outcome",
+    "signal",
+    "response_chars",
+    "prompt_blob",
+    "prompt_key",
+    "response_key",
+    "reference_key",
 ];
 
 /// One finished request, ready to be appended.
@@ -58,6 +65,13 @@ pub struct Record {
     /// Saved prompt/response files, as a path stem under the capture folder
     /// ("studio/2026/10/11/2026-10-11-14-03-22"). Empty when not captured.
     pub record: String,
+    pub outcome: String,
+    pub signal: String,
+    pub response_chars: u64,
+    pub prompt_blob: String,
+    pub prompt_key: String,
+    pub response_key: String,
+    pub reference_key: String,
 }
 
 /// Generation time: from first token to end for streams, whole request otherwise.
@@ -95,6 +109,13 @@ pub struct Row {
     pub fp: Option<[u8; 32]>,
     pub host: Arc<str>,
     pub record: Option<Box<str>>,
+    pub outcome: String,
+    pub signal: String,
+    pub response_chars: u64,
+    pub prompt_blob: String,
+    pub prompt_key: String,
+    pub response_key: String,
+    pub reference_key: String,
 }
 
 impl Row {
@@ -111,7 +132,7 @@ impl Row {
     pub fn tokens_per_sec(&self) -> Option<f64> {
         tps(self.output, self.gen_ms)
     }
-    fn to_csv_fields(&self) -> [String; 16] {
+    fn to_csv_fields(&self) -> [String; 23] {
         [
             self.request_id.clone(),
             self.timestamp()
@@ -132,6 +153,13 @@ impl Row {
             self.fp_hex(),
             self.host.to_string(),
             self.record.as_deref().unwrap_or("").to_string(),
+            self.outcome.clone(),
+            self.signal.clone(),
+            self.response_chars.to_string(),
+            self.prompt_blob.clone(),
+            self.prompt_key.clone(),
+            self.response_key.clone(),
+            self.reference_key.clone(),
         ]
     }
 }
@@ -169,6 +197,20 @@ struct CsvRow {
     host: String,
     #[serde(default)]
     record: String,
+    #[serde(default)]
+    outcome: String,
+    #[serde(default)]
+    signal: String,
+    #[serde(default)]
+    response_chars: String,
+    #[serde(default)]
+    prompt_blob: String,
+    #[serde(default)]
+    prompt_key: String,
+    #[serde(default)]
+    response_key: String,
+    #[serde(default)]
+    reference_key: String,
 }
 
 #[derive(Default)]
@@ -210,6 +252,7 @@ pub struct Ledger {
     write_lock: Mutex<()>,
     /// Host for rows written before Toktail tracked more than one host.
     default_host: String,
+    dirty: Mutex<HashSet<String>>,
 }
 
 pub fn file_name_for(date: NaiveDate) -> String {
@@ -234,6 +277,7 @@ impl Ledger {
             data: RwLock::new(Data::default()),
             write_lock: Mutex::new(()),
             default_host: default_host.to_string(),
+            dirty: Mutex::new(HashSet::new()),
         });
         l.migrate_headers();
         l.refresh(true);
@@ -262,6 +306,11 @@ impl Ledger {
             let mut tmp = Data::default();
             match parse_file(&path, &mut tmp, &self.default_host) {
                 Ok((rows, _)) => {
+                    let backup = path.with_extension("csv.pre-v0.5.bak");
+                    if !backup.exists() && std::fs::copy(&path, &backup).is_err() {
+                        log::warn!("{name}: could not create migration backup");
+                        continue;
+                    }
                     if let Err(e) = write_rows(&path, rows.iter()) {
                         log::warn!("{name}: could not add the host column: {e:#}");
                     } else {
@@ -311,8 +360,10 @@ impl Ledger {
         Ok(removed)
     }
 
-    /// Clears the `record` column of these rows (their files were deleted
-    /// but the counts stay). Returns how many rows changed.
+    /// Clears the `record` column (and the key ids that went with the files)
+    /// of these rows: their files were deleted but the counts stay. The CSV is
+    /// the token history, so losing a saved prompt never loses a count.
+    /// Returns how many rows changed.
     pub fn forget_records(&self, ids: &HashSet<String>) -> Result<usize> {
         self.refresh(true);
         let _w = self.write_lock.lock();
@@ -334,6 +385,10 @@ impl Ledger {
                             let mut r = r.clone();
                             if r.record.is_some() && ids.contains(&r.request_id) {
                                 r.record = None;
+                                r.prompt_blob.clear();
+                                r.prompt_key.clear();
+                                r.response_key.clear();
+                                r.reference_key.clear();
                                 changed += 1;
                             }
                             r
@@ -351,16 +406,62 @@ impl Ledger {
         Ok(changed)
     }
 
+    /// Persist lazily discovered signals for legacy captures in one rewrite per month.
+    pub fn update_signals(&self, changes: &HashMap<String, (String, String, u64)>) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        self.refresh(true);
+        let guard = self.write_lock.lock();
+        let targets: Vec<_> = self
+            .data
+            .read()
+            .files
+            .iter()
+            .filter(|(_, f)| f.rows.iter().any(|r| changes.contains_key(&r.request_id)))
+            .map(|(name, f)| {
+                let mut rows = f.rows.clone();
+                for r in &mut rows {
+                    if let Some((outcome, signal, chars)) = changes.get(&r.request_id) {
+                        r.outcome = outcome.clone();
+                        r.signal = signal.clone();
+                        r.response_chars = *chars;
+                    }
+                }
+                (name.clone(), rows)
+            })
+            .collect();
+        for (name, rows) in targets {
+            write_rows(&self.dir.join(name), rows.iter())?;
+        }
+        drop(guard);
+        self.refresh(true);
+        Ok(())
+    }
+
     /// One row by request id.
     pub fn find(&self, id: &str) -> Option<Row> {
         self.with_data(|d| d.rows().find(|r| r.request_id == id).cloned())
+    }
+
+    pub fn flush(&self) -> Result<()> {
+        let _w = self.write_lock.lock();
+        let names = self.dirty.lock().clone();
+        for name in names {
+            OpenOptions::new()
+                .write(true)
+                .open(self.dir.join(&name))?
+                .sync_data()?;
+            self.dirty.lock().remove(&name);
+        }
+        Ok(())
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    /// Appends one request to this month's CSV (fsynced) and to the cache.
+    /// Appends immediately to CSV/cache; durability is grouped every two seconds.
     pub fn append(&self, rec: &Record) -> Result<()> {
         let _w = self.write_lock.lock();
         let date = rec.timestamp.date_naive();
@@ -402,11 +503,18 @@ impl Ledger {
                 &rec.prompt_sha256,
                 &rec.host,
                 &rec.record,
+                &rec.outcome,
+                &rec.signal,
+                &rec.response_chars.to_string(),
+                &rec.prompt_blob,
+                &rec.prompt_key,
+                &rec.response_key,
+                &rec.reference_key,
             ])?;
             w.flush()?;
         }
         file.write_all(&buf)?;
-        file.sync_data()?;
+        self.dirty.lock().insert(name.clone());
         drop(file);
         let after = meta(&path);
 
@@ -445,6 +553,13 @@ impl Ledger {
                 fp: parse_fp(&rec.prompt_sha256),
                 host,
                 record: (!rec.record.is_empty()).then(|| rec.record.clone().into_boxed_str()),
+                outcome: rec.outcome.clone(),
+                signal: rec.signal.clone(),
+                response_chars: rec.response_chars,
+                prompt_blob: rec.prompt_blob.clone(),
+                prompt_key: rec.prompt_key.clone(),
+                response_key: rec.response_key.clone(),
+                reference_key: rec.reference_key.clone(),
             };
             let f = data.files.entry(name).or_default();
             f.rows.push(row);
@@ -463,7 +578,7 @@ impl Ledger {
             let d = self.data.read();
             if !force
                 && d.last_scan
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
             {
                 return;
             }
@@ -477,7 +592,7 @@ impl Ledger {
                 .collect(),
             Err(e) => {
                 log::warn!("cannot list {}: {e}", self.dir.display());
-                Vec::new()
+                return;
             }
         };
         names.sort();
@@ -530,6 +645,7 @@ fn write_rows<'a>(path: &Path, rows: impl Iterator<Item = &'a Row>) -> Result<()
             w.write_record(r.to_csv_fields())?;
         }
         w.flush()?;
+        w.into_inner()?.sync_data()?;
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -588,6 +704,13 @@ fn parse_file(path: &Path, data: &mut Data, default_host: &str) -> Result<(Vec<R
             }),
             record: (!r.record.trim().is_empty())
                 .then(|| r.record.trim().to_string().into_boxed_str()),
+            outcome: r.outcome,
+            signal: r.signal,
+            response_chars: num(&r.response_chars),
+            prompt_blob: r.prompt_blob,
+            prompt_key: r.prompt_key,
+            response_key: r.response_key,
+            reference_key: r.reference_key,
         });
     }
     Ok((rows, bad))
@@ -670,6 +793,7 @@ pub fn daily(data: &Data, f: &Filter) -> Vec<DailyEntry> {
 }
 
 /// Today's totals per host, for the menu bar and the host strip.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub fn day_by_host(data: &Data, day: NaiveDate) -> BTreeMap<String, Totals> {
     let mut map: BTreeMap<String, Totals> = BTreeMap::new();
     for r in data.rows().filter(|r| r.date == day) {
@@ -679,6 +803,7 @@ pub fn day_by_host(data: &Data, day: NaiveDate) -> BTreeMap<String, Totals> {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub struct ModelTotals {
     pub model: String,
     #[serde(flatten)]
@@ -686,6 +811,7 @@ pub struct ModelTotals {
 }
 
 /// Today's totals per model, for the menu bar.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub fn day_by_model(data: &Data, day: NaiveDate) -> Vec<ModelTotals> {
     let mut map: BTreeMap<Arc<str>, Totals> = BTreeMap::new();
     for r in data.rows().filter(|r| r.date == day) {
@@ -753,6 +879,9 @@ pub struct RecentRow {
     pub prompt_sha256: String,
     /// True when the prompt and response were saved.
     pub captured: bool,
+    pub outcome: String,
+    pub signal: String,
+    pub response_chars: u64,
     /// Their path stem under the capture folder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record: Option<String>,
@@ -778,6 +907,9 @@ impl From<&Row> for RecentRow {
             source: r.source.to_string(),
             prompt_sha256: r.fp_hex(),
             captured: r.record.is_some(),
+            outcome: r.outcome.clone(),
+            signal: r.signal.clone(),
+            response_chars: r.response_chars,
             record: r.record.as_deref().map(String::from),
         }
     }
@@ -947,6 +1079,13 @@ mod tests {
             prompt_sha256: fp.into(),
             host: "studio".into(),
             record: String::new(),
+            outcome: String::new(),
+            signal: String::new(),
+            response_chars: 0,
+            prompt_blob: String::new(),
+            prompt_key: String::new(),
+            response_key: String::new(),
+            reference_key: String::new(),
         }
     }
 
@@ -1046,7 +1185,8 @@ mod migration_tests {
         .unwrap();
         let l = Ledger::open(dir.clone(), "studio").unwrap();
         let text = std::fs::read_to_string(dir.join("tokens-2026-09.csv")).unwrap();
-        assert!(text.lines().next().unwrap().ends_with("host,record"));
+        assert_eq!(text.lines().next().unwrap(), HEADER.join(","));
+        assert!(dir.join("tokens-2026-09.csv.pre-v0.5.bak").exists());
         assert_eq!(&*l.find("a").unwrap().host, "studio");
         std::fs::remove_dir_all(dir).ok();
     }

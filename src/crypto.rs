@@ -104,6 +104,9 @@ pub trait KeyStore: Send + Sync {
     fn get(&self, id: &[u8; 16]) -> Result<[u8; 32]>;
     fn delete(&self, id: &[u8; 16]) -> Result<()>;
     fn describe(&self) -> String;
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn key_from_b64(s: &str) -> Result<[u8; 32]> {
@@ -117,6 +120,8 @@ fn key_from_b64(s: &str) -> Result<[u8; 32]> {
 pub struct FileKeyStore {
     path: PathBuf,
     master: [u8; 32],
+    dirty: Mutex<bool>,
+    journal: Mutex<()>,
     keys: Mutex<HashMap<[u8; 16], [u8; 32]>>,
 }
 
@@ -153,10 +158,13 @@ impl FileKeyStore {
             path,
             master,
             keys: Mutex::new(keys),
+            dirty: Mutex::new(false),
+            journal: Mutex::new(()),
         })
     }
 
     fn append(&self, entry: &str) -> Result<()> {
+        let _guard = self.journal.lock();
         let (nonce, ct) = seal(&self.master, b"toktail-keystore", entry.as_bytes())?;
         let mut raw = nonce;
         raw.extend(ct);
@@ -165,12 +173,23 @@ impl FileKeyStore {
             .append(true)
             .open(&self.path)?;
         writeln!(f, "{}", B64.encode(raw))?;
-        f.sync_data()?;
+        *self.dirty.lock() = true;
         Ok(())
     }
 }
 
 impl KeyStore for FileKeyStore {
+    fn flush(&self) -> Result<()> {
+        let _guard = self.journal.lock();
+        if *self.dirty.lock() {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.path)?
+                .sync_data()?;
+            *self.dirty.lock() = false;
+        }
+        Ok(())
+    }
     fn put(&self, id: &[u8; 16], key: &[u8; 32]) -> Result<()> {
         self.append(&format!("{},{}", hex::encode(id), B64.encode(key)))?;
         self.keys.lock().insert(*id, *key);
@@ -609,6 +628,41 @@ impl Crypto {
             m => bail!("unknown file format {m}"),
         };
         gunzip(&gz)
+    }
+
+    pub fn flush(&self) -> Result<()> {
+        if let Some(ks) = self.state.read().keystore.as_ref() {
+            ks.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn key_id(data: &[u8]) -> String {
+        if data.len() >= 21 && &data[..4] == MAGIC && data[4] == MODE_PER_FILE {
+            hex::encode(&data[5..21])
+        } else {
+            String::new()
+        }
+    }
+
+    pub fn forget_id(&self, id: &str) {
+        if let Ok(bytes) = hex::decode(id) {
+            if let Ok(id) = <[u8; 16]>::try_from(bytes) {
+                if let Some(ks) = self.state.read().keystore.as_ref() {
+                    let _ = ks.delete(&id);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn fixture_per_file(&self, path: PathBuf) {
+        *self.state.write() = State {
+            mode: Mode::PerFile,
+            master: Some([9; 32]),
+            keystore: Some(Box::new(FileKeyStore::open(path, [9; 32]).unwrap())),
+            problem: None,
+        };
     }
 
     /// Forgets a per-file key (after its file is deleted).

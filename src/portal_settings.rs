@@ -2,7 +2,8 @@
 //! Settings, hosts, hardware and savings endpoints for the portal.
 //!
 //! Secrets (API tokens, the encryption password, key-store tokens, the S3
-//! secret key) are accepted here and stored in the Keychain. They are never
+//! secret key) are accepted here and stored in the Keychain (Credential
+//! Manager on Windows). They are never
 //! sent back: the portal only learns whether one is saved and its last four
 //! characters.
 
@@ -168,6 +169,8 @@ pub fn settings_json(app: &App) -> serde_json::Value {
         "config_file": app.paths.config_file.display().to_string(),
         "data_dir": app.ledger.dir().display().to_string(),
         "demo": app.demo,
+        "secret_store": crate::platform::secret_store_name(),
+        "os": std::env::consts::OS,
     })
 }
 
@@ -471,18 +474,25 @@ async fn set_settings(State(app): State<Arc<App>>, Json(body): Json<SettingsIn>)
 
     if let Some(pw) = &new_password {
         if let Err(e) = secrets::set_encryption_password(Some(pw)) {
-            return server_error(format!("Couldn't save the password to the Keychain: {e:#}"));
+            return server_error(format!(
+                "Couldn't save the password to the {}: {e:#}",
+                crate::platform::secret_store_name()
+            ));
         }
     }
     for (name, v) in named {
         if let Err(e) = secrets::set_named_secret(name, v.as_deref()) {
-            return server_error(format!("Couldn't save to the Keychain: {e:#}"));
+            return server_error(format!(
+                "Couldn't save to the {}: {e:#}",
+                crate::platform::secret_store_name()
+            ));
         }
     }
     if let Some(secret) = &new_s3_secret {
         if let Err(e) = secrets::set_s3_secret(&cfg.s3.access_key_id, Some(secret)) {
             return server_error(format!(
-                "Couldn't save the S3 secret to the Keychain: {e:#}"
+                "Couldn't save the S3 secret to the {}: {e:#}",
+                crate::platform::secret_store_name()
             ));
         }
     }
@@ -694,23 +704,9 @@ async fn test_s3(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
 
 /// Opens the macOS folder picker and returns the chosen path.
 async fn pick_folder() -> Response {
-    if !cfg!(target_os = "macos") {
-        return (StatusCode::NOT_IMPLEMENTED, "Type the folder path instead.").into_response();
-    }
-    let out = tokio::process::Command::new("osascript")
-        .args(["-e", "POSIX path of (choose folder with prompt \"Where should Toktail save prompts and responses?\")"])
-        .output()
-        .await;
-    match out {
-        Ok(o) if o.status.success() => {
-            let p = String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .trim_end_matches('/')
-                .to_string();
-            Json(json!({ "path": p })).into_response()
-        }
-        Ok(_) => Json(json!({ "path": null })).into_response(),
-        Err(e) => server_error(e.to_string()),
+    match crate::platform::pick_folder("Where should Toktail save prompts and responses?").await {
+        Ok(p) => Json(json!({ "path": p })).into_response(),
+        Err(e) => (StatusCode::NOT_IMPLEMENTED, e).into_response(),
     }
 }
 

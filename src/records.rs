@@ -21,14 +21,17 @@ use crate::app::App;
 use crate::s3sync;
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Local, NaiveDate};
+use notify::Watcher;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -67,17 +70,26 @@ pub struct Note {
 }
 
 struct Job {
-    stem: String,
-    prompt: Vec<u8>,
-    response: Vec<u8>,
+    rec: crate::ledger::Record,
+    prompt: Option<Vec<u8>>,
+    response: Option<Vec<u8>>,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 pub struct Records {
+    pub mutation: Mutex<()>,
+    scan: tokio::sync::Mutex<()>,
+    blobs: tokio::sync::Mutex<()>,
+    pub blob_cache: Mutex<std::collections::HashMap<String, String>>,
+    cursor: AtomicUsize,
+    jobs: AtomicUsize,
+    budget: Arc<Semaphore>,
     tx: Mutex<Option<mpsc::Sender<Job>>>,
     /// Stems handed out in the current second, so names never collide.
     alloc: Mutex<(i64, HashSet<String>)>,
     /// Stems written locally but not yet in S3.
     pending: Mutex<Vec<String>>,
+    pending_io: Mutex<()>,
     /// Notes by stem (kept sealed in `notes.tkt`).
     notes: Mutex<BTreeMap<String, Note>>,
     pub errors: Mutex<Option<String>>,
@@ -92,9 +104,17 @@ impl Default for Records {
 impl Records {
     pub fn new() -> Records {
         Records {
+            mutation: Mutex::new(()),
+            scan: tokio::sync::Mutex::new(()),
+            blobs: tokio::sync::Mutex::new(()),
+            blob_cache: Mutex::new(Default::default()),
+            cursor: AtomicUsize::new(0),
+            jobs: AtomicUsize::new(0),
+            budget: Arc::new(Semaphore::new(128 * 1024 * 1024)),
             tx: Mutex::new(None),
             alloc: Mutex::new((0, HashSet::new())),
             pending: Mutex::new(Vec::new()),
+            pending_io: Mutex::new(()),
             notes: Mutex::new(BTreeMap::new()),
             errors: Mutex::new(None),
         }
@@ -168,6 +188,10 @@ fn s3_on(app: &App) -> bool {
     c.s3.enabled && c.capture.s3_upload
 }
 
+fn mirror_available(app: &App) -> bool {
+    app.config.read().s3.enabled
+}
+
 /// Stems may only contain what `allocate` produces: no "..", no leading "/".
 pub fn valid_stem(stem: &str) -> bool {
     !stem.is_empty()
@@ -178,77 +202,204 @@ pub fn valid_stem(stem: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '/' || c == '_')
 }
 
-/// Starts the writer thread and loads the upload queue and notes.
+/// A bounded writer keeps compression, encryption and CSV work off proxy workers.
 pub fn start(app: Arc<App>) {
-    let (tx, rx) = mpsc::channel::<Job>();
+    if app.config.read().capture.enabled {
+        let _ = std::fs::create_dir_all(root(&app));
+    }
+    let (tx, mut rx) = mpsc::channel::<Job>(128);
     *app.records.tx.lock() = Some(tx);
     if let Ok(text) = std::fs::read_to_string(pending_file(&app)) {
-        let mut seen = HashSet::new();
-        let list: Vec<String> = text
+        *app.records.pending.lock() = text
             .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && seen.insert(l.to_string()))
+            .filter(|s| valid_stem(s))
             .map(String::from)
             .collect();
-        *app.records.pending.lock() = list;
     }
     load_notes(&app);
     let writer = app.clone();
     std::thread::Builder::new()
         .name("toktail-records".into())
         .spawn(move || {
-            for job in rx {
-                if let Err(e) = write_job(&writer, &job) {
-                    log::warn!("couldn't save the prompt/response for {}: {e:#}", job.stem);
+            while let Some(mut job) = rx.blocking_recv() {
+                let _blobs = writer.rt.block_on(writer.records.blobs.lock());
+                let _guard = writer.records.mutation.lock();
+                if let Err(e) = write_job(&writer, &mut job) {
+                    log::warn!("record save failed: {e:#}");
                     *writer.records.errors.lock() = Some(format!("{e:#}"));
+                    job.rec.record.clear();
                 }
+                if let Err(e) = writer.ledger.append(&job.rec) {
+                    log::error!("could not write CSV: {e:#}");
+                }
+                if !job.rec.record.is_empty() {
+                    if let (Some(row), Some(p), Some(r)) = (
+                        writer.ledger.find(&job.rec.request_id),
+                        job.prompt.as_ref(),
+                        job.response.as_ref(),
+                    ) {
+                        writer.retrieval.insert(row, p, r);
+                    }
+                }
+                if !job.rec.record.is_empty() && s3_on(&writer) {
+                    queue_upload(&writer, &job.rec.record);
+                }
+                writer.records.jobs.fetch_sub(1, Ordering::SeqCst);
             }
         })
-        .ok();
-    let r = app.clone();
+        .expect("start record writer");
+    let a = app.clone();
+    app.rt.spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            ticker.tick().await;
+            let a = a.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _guard = a.records.mutation.lock();
+                if let Err(e) = a.crypto.flush().and_then(|_| a.ledger.flush()) {
+                    log::warn!("flushing records: {e:#}");
+                }
+            })
+            .await;
+        }
+    });
+    let a = app.clone();
     app.rt.spawn(async move {
         tokio::time::sleep(Duration::from_secs(30)).await;
+        let mut cycles = 0;
         loop {
-            if let Err(e) = retention(&r).await {
-                log::warn!("retention: {e:#}");
+            if let Err(e) = reconcile(&a, None).await {
+                log::debug!("reconciliation deferred: {e:#}");
             }
-            tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+            crate::retrieval::warm(&a).await;
+            if cycles % 360 == 0 {
+                let _ = collect_blobs(&a).await;
+                if let Err(e) = retention(&a).await {
+                    log::warn!("retention: {e:#}");
+                }
+            }
+            cycles += 1;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+    let a = app.clone();
+    app.rt.spawn(async move {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let Ok(mut watcher) =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(e) = event {
+                    if matches!(e.kind, notify::EventKind::Remove(_)) {
+                        let _ = tx.send(e.paths);
+                    }
+                }
+            })
+        else {
+            return;
+        };
+        let mut watched=root(&a);
+        let mut watching=watcher.watch(&watched,notify::RecursiveMode::Recursive).is_ok();
+        let mut tick=tokio::time::interval(Duration::from_secs(10));
+        loop {
+            let mut paths=tokio::select! {
+                p=rx.recv()=>{let Some(p)=p else {break;};p},
+                _=tick.tick()=>{
+                    let next=root(&a);
+                    if next!=watched || !watching {
+                        if watching {let _=watcher.unwatch(&watched);}
+                        watched=next;
+                        if a.config.read().capture.enabled {let _=std::fs::create_dir_all(&watched);}
+                        watching=watcher.watch(&watched,notify::RecursiveMode::Recursive).is_ok();
+                    }
+                    continue;
+                }
+            };
+            if paths.iter().any(|p|p==&watched){watching=false;}
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while let Ok(p) = rx.try_recv() {
+                paths.extend(p);
+            }
+            let root = root(&a);
+            a.records.blob_cache.lock().clear();
+            let relative: Vec<String> = paths
+                .iter()
+                .filter_map(|p| p.strip_prefix(&root).ok())
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .collect();
+            let targets = a.ledger.with_data(|d| {
+                d.rows()
+                    .filter_map(|r| r.record.as_deref())
+                    .filter(|s| {
+                        relative.iter().any(|p| {
+                            p.is_empty() || *s == p.trim_end_matches(".prompt").trim_end_matches(".response")
+                                || s.starts_with(&(p.clone() + "/"))
+                        })
+                    })
+                    .map(String::from)
+                    .collect()
+            });
+            let _ = reconcile(&a, Some(targets)).await;
         }
     });
 }
 
-/// Called by the proxy: returns the stem to put in the CSV row, or "" when
-/// capture is off or encryption isn't ready (nothing unencrypted is written
-/// when encryption is on but locked).
-pub fn capture(
-    app: &App,
-    host: &str,
-    ts: DateTime<Local>,
-    prompt: Vec<u8>,
-    response: Vec<u8>,
-) -> String {
-    if !app.config.read().capture.enabled {
-        return String::new();
+pub fn enqueue(
+    app: &Arc<App>,
+    rec: crate::ledger::Record,
+    prompt: Option<Vec<u8>>,
+    response: Option<Vec<u8>>,
+) {
+    let saving = app.config.read().capture.enabled && app.crypto.problem().is_none();
+    let size = prompt
+        .as_ref()
+        .map_or(0, Vec::len)
+        .saturating_add(response.as_ref().map_or(0, Vec::len));
+    let permit = if saving && size <= 128 * 1024 * 1024 {
+        app.records
+            .budget
+            .clone()
+            .try_acquire_many_owned(size.max(1) as u32)
+            .ok()
+    } else {
+        None
+    };
+    let capture = permit.is_some();
+    let job = Job {
+        rec,
+        prompt: if capture { prompt } else { None },
+        response: if capture { response } else { None },
+        _permit: permit,
+    };
+    if saving && !capture {
+        *app.records.errors.lock() =
+            Some("Capture queue is full; token counts are retained.".into());
     }
-    if let Some(p) = app.crypto.problem() {
-        *app.records.errors.lock() = Some(p);
-        return String::new();
+    if let Some(tx) = app.records.tx.lock().as_ref().cloned() {
+        app.records.jobs.fetch_add(1, Ordering::SeqCst);
+        let a = app.clone();
+        app.rt.spawn(async move {
+            if tx.send(job).await.is_err() {
+                a.records.jobs.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
     }
-    let root = root(app);
-    let stem = app.records.allocate(&root, host, ts);
-    if let Some(tx) = app.records.tx.lock().as_ref() {
-        if tx
-            .send(Job {
-                stem: stem.clone(),
-                prompt,
-                response,
-            })
-            .is_ok()
-        {
-            return stem;
-        }
+}
+
+pub async fn shutdown(app: &Arc<App>) {
+    app.shutting_down.store(true, Ordering::SeqCst);
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while app.live.snapshot(1).active_requests > 0 && std::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    String::new()
+    while app.records.jobs.load(Ordering::SeqCst) > 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let a = app.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _guard = a.records.mutation.lock();
+        let _ = a.crypto.flush();
+        let _ = a.ledger.flush();
+    })
+    .await;
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
@@ -265,19 +416,90 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn write_job(app: &App, job: &Job) -> Result<()> {
-    for (kind, bytes) in [(Kind::Prompt, &job.prompt), (Kind::Response, &job.response)] {
+/// Prompts share their semantic content across models. Model/sampling/tool
+/// parameters remain in a sealed request reference; downloads reconstruct all fields.
+fn split_prompt(bytes: &[u8]) -> (Vec<u8>, Option<serde_json::Map<String, serde_json::Value>>) {
+    if let Ok(serde_json::Value::Object(mut params)) = serde_json::from_slice(bytes) {
+        let mut prompt = serde_json::Map::new();
+        for key in crate::usage::PROMPT_FIELDS {
+            if let Some(value) = params.remove(key) {
+                prompt.insert(key.into(), value);
+            }
+        }
+        if !prompt.is_empty() {
+            return (serde_json::to_vec(&prompt).unwrap(), Some(params));
+        }
+    }
+    (bytes.to_vec(), None)
+}
+
+fn blob_stem(hash: &str) -> String {
+    format!("blobs/{}/{}", &hash[..2], hash)
+}
+fn blob_key(app: &App, hash: &str) -> String {
+    s3_key(app, &blob_stem(hash), Kind::Prompt)
+}
+
+fn write_job(app: &App, job: &mut Job) -> Result<()> {
+    let (Some(prompt), Some(response)) = (&job.prompt, &job.response) else {
+        return Ok(());
+    };
+    let (content, params) = split_prompt(prompt);
+    let hash = hex::encode(Sha256::digest(&content));
+    let path = local_path(app, &blob_stem(&hash), Kind::Prompt);
+    let cached_key = app.records.blob_cache.lock().get(&hash).cloned();
+    let key = if let Some(key) = cached_key {
+        key
+    } else {
+        let previous = std::fs::read(&path).ok();
+        let sealed = if let Some(old) = previous.filter(|raw| {
+            app.crypto
+                .open_file(raw)
+                .is_ok_and(|plain| plain == content)
+        }) {
+            old
+        } else {
+            let sealed = app.crypto.seal(&content)?;
+            write_atomic(&path, &sealed)?;
+            sealed
+        };
+        let key = crate::crypto::Crypto::key_id(&sealed);
+        let mut cache = app.records.blob_cache.lock();
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(hash.clone(), key.clone());
+        key
+    };
+    job.rec.prompt_blob = hash.clone();
+    job.rec.prompt_key = key;
+    let stem = app
+        .records
+        .allocate(&root(app), &job.rec.host, job.rec.timestamp);
+    let reference =
+        serde_json::to_vec(&serde_json::json!({"toktail_ref":1, "hash":hash, "params":params}))?;
+    for (kind, bytes) in [
+        (Kind::Prompt, reference.as_slice()),
+        (Kind::Response, response.as_slice()),
+    ] {
         let sealed = app.crypto.seal(bytes)?;
-        write_atomic(&local_path(app, &job.stem, kind), &sealed)?;
+        if kind == Kind::Prompt {
+            job.rec.reference_key = crate::crypto::Crypto::key_id(&sealed);
+        } else {
+            job.rec.response_key = crate::crypto::Crypto::key_id(&sealed);
+        }
+        write_atomic(&local_path(app, &stem, kind), &sealed)?;
     }
-    if s3_on(app) {
-        queue_upload(app, &job.stem);
-    }
+    job.rec.record = stem;
     *app.records.errors.lock() = None;
     Ok(())
 }
 
 fn queue_upload(app: &App, stem: &str) {
+    let _guard = app.records.pending_io.lock();
+    if app.records.pending.lock().iter().any(|s| s == stem) {
+        return;
+    }
     app.records.pending.lock().push(stem.to_string());
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -307,6 +529,7 @@ pub fn queue_existing(app: &App) -> usize {
 }
 
 fn rewrite_pending(app: &App) {
+    let _guard = app.records.pending_io.lock();
     let list = app.records.pending.lock().clone();
     let tmp = pending_file(app).with_extension("tmp");
     if std::fs::write(
@@ -334,6 +557,22 @@ pub async fn upload_pending(app: &Arc<App>) -> Result<usize> {
         .collect();
     let mut done = HashSet::new();
     for stem in &batch {
+        let hash = app.ledger.with_data(|d| {
+            d.rows()
+                .find(|r| r.record.as_deref() == Some(stem.as_str()))
+                .map(|r| r.prompt_blob.clone())
+                .unwrap_or_default()
+        });
+        if hash.len() == 64 {
+            let bytes = tokio::fs::read(local_path(app, &blob_stem(&hash), Kind::Prompt)).await?;
+            s3sync::put_object(
+                app,
+                &blob_key(app, &hash),
+                &bytes,
+                "application/octet-stream",
+            )
+            .await?;
+        }
         for kind in Kind::ALL {
             let path = local_path(app, stem, kind);
             match tokio::fs::read(&path).await {
@@ -380,36 +619,218 @@ pub struct Availability {
 }
 
 pub async fn availability(app: &Arc<App>, stem: &str) -> Availability {
-    let local = local_path(app, stem, Kind::Prompt).exists();
-    let pending = app.records.pending.lock().iter().any(|s| s == stem);
-    let s3 = app.config.read().s3.enabled && !pending && !local_only(app);
+    let local = Kind::ALL.iter().all(|k| local_path(app, stem, *k).exists());
+    let s3 = if mirror_available(app) {
+        s3sync::exists_object(app, &s3_key(app, stem, Kind::Prompt))
+            .await
+            .ok()
+            == Some(true)
+            && s3sync::exists_object(app, &s3_key(app, stem, Kind::Response))
+                .await
+                .ok()
+                == Some(true)
+    } else {
+        false
+    };
     Availability { local, s3 }
 }
 
-fn local_only(app: &App) -> bool {
-    !app.config.read().capture.s3_upload
+async fn read_sealed(app: &Arc<App>, stem: &str, kind: Kind) -> Result<Vec<u8>> {
+    let raw = match tokio::fs::read(local_path(app, stem, kind)).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && mirror_available(app) => {
+            tokio::time::timeout(
+                Duration::from_secs(8),
+                s3sync::get_object(app, &s3_key(app, stem, kind)),
+            )
+            .await??
+            .ok_or_else(|| anyhow!("record is missing on disk and in S3"))?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let a = app.clone();
+    tokio::task::spawn_blocking(move || a.crypto.open_file(&raw)).await?
 }
 
-/// The decrypted, decompressed content of one file, from disk or from S3.
+/// Old raw captures and new shared request references are both readable.
 pub async fn read(app: &Arc<App>, stem: &str, kind: Kind) -> Result<Vec<u8>> {
     if !valid_stem(stem) {
         bail!("bad record name");
     }
-    let path = local_path(app, stem, kind);
-    let raw = match tokio::fs::read(&path).await {
-        Ok(b) => b,
-        Err(_) if app.config.read().s3.enabled => s3sync::get_object(app, &s3_key(app, stem, kind))
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "This record's {} isn't on this Mac or in S3 (it may have expired).",
-                    kind.ext()
+    let bytes = read_sealed(app, stem, kind).await?;
+    if kind != Kind::Prompt {
+        return Ok(bytes);
+    }
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        if v["toktail_ref"] == 1 {
+            let hash = v["hash"].as_str().unwrap_or("");
+            if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                bail!("bad prompt reference");
+            }
+            let blob = read_sealed(app, &blob_stem(hash), Kind::Prompt).await?;
+            if let Some(params) = v["params"].as_object() {
+                let mut original: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_slice(&blob)?;
+                original.extend(params.clone());
+                return Ok(serde_json::to_vec(&original)?);
+            }
+            return Ok(blob);
+        }
+    }
+    Ok(bytes)
+}
+
+/// Notices saved records whose files are gone everywhere (deleted in Finder,
+/// expired by retention here and in S3) and turns them into count-only rows:
+/// the CSV keeps every token count, only the pointer to the files and their
+/// keys are dropped. Only confirmed absence counts; network errors,
+/// permissions and a configured-but-disabled mirror defer the check.
+pub async fn reconcile(app: &Arc<App>, targets: Option<HashSet<String>>) -> Result<usize> {
+    let _scan = app.records.scan.lock().await;
+    if std::fs::read_dir(root(app)).is_err() {
+        return Ok(0);
+    }
+    let configured = !app.config.read().s3.bucket.trim().is_empty();
+    if configured && !mirror_available(app) {
+        return Ok(0);
+    }
+    let mut rows: Vec<_> = app
+        .ledger
+        .with_data(|d| d.rows().filter(|r| r.record.is_some()).cloned().collect());
+    rows.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+    if let Some(t) = targets.as_ref() {
+        rows.retain(|r| t.contains(r.record.as_deref().unwrap_or("")));
+    } else if !rows.is_empty() {
+        let start = app.records.cursor.fetch_add(256, Ordering::Relaxed) % rows.len();
+        rows.rotate_left(start);
+        rows.truncate(256);
+        rows.retain(|r| r.ts_ms < Local::now().timestamp_millis() - 300_000);
+    }
+    let pending: HashSet<_> = app.records.pending.lock().iter().cloned().collect();
+    let mut gone = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    for row in rows {
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        let stem = row.record.as_deref().unwrap();
+        if pending.contains(stem) {
+            continue;
+        }
+        let mut absent = true;
+        for kind in Kind::ALL {
+            match tokio::fs::metadata(local_path(app, stem, kind)).await {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                _ => {
+                    absent = false;
+                    break;
+                }
+            }
+        }
+        if !absent {
+            continue;
+        }
+        if mirror_available(app) {
+            for kind in Kind::ALL {
+                let missing = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    s3sync::exists_object(app, &s3_key(app, stem, kind)),
                 )
-            })?,
-        Err(_) => bail!("This record's {} isn't saved on this Mac.", kind.ext()),
-    };
+                .await;
+                if !matches!(missing, Ok(Ok(false))) {
+                    absent = false;
+                    break;
+                }
+            }
+        }
+        if absent {
+            gone.push(row);
+        }
+    }
+    let ids: HashSet<_> = gone.iter().map(|r| r.request_id.clone()).collect();
+    if ids.is_empty() {
+        return Ok(0);
+    }
     let a = app.clone();
-    tokio::task::spawn_blocking(move || a.crypto.open_file(&raw)).await?
+    let n = tokio::task::spawn_blocking(move || {
+        let _guard = a.records.mutation.lock();
+        let n = a.ledger.forget_records(&ids)?;
+        for r in gone {
+            a.retrieval.remove(&r.request_id);
+            a.crypto.forget_id(&r.reference_key);
+            a.crypto.forget_id(&r.response_key);
+            if let Some(stem) = r.record.as_deref() {
+                a.records.notes.lock().remove(stem);
+            }
+        }
+        save_notes(&a)?;
+        Ok::<usize, anyhow::Error>(n)
+    })
+    .await??;
+    app.sync_now.notify_one();
+    Ok(n)
+}
+
+pub async fn collect_blobs(app: &Arc<App>) -> Result<()> {
+    let _blobs = app.records.blobs.lock().await;
+    let budget = std::time::Instant::now() + Duration::from_secs(2);
+    if !app.config.read().s3.bucket.trim().is_empty() && !s3_on(app) {
+        return Ok(());
+    }
+    let used: HashSet<_> = app.ledger.with_data(|d| {
+        d.rows()
+            .filter(|r| r.record.is_some())
+            .map(|r| r.prompt_blob.clone())
+            .collect()
+    });
+    let dirs = match std::fs::read_dir(root(app).join("blobs")) {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+    for dir in dirs.flatten() {
+        if let Ok(files) = std::fs::read_dir(dir.path()) {
+            for entry in files.flatten() {
+                if std::time::Instant::now() > budget {
+                    return Ok(());
+                }
+                let path = entry.path();
+                let hash = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if hash.len() != 64 || used.contains(&hash) {
+                    continue;
+                }
+                if s3_on(app) {
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        s3sync::delete_object(app, &blob_key(app, &hash)),
+                    )
+                    .await??;
+                }
+                let a = app.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _guard = a.records.mutation.lock();
+                    // Recheck after concurrent capture: a shared key must outlive all references.
+                    if a.ledger.with_data(|d| {
+                        d.rows()
+                            .any(|r| r.record.is_some() && r.prompt_blob == hash)
+                    }) {
+                        return;
+                    }
+                    if let Ok(raw) = std::fs::read(&path) {
+                        if std::fs::remove_file(&path).is_ok() {
+                            a.records.blob_cache.lock().remove(&hash);
+                            a.crypto.forget(&raw);
+                        }
+                    }
+                })
+                .await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Deletes a record's files here and in S3, and forgets their keys.
@@ -417,35 +838,54 @@ pub async fn delete_files(app: &Arc<App>, stem: &str) -> Result<()> {
     if !valid_stem(stem) {
         bail!("bad record name");
     }
-    let s3 = app.config.read().s3.enabled;
+    if !app.config.read().s3.bucket.trim().is_empty() && !mirror_available(app) {
+        bail!("The configured S3 mirror is disabled. Enable it to delete both copies.");
+    }
+    let keys = app.ledger.with_data(|d| {
+        d.rows()
+            .find(|r| r.record.as_deref() == Some(stem))
+            .map(|r| (r.reference_key.clone(), r.response_key.clone()))
+    });
+    let mut heads = Vec::new();
+    // Finish remote deletion before destroying any local file or encryption key.
     for kind in Kind::ALL {
-        let path = local_path(app, stem, kind);
-        let head = match tokio::fs::read(&path).await {
-            Ok(b) => Some(b),
-            Err(_) if s3 => s3sync::get_object(app, &s3_key(app, stem, kind))
-                .await
-                .ok()
-                .flatten(),
-            Err(_) => None,
-        };
-        if let Some(h) = head {
-            let a = app.clone();
-            let _ = tokio::task::spawn_blocking(move || a.crypto.forget(&h)).await;
-        }
-        let _ = tokio::fs::remove_file(&path).await;
-        if s3 {
+        let raw = tokio::fs::read(local_path(app, stem, kind)).await.ok();
+        if mirror_available(app) {
             s3sync::delete_object(app, &s3_key(app, stem, kind)).await?;
         }
+        heads.push((kind, raw));
     }
-    app.records.pending.lock().retain(|s| s != stem);
-    rewrite_pending(app);
-    if app.records.notes.lock().remove(stem).is_some() {
-        save_notes(app)?;
-    }
-    Ok(())
+    let a = app.clone();
+    let stem = stem.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _guard = a.records.mutation.lock();
+        for (kind, raw) in heads {
+            match std::fs::remove_file(local_path(&a, &stem, kind)) {
+                Ok(()) => {
+                    if let Some(raw) = raw {
+                        a.crypto.forget(&raw);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if let Some((reference, response)) = keys {
+            a.crypto.forget_id(&reference);
+            a.crypto.forget_id(&response);
+        }
+        a.records.pending.lock().retain(|s| s != &stem);
+        rewrite_pending(&a);
+        if a.records.notes.lock().remove(&stem).is_some() {
+            save_notes(&a)?;
+        }
+        Ok(())
+    })
+    .await?
 }
 
 pub fn set_note(app: &App, stem: &str, note: Note) -> Result<()> {
+    let _guard = app.records.mutation.lock();
     {
         let mut n = app.records.notes.lock();
         if note.title.is_empty() && note.tags.is_empty() && note.notes.is_empty() && !note.starred {
@@ -459,8 +899,13 @@ pub fn set_note(app: &App, stem: &str, note: Note) -> Result<()> {
 
 fn save_notes(app: &App) -> Result<()> {
     let json = serde_json::to_vec(&*app.records.notes.lock())?;
+    let old = std::fs::read(notes_file(app)).ok();
     let sealed = app.crypto.seal(&json)?;
-    write_atomic(&notes_file(app), &sealed)
+    write_atomic(&notes_file(app), &sealed)?;
+    if let Some(old) = old {
+        app.crypto.forget(&old);
+    }
+    Ok(())
 }
 
 fn load_notes(app: &App) {
@@ -584,7 +1029,15 @@ pub fn summarize_prompt(body: &[u8]) -> serde_json::Value {
             msgs.push(serde_json::json!({ "role": m.get("role").and_then(|r| r.as_str()).unwrap_or("user"), "text": text_of(m.get("content").unwrap_or(&serde_json::Value::Null)) }));
         }
     }
-    if let Some(p) = v.get("prompt").or_else(|| v.get("input")) {
+    if let Some(p) = v
+        .get("input")
+        .and_then(|v| v.as_array())
+        .filter(|a| a.iter().any(|m| m.get("role").is_some()))
+    {
+        for m in p {
+            msgs.push(serde_json::json!({"role":m["role"].as_str().unwrap_or("user"),"text":text_of(&m["content"])}));
+        }
+    } else if let Some(p) = v.get("prompt").or_else(|| v.get("input")) {
         msgs.push(serde_json::json!({ "role": "user", "text": text_of(p) }));
     }
     let mut params = serde_json::Map::new();
@@ -628,6 +1081,22 @@ pub fn summarize_response(body: &[u8]) -> serde_json::Value {
             }
         }
     }
+    if let Some(out) = v["output"].as_array() {
+        for m in out {
+            if let Some(parts) = m["content"].as_array() {
+                for p in parts {
+                    if let Some(t) = p["text"].as_str().or(p["refusal"].as_str()) {
+                        text.push_str(t);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(t) = v["output_text"].as_str() {
+        if text.is_empty() {
+            text.push_str(t);
+        }
+    }
     if text.is_empty() && !v.is_null() && v.get("data").is_some() {
         text = "(embedding vectors)".into();
     }
@@ -663,5 +1132,166 @@ mod tests {
         assert_eq!(p["params"]["temperature"], 0.2);
         let r = summarize_response(br#"{"model":"m","choices":[{"message":{"content":"hello"}}],"usage":{"prompt_tokens":1}}"#);
         assert_eq!(r["content"], "hello");
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::test_support;
+    #[tokio::test]
+    async fn encrypted_cross_model_dedup_and_partial_deletion() {
+        let app = test_support::app();
+        app.crypto
+            .fixture_per_file(app.paths.base.join("keystore.tkt"));
+        let a=br#"{"model":"one","temperature":0.2,"messages":[{"role":"user","content":"Explain Rust ownership"}]}"#.to_vec();
+        let b=br#"{"messages":[{"content":"Explain Rust ownership","role":"user"}],"temperature":0.8,"model":"two"}"#.to_vec();
+        let response =
+            br#"{"choices":[{"message":{"content":"Every value has one owner."}}]}"#.to_vec();
+        let mut first = Job {
+            rec: test_support::record("one"),
+            prompt: Some(a.clone()),
+            response: Some(response.clone()),
+            _permit: None,
+        };
+        let mut second = Job {
+            rec: test_support::record("two"),
+            prompt: Some(b.clone()),
+            response: Some(response.clone()),
+            _permit: None,
+        };
+        write_job(&app, &mut first).unwrap();
+        app.ledger.append(&first.rec).unwrap();
+        write_job(&app, &mut second).unwrap();
+        app.ledger.append(&second.rec).unwrap();
+        app.crypto.flush().unwrap();
+        app.ledger.flush().unwrap();
+        assert_eq!(first.rec.prompt_blob, second.rec.prompt_blob);
+        assert_ne!(first.rec.record, second.rec.record);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &read(&app, &second.rec.record, Kind::Prompt).await.unwrap()
+            )
+            .unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap()
+        );
+        let target = || Some([first.rec.record.clone()].into_iter().collect());
+        std::fs::remove_file(local_path(&app, &first.rec.record, Kind::Prompt)).unwrap();
+        assert_eq!(
+            reconcile(&app, target()).await.unwrap(),
+            0,
+            "a response alone preserves the history"
+        );
+        std::fs::remove_file(local_path(&app, &first.rec.record, Kind::Response)).unwrap();
+        assert_eq!(reconcile(&app, target()).await.unwrap(), 1);
+        let kept = app
+            .ledger
+            .find(&first.rec.request_id)
+            .expect("the counts stay");
+        assert!(kept.record.is_none() && kept.output == first.rec.output_tokens);
+        assert!(
+            read(&app, &second.rec.record, Kind::Prompt).await.is_ok(),
+            "a surviving request still owns the shared prompt key"
+        );
+        collect_blobs(&app).await.unwrap();
+        assert!(local_path(&app, &blob_stem(&second.rec.prompt_blob), Kind::Prompt).exists());
+        let count_only = test_support::record("counts");
+        app.ledger.append(&count_only).unwrap();
+        let targets = Some([second.rec.record.clone()].into_iter().collect());
+        for k in Kind::ALL {
+            std::fs::remove_file(local_path(&app, &second.rec.record, k)).unwrap();
+        }
+        app.config.write().s3.bucket = "configured-but-offline".into();
+        assert_eq!(reconcile(&app, targets.clone()).await.unwrap(), 0);
+        app.config.write().s3.bucket.clear();
+        assert_eq!(reconcile(&app, targets).await.unwrap(), 1);
+        // Reusing a prompt before garbage collection must retain a working key.
+        let mut third = Job {
+            rec: test_support::record("three"),
+            prompt: Some(a),
+            response: Some(response),
+            _permit: None,
+        };
+        write_job(&app, &mut third).unwrap();
+        app.ledger.append(&third.rec).unwrap();
+        assert!(read(&app, &third.rec.record, Kind::Prompt).await.is_ok());
+        delete_files(&app, &third.rec.record).await.unwrap();
+        app.ledger
+            .forget_records(&[third.rec.request_id].into_iter().collect())
+            .unwrap();
+        collect_blobs(&app).await.unwrap();
+        assert!(!local_path(&app, &blob_stem(&second.rec.prompt_blob), Kind::Prompt).exists());
+        assert!(app.ledger.find(&count_only.request_id).is_some());
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+    #[tokio::test]
+    async fn legacy_capture_remains_readable() {
+        let app = test_support::app();
+        let stem = "laptop/2026/09/30/2026-09-30-12-00-00";
+        let original = br#"{"model":"old","prompt":"hello"}"#;
+        write_atomic(
+            &local_path(&app, stem, Kind::Prompt),
+            &app.crypto.seal(original).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read(&app, stem, Kind::Prompt).await.unwrap(), original);
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use super::*;
+    #[tokio::test]
+    async fn only_confirmed_remote_404_prunes_missing_capture() {
+        let app = crate::test_support::app();
+        std::fs::create_dir_all(root(&app)).unwrap();
+        let mut rec = crate::test_support::record("m");
+        rec.record = "laptop/2026/09/30/2026-09-30-00-00-00".into();
+        app.ledger.append(&rec).unwrap();
+        let status = Arc::new(std::sync::atomic::AtomicU16::new(403));
+        let state = status.clone();
+        let router = axum::Router::new().route(
+            "/{*path}",
+            axum::routing::head(move || {
+                let s = state.clone();
+                async move { axum::http::StatusCode::from_u16(s.load(Ordering::SeqCst)).unwrap() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let old = std::env::var(crate::secrets::ENV_SECRET).ok();
+        std::env::set_var(crate::secrets::ENV_SECRET, "synthetic-fixture-secret");
+        {
+            let mut c = app.config.write();
+            c.s3.enabled = true;
+            c.capture.s3_upload = true;
+            c.s3.endpoint = format!("http://{addr}");
+            c.s3.bucket = "fixture".into();
+            c.s3.access_key_id = "fixture-key".into();
+        }
+        let target = || Some([rec.record.clone()].into_iter().collect());
+        for code in [403, 503, 200] {
+            status.store(code, Ordering::SeqCst);
+            assert_eq!(
+                reconcile(&app, target()).await.unwrap(),
+                0,
+                "HTTP {code} is not confirmed absence"
+            );
+        }
+        status.store(404, Ordering::SeqCst);
+        assert_eq!(reconcile(&app, target()).await.unwrap(), 1);
+        let kept = app.ledger.find(&rec.request_id).expect("the counts stay");
+        assert!(kept.record.is_none());
+        if let Some(old) = old {
+            std::env::set_var(crate::secrets::ENV_SECRET, old);
+        } else {
+            std::env::remove_var(crate::secrets::ENV_SECRET);
+        }
+        task.abort();
+        std::fs::remove_dir_all(&app.paths.base).ok();
     }
 }

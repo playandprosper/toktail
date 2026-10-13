@@ -117,6 +117,13 @@ fn client() -> reqwest::Client {
         .expect("http client")
 }
 
+/// Guards that keep a request counted as in flight until it ends.
+struct InFlight {
+    _all: crate::live::ActiveGuard,
+    _host: crate::live::ActiveGuard,
+    flight: crate::live::FlightGuard,
+}
+
 struct Running {
     listen: String,
     stop: Arc<Notify>,
@@ -434,12 +441,27 @@ async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
             return (StatusCode::LOOP_DETECTED, axum::Json(body)).into_response();
         }
     }
+    if ctx
+        .app
+        .shutting_down
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Toktail is shutting down").into_response();
+    }
     let saving = ctx.app.config.read().capture.enabled;
     let tracked = kind.and_then(|kind| prepare(kind, &path, &mut body_bytes, started, saving));
-    // Counts this request as in flight (for Pip) until the guards are dropped.
-    let in_flight = tracked
-        .as_ref()
-        .map(|_| (ctx.app.live.begin(), ctx.app.live_for(&ctx.host).begin()));
+    // Counts this request as in flight (for Pip and the live feed) until the
+    // guards are dropped, however the request ends.
+    let in_flight = tracked.as_ref().map(|t| InFlight {
+        _all: ctx.app.live.begin(),
+        _host: ctx.app.live_for(&ctx.host).begin(),
+        flight: ctx.app.activity.begin(
+            &ctx.host,
+            t.request_model.as_deref(),
+            &t.endpoint,
+            t.streamed,
+        ),
+    });
 
     let token = ctx.app.host_token(&ctx.host);
     let url = format!("{up}{path_q}");
@@ -458,7 +480,26 @@ async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
         .await;
     let resp = match upstream_resp {
         Ok(r) => r,
-        Err(e) => return bad_gateway(&up, e),
+        Err(e) => {
+            // Count the failure, so a host that stops answering shows up as
+            // errors on the dashboard instead of silence.
+            if let Some(t) = tracked {
+                let duration = t.started.elapsed();
+                record(
+                    &ctx,
+                    t,
+                    None,
+                    502,
+                    Usage::default(),
+                    0,
+                    None,
+                    duration,
+                    None,
+                );
+            }
+            drop(in_flight);
+            return bad_gateway(&up, e);
+        }
     };
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -492,7 +533,10 @@ async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
             model = usage::response_model(&v);
         }
         let duration = t.started.elapsed();
-        let captured = t.original.is_some().then(|| bytes.clone());
+        if let (Some(f), Some(m)) = (in_flight.as_ref(), model.as_deref()) {
+            f.flight.set_model(m);
+        }
+        let captured = Some(bytes.clone());
         record(
             &ctx,
             t,
@@ -576,14 +620,19 @@ fn stream_and_count(
     status: StatusCode,
     headers: HeaderMap,
     resp: reqwest::Response,
-    in_flight: Option<(crate::live::ActiveGuard, crate::live::ActiveGuard)>,
+    in_flight: Option<InFlight>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
-        let mut tracker = SseTracker::new(t.strip_injected_usage);
-        if t.original.is_some() {
-            tracker = tracker.collect_text();
-        }
+        // Saving keeps the whole answer; otherwise only enough of it to tell
+        // a refusal from an answer (the character count stays exact).
+        let cap = if t.original.is_some() {
+            MAX_CAPTURE_BYTES / 2
+        } else {
+            16 * 1024
+        };
+        let mut tracker = SseTracker::new(t.strip_injected_usage).collect_text(cap);
+        let mut named = false;
         let host_live = ctx.app.live_for(&ctx.host);
         let mut upstream = resp.bytes_stream();
         let mut client_gone = false;
@@ -596,6 +645,15 @@ fn stream_and_count(
                     if tracker.deltas > before {
                         ctx.app.live.add(tracker.deltas - before, 0);
                         host_live.add(tracker.deltas - before, 0);
+                    }
+                    if let Some(f) = in_flight.as_ref() {
+                        f.flight.progress(tracker.deltas, tracker.first_token_at);
+                        if !named {
+                            if let Some(m) = tracker.model.as_deref() {
+                                f.flight.set_model(m);
+                                named = true;
+                            }
+                        }
                     }
                     if !out.is_empty() && tx.send(Ok(Bytes::from(out))).await.is_err() {
                         client_gone = true;
@@ -633,6 +691,9 @@ fn stream_and_count(
                 "reasoning": reasoning,
                 "usage": { "input_tokens": tracker.usage.input, "output_tokens": tracker.usage.output },
                 "status": code,
+                "refusal": tracker.refusal,
+                "tool_call": tracker.tool_call,
+                "content_chars": tracker.content_chars,
             });
             Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
         });
@@ -677,12 +738,15 @@ fn record(
     app.live_for(&ctx.host)
         .add(output.saturating_sub(deltas), input);
     let now = Local::now();
-    let record = match (t.original, response) {
-        (Some(p), Some(r)) if r.len() <= MAX_CAPTURE_BYTES => {
-            crate::records::capture(app, &ctx.host, now, p.to_vec(), r.to_vec())
-        }
-        _ => String::new(),
-    };
+    let (outcome, signal, response_chars) =
+        crate::intelligence::classify(status, response.as_deref().unwrap_or(&[]));
+    let prompt = t
+        .original
+        .filter(|p| p.len() <= MAX_CAPTURE_BYTES)
+        .map(|p| p.to_vec());
+    let captured = response
+        .filter(|r| r.len() <= MAX_CAPTURE_BYTES)
+        .map(|r| r.to_vec());
     let rec = Record {
         request_id: uuid::Uuid::new_v4().to_string(),
         timestamp: now,
@@ -699,14 +763,37 @@ fn record(
         usage_source: source,
         prompt_sha256: t.fingerprint,
         host: ctx.host.clone(),
-        record,
+        record: String::new(),
+        outcome,
+        signal,
+        response_chars,
+        prompt_blob: String::new(),
+        prompt_key: String::new(),
+        response_key: String::new(),
+        reference_key: String::new(),
     };
-    let ledger = app.ledger.clone();
-    app.rt.spawn_blocking(move || {
-        if let Err(e) = ledger.append(&rec) {
-            log::error!("could not write CSV row: {e:#}");
-        }
+    let gen = rec
+        .duration_ms
+        .saturating_sub(rec.ttft_ms.unwrap_or(0))
+        .max(if rec.ttft_ms.is_some() { 1 } else { 0 });
+    app.activity.finish(crate::live::Finished {
+        seq: 0,
+        request_id: rec.request_id.clone(),
+        host: rec.host.clone(),
+        model: rec.model.clone(),
+        endpoint: rec.endpoint.clone(),
+        status: rec.status,
+        input: rec.input_tokens,
+        output: rec.output_tokens,
+        duration_ms: rec.duration_ms,
+        ttft_ms: rec.ttft_ms,
+        tokens_per_sec: (rec.output_tokens > 0 && gen > 0)
+            .then(|| rec.output_tokens as f64 * 1000.0 / gen as f64),
+        outcome: rec.outcome.clone(),
+        signal: rec.signal.clone(),
+        finished_at: rec.timestamp.to_rfc3339(),
     });
+    crate::records::enqueue(app, rec, prompt, captured);
 }
 
 #[cfg(test)]

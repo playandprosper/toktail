@@ -35,6 +35,7 @@
     <nav class="nav" id="nav" aria-label="Pages">
       <a href="#/dashboard" data-page="dashboard">Dashboard</a>
       <a href="#/prompts" data-page="prompts">Prompts</a>
+      <a href="#/models" data-page="models">Models</a>
       <a href="#/savings" data-page="savings">Savings</a>
       <a href="#/settings" data-page="settings">Settings</a>
     </nav>
@@ -42,7 +43,13 @@
       <a class="pill clickable" id="pill-hosts" href="#/settings/hosts"><span class="dot"></span><span>Hosts</span></a>
       <span class="pill" id="pill-s3"><span class="dot"></span><span>S3</span></span>
       <button class="small" id="btn-sync" type="button" hidden>Sync now</button>
-      <button class="small" id="btn-theme" type="button">Dark mode</button>
+      <button class="pill clickable bell" id="btn-alerts" type="button" aria-haspopup="true" aria-expanded="false" title="Alerts">
+        <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true"><path d="M10 2.5a5 5 0 0 0-5 5v3.2L3.6 13.4a.8.8 0 0 0 .7 1.2h11.4a.8.8 0 0 0 .7-1.2L15 10.7V7.5a5 5 0 0 0-5-5Zm-2 13.6a2 2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span id="alerts-count">Alerts</span>
+      </button>
+      <button class="small kbd-hint" id="btn-palette" type="button" title="Jump anywhere, or ask Pip (⌘K or /)" aria-label="Search and commands"><svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m13 13 4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><kbd>⌘K</kbd></button>
+      <button class="small" id="btn-data-folder" type="button" hidden>Data folder</button>
+      <button class="small" id="btn-theme" type="button" title="Light or dark (t)">Dark mode</button>
     </div>
   </header>
 
@@ -87,6 +94,25 @@
       <div class="stats" id="stats"></div>
     </section>
 
+    <div id="signal-strip" class="signal-strip"></div>
+
+    <div class="grid2 now-row">
+      <section class="card" id="card-live" data-fixed="Live, every second">
+        <div class="card-head">
+          <div><h2>Right now</h2><div class="sub" id="live-sub">Requests streaming through your hosts, and the ones that just finished</div></div>
+          <div class="actions"><button class="small" id="btn-live-pause" type="button" aria-pressed="false">Pause feed</button></div>
+        </div>
+        <div class="flights" id="flights"></div>
+        <ol class="feed" id="feed" aria-live="off"></ol>
+      </section>
+      <section class="card" id="card-budgets">
+        <div class="card-head">
+          <div><h2>Budgets</h2><div class="sub" id="budgets-sub">Token limits per day, week or month</div></div>
+          <div class="actions"><a class="btn" href="#/settings/budgets">Edit</a></div>
+        </div>
+        <div class="budgets" id="budgets"></div>
+      </section>
+    </div>
     <div class="grid2">
       <section class="card metric-aware" id="card-daily">
         <div class="card-head">
@@ -209,6 +235,7 @@
         <select id="rec-range" aria-label="Date range">
           <option value="all">All time</option><option value="today">Today</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option><option value="365">1 year</option>
         </select>
+        <select id="rec-outcome" aria-label="Response signal"><option value="">All responses</option><option value="refused">Refusals</option><option value="noteworthy">Noteworthy outputs</option></select>
         <select id="rec-sort" aria-label="Sort">
           <option value="newest">Newest first</option><option value="oldest">Oldest first</option><option value="combined">Most tokens</option><option value="output">Most output</option><option value="input">Most input</option><option value="fastest">Fastest</option><option value="slowest">Slowest</option><option value="longest">Longest</option>
         </select>
@@ -234,25 +261,48 @@
     </section>
 
     <section id="chat-view" hidden>
-      <div class="chat card" id="chat-card">
-        <div class="chat-bar">
-          <label class="label-sm" for="chat-host">Host</label>
-          <select id="chat-host"></select>
-          <label class="label-sm" for="chat-model">Model</label>
-          <select id="chat-model"></select>
-          <label class="label-sm" for="chat-temp">Temperature</label>
-          <input type="number" id="chat-temp" min="0" max="2" step="0.1" value="0.7">
-          <button class="small" id="chat-system-btn" type="button">System prompt</button>
-          <button class="small" id="chat-clear" type="button">New conversation</button>
-        </div>
-        <textarea id="chat-system" class="chat-system" placeholder="Optional system prompt" hidden></textarea>
-        <div class="chat-log" id="chat-log" aria-live="polite"></div>
-        <form class="chat-input" id="chat-form">
-          <textarea id="chat-text" rows="2" placeholder="Message your model. Enter sends, Shift+Enter adds a line." aria-label="Message"></textarea>
-          <button type="submit" class="primary" id="chat-send">Send</button>
-        </form>
-        <div class="chat-foot label-sm" id="chat-foot">Sent through Toktail, so every token is counted.</div>
+      <div class="chat card pip-full-chat" id="chat-card"></div>
+    </section>
+  </main>
+
+  <!-- ============================================================ models -->
+  <main class="page" data-page="models" id="page-models" hidden>
+    <div class="page-head">
+      <div>
+        <h1>Models</h1>
+        <p class="page-sub" id="models-page-sub">Every model that ran through Toktail: how fast it starts, how fast it writes, how often it stumbles, and what its tokens would have cost.</p>
       </div>
+      <div class="actions">
+        <select id="mdl-range" aria-label="Date range">
+          <option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option><option value="365">1 year</option><option value="all">All time</option>
+        </select>
+        <select id="mdl-host" aria-label="Host"></select>
+        <div class="seg" id="mdl-split" role="group" aria-label="Rows">
+          <button type="button" data-v="model">By model</button>
+          <button type="button" data-v="host">Model × host</button>
+        </div>
+      </div>
+    </div>
+    <section class="podium" id="podium" aria-label="Highlights"></section>
+    <div class="grid2">
+      <section class="card" id="card-scatter">
+        <div class="card-head">
+          <div><h2>Speed against wait</h2><div class="sub">Each bubble is a model: further right writes faster, lower starts sooner, bigger did more work</div></div>
+          <div class="actions"><button class="small" data-export="scatter" type="button">Export SVG</button></div>
+        </div>
+        <div class="chart" id="chart-scatter"></div>
+      </section>
+      <section class="card" id="card-model-detail">
+        <div class="card-head"><div><h2 id="md-title">Pick a model</h2><div class="sub" id="md-sub">Click a row or a bubble</div></div></div>
+        <div id="model-detail"></div>
+      </section>
+    </div>
+    <section class="card" id="card-leaderboard">
+      <div class="card-head">
+        <div><h2>Leaderboard</h2><div class="sub" id="lb-sub">Click a column to sort. Speed is output tokens per second while generating; speed p95 is what the fastest 5% of requests beat, first token p95 what the slowest 5% waited.</div></div>
+        <div class="actions"><button class="small" id="btn-lb-csv" type="button">Download this table</button></div>
+      </div>
+      <div class="tbl tall" id="leaderboard"></div>
     </section>
   </main>
 
@@ -293,7 +343,7 @@
     <div class="page-head">
       <div>
         <h1>Settings</h1>
-        <p class="page-sub" id="settings-sub">Changes apply right away. Secrets go to your Mac's Keychain, never to a file.</p>
+        <p class="page-sub" id="settings-sub">Changes apply right away. Secrets go to your Keychain or Credential Manager, never to a file.</p>
       </div>
     </div>
     <div class="settings-layout">
@@ -316,15 +366,29 @@
   </form>
 </dialog>
 
+<div class="alerts-pop" id="alerts-pop" role="dialog" aria-label="Alerts" hidden></div>
+
+<dialog class="palette" id="palette" aria-label="Jump anywhere or ask Pip">
+  <form method="dialog" class="palette-box" id="palette-form">
+    <label class="palette-in"><span class="prompt" aria-hidden="true">pip&gt;</span><input id="palette-input" type="text" autocomplete="off" spellcheck="false" placeholder="Jump to a page, host or model, or ask Pip anything…" aria-label="Command"></label>
+    <ul class="palette-list" id="palette-list" role="listbox"></ul>
+    <div class="palette-foot label-sm"><span><kbd>↑</kbd><kbd>↓</kbd> move</span><span><kbd>↵</kbd> go</span><span><kbd>esc</kbd> close</span><span><kbd>?</kbd> shortcuts</span></div>
+  </form>
+</dialog>
+
 <div id="tip" role="status" aria-live="polite"></div>
 <div class="toast" id="toast" role="status"></div>
 <script src="/pip.js"></script>
 <script src="/common.js"></script>
 <script src="/dashboard.js"></script>
 <script src="/prompts.js"></script>
+<script src="/models.js"></script>
 <script src="/savings.js"></script>
 <script src="/settings.js"></script>
+<script src="/pip-chat.js"></script>
+<script src="/palette.js"></script>
 <script src="/stage.js"></script>
 <script src="/main.js"></script>
 </body>
 </html>
+

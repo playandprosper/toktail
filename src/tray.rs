@@ -47,6 +47,8 @@ struct Ui {
     by_model: Submenu,
     by_host: Submenu,
     hosts_line: MenuItem,
+    budget_line: MenuItem,
+    ask_pip: MenuItem,
     animate: CheckMenuItem,
     open_portal: MenuItem,
     open_data: MenuItem,
@@ -134,8 +136,18 @@ pub fn run(app: Arc<App>) -> ! {
     })
 }
 
+/// macOS tints template images for light and dark menu bars. Windows and
+/// Linux show the colors as they are, so Pip gets its fox orange there.
 fn icon(bytes: &[u8]) -> anyhow::Result<Icon> {
-    Ok(Icon::from_rgba(bytes.to_vec(), ICON_W, ICON_H)?)
+    let mut px = bytes.to_vec();
+    if !cfg!(target_os = "macos") {
+        for p in px.chunks_exact_mut(4) {
+            p[0] = 0xfc;
+            p[1] = 0x89;
+            p[2] = 0x39;
+        }
+    }
+    Ok(Icon::from_rgba(px, ICON_W, ICON_H)?)
 }
 
 /// What Pip says in the first line of the menu.
@@ -161,6 +173,8 @@ impl Ui {
         let by_model = Submenu::new("Today by model", true);
         let by_host = Submenu::new("Today by host", true);
         let hosts_line = MenuItem::new("Hosts: checking…", false, None);
+        let budget_line = MenuItem::new("Budgets: none set", true, None);
+        let ask_pip = MenuItem::new("Ask Pip…", true, None);
         let animate = CheckMenuItem::new(
             "Animate Pip in Menu Bar",
             true,
@@ -204,6 +218,7 @@ impl Ui {
             &by_model,
             &PredefinedMenuItem::separator(),
             &open_portal,
+            &ask_pip,
             &open_data,
             &settings,
             &edit_config,
@@ -211,6 +226,7 @@ impl Ui {
             &sync,
             &s3_status,
             &hosts_line,
+            &budget_line,
             &PredefinedMenuItem::separator(),
             &animate,
             &login,
@@ -246,6 +262,8 @@ impl Ui {
             settings,
             by_host,
             hosts_line,
+            budget_line,
+            ask_pip,
             animate,
             sync,
             s3_status,
@@ -451,6 +469,33 @@ impl Ui {
         } else {
             format!("⚠ {healthy} of {enabled} hosts reachable (see Today by host)")
         });
+        let budgets = app.config.read().budgets.clone();
+        if budgets.is_empty() {
+            self.budget_line.set_text("Budgets: none set (Settings…)");
+        } else {
+            let st = app
+                .ledger
+                .with_data(|d| crate::budgets::status(d, &budgets, Local::now()));
+            if let Some(w) = st.iter().max_by(|a, b| a.ratio.total_cmp(&b.ratio)) {
+                let mark = match w.state {
+                    "over" => "⚠",
+                    "warn" => "◐",
+                    _ => "○",
+                };
+                self.budget_line.set_text(format!(
+                    "{mark} {}: {}% of {} this {}{}",
+                    w.budget.name,
+                    (w.ratio * 100.0).round(),
+                    fmt_compact(w.budget.limit),
+                    w.budget.period,
+                    if st.len() > 1 {
+                        format!(" (+{} more)", st.len() - 1)
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+        }
         if self.animate.is_checked() != app.config.read().app.animate_menu_bar {
             self.animate
                 .set_checked(app.config.read().app.animate_menu_bar);
@@ -462,9 +507,21 @@ impl Ui {
         if id == self.open_portal.id() {
             open(&app.portal_url(), false);
         } else if id == self.open_data.id() {
-            open(&app.ledger.dir().display().to_string(), false);
+            open(
+                &app.ledger
+                    .dir()
+                    .parent()
+                    .unwrap_or(app.ledger.dir())
+                    .display()
+                    .to_string(),
+                false,
+            );
         } else if id == self.settings.id() {
-            open(&format!("{}#settings", app.portal_url()), false);
+            open(&format!("{}#/settings", app.portal_url()), false);
+        } else if id == self.budget_line.id() {
+            open(&format!("{}#/settings/budgets", app.portal_url()), false);
+        } else if id == self.ask_pip.id() {
+            open(&format!("{}#/prompts/chat", app.portal_url()), false);
         } else if id == self.edit_config.id() {
             open(&app.paths.config_file.display().to_string(), true);
         } else if id == self.about.id() {
@@ -498,25 +555,20 @@ impl Ui {
             }
         } else if id == self.quit.id() {
             self.quit.set_text("Pip is tidying up… (final S3 sync)");
-            app.rt.block_on(s3sync::final_sync(app));
+            app.rt.block_on(async {
+                crate::records::shutdown(app).await;
+                s3sync::final_sync(app).await;
+            });
             std::process::exit(0);
         }
     }
 }
 
 fn open(target: &str, as_text: bool) {
-    #[cfg(target_os = "macos")]
-    let r = {
-        let mut c = std::process::Command::new("open");
-        if as_text {
-            c.arg("-t");
-        }
-        c.arg(target).spawn()
-    };
-    #[cfg(not(target_os = "macos"))]
-    let r = {
-        let _ = as_text;
-        std::process::Command::new("xdg-open").arg(target).spawn()
+    let r = if as_text {
+        crate::platform::open_text(target)
+    } else {
+        crate::platform::open(target)
     };
     if let Err(e) = r {
         log::warn!("could not open {target}: {e}");

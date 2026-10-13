@@ -39,6 +39,13 @@ pub struct App {
     pub records: crate::records::Records,
     /// The machines behind the hosts (hardware.json).
     pub hardware: RwLock<crate::hardware::Fleet>,
+    /// Requests in flight and just finished, for the live feed.
+    pub activity: Arc<crate::live::Activity>,
+    /// Budget, host and stampede alerts.
+    pub alerts: crate::budgets::Alerts,
+    pub retrieval: crate::retrieval::Index,
+    pub chat_client: reqwest::Client,
+    pub shutting_down: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -124,6 +131,10 @@ impl App {
     /// Loads encryption keys from settings, remembering the key fingerprint
     /// the first time a password is used.
     pub fn configure_crypto(&self) {
+        let _guard = self.records.mutation.lock();
+        let _ = self.crypto.flush();
+        self.retrieval.clear();
+        self.records.blob_cache.lock().clear();
         let enc = self.config.read().encryption.clone();
         if let Some(check) = self.crypto.configure(&self.paths.base, &enc) {
             let mut c = self.config.write();
@@ -174,6 +185,7 @@ impl App {
 }
 
 /// 1234 -> "1,234"
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub fn fmt_thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
@@ -187,6 +199,7 @@ pub fn fmt_thousands(n: u64) -> String {
 }
 
 /// 1_234_567 -> "1.23M"
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub fn fmt_compact(n: u64) -> String {
     let f = n as f64;
     let (v, unit) = if n >= 1_000_000_000_000 {
@@ -210,6 +223,7 @@ pub fn fmt_compact(n: u64) -> String {
     format!("{s}{unit}")
 }
 
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub fn ago(t: DateTime<Local>) -> String {
     let secs = (Local::now() - t).num_seconds().max(0);
     match secs {

@@ -26,7 +26,12 @@ use std::sync::Arc;
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const PIP_SVG: &str = include_str!("../assets/pip.svg");
 /// Page scripts and styles, served from memory.
-const ASSETS: [(&str, &str, &str); 9] = [
+const ASSETS: [(&str, &str, &str); 12] = [
+    (
+        "/pip-chat.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/pip-chat.js"),
+    ),
     (
         "/app.css",
         "text/css; charset=utf-8",
@@ -51,6 +56,16 @@ const ASSETS: [(&str, &str, &str); 9] = [
         "/prompts.js",
         "text/javascript; charset=utf-8",
         include_str!("../assets/prompts.js"),
+    ),
+    (
+        "/models.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/models.js"),
+    ),
+    (
+        "/palette.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/palette.js"),
     ),
     (
         "/savings.js",
@@ -86,6 +101,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/repeats", get(repeats))
         .route("/api/export.csv", get(export_csv))
         .route("/api/sync", post(sync_now))
+        .route("/api/signals", get(signals))
+        .route("/api/open-data-folder", post(open_data_folder))
         .route("/pip.svg", get(pip_svg))
         .route("/api/live", get(live))
         .route("/api/costs", get(costs));
@@ -97,6 +114,8 @@ pub fn router(app: Arc<App>) -> Router {
     }
     r.merge(portal_settings::routes())
         .merge(portal_records::routes())
+        .merge(crate::pip_agent::routes())
+        .merge(crate::portal_insights::routes())
         .layer(middleware::from_fn_with_state(app.clone(), local_only))
         .with_state(app)
 }
@@ -267,6 +286,7 @@ async fn meta(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
     let enc_mode = cfg.encryption.mode.clone();
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "demo": app.demo,
         "repository": REPOSITORY,
         "portal": { "intro_animation": cfg.portal.intro_animation, "pip_roams": cfg.portal.pip_roams },
         "costs_enabled": cfg.costs.show_comparison,
@@ -364,6 +384,9 @@ async fn pip_svg() -> Response {
 struct LiveQ {
     seconds: Option<usize>,
     host: Option<String>,
+    /// Only finished requests newer than this sequence number (the live feed
+    /// passes back the `seq` it last saw).
+    since: Option<u64>,
 }
 
 /// Pip's pulse: live tokens/sec and mood, combined and per host. Polled
@@ -398,7 +421,9 @@ async fn live(State(app): State<Arc<App>>, Query(q): Query<LiveQ>) -> Json<serde
             (id.clone(), json!({ "state": st, "tokens_per_sec": s.tokens_per_sec, "active_requests": s.active_requests, "per_second": s.per_second, "output_last_minute": s.output_last_minute, "input_last_minute": s.input_last_minute }))
         })
         .collect();
+    let (in_flight, finished, seq) = app.activity.snapshot(q.since.unwrap_or(0), 60);
     Json(json!({
+        "activity": { "in_flight": in_flight, "finished": finished, "seq": seq },
         "state": state,
         "per_second": snap.per_second,
         "tokens_per_sec": snap.tokens_per_sec,
@@ -448,4 +473,31 @@ async fn costs(State(app): State<Arc<App>>, Query(q): Query<Q>) -> Response {
     let mut v = serde_json::to_value(&report).unwrap_or_default();
     v["hardware"] = json!({ "amortized": amortized, "machines": machines, "has_fleet": !fleet.machines.is_empty(), "days": (to - from).num_days() + 1 });
     Json(v).into_response()
+}
+
+async fn signals(State(app): State<Arc<App>>, Query(q): Query<Q>) -> Json<serde_json::Value> {
+    let f = q.filter();
+    let (mut input, mut output, mut refused, mut noteworthy) = (0u128, 0u128, 0u64, 0u64);
+    app.ledger.with_data(|d| {
+        for r in d.rows().filter(|r| f.matches(r)) {
+            input += r.input as u128;
+            output += r.output as u128;
+            if r.outcome == "refused" {
+                refused += 1;
+            }
+            if ["structured", "substantial", "tool_call"].contains(&r.signal.as_str()) {
+                noteworthy += 1;
+            }
+        }
+    });
+    Json(
+        json!({"input":input.to_string(),"output":output.to_string(),"combined":(input+output).to_string(),"refused":refused,"noteworthy":noteworthy}),
+    )
+}
+async fn open_data_folder(State(app): State<Arc<App>>) -> Response {
+    let path = app.paths.data_dir.parent().unwrap_or(&app.paths.data_dir);
+    match crate::platform::open(&path.display().to_string()) {
+        Ok(_) => Json(json!({"opened":true,"path":path})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }

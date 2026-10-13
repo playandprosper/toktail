@@ -17,6 +17,7 @@ const Prompts = (() => {
     if ($("rec-model").value) p.set("models", $("rec-model").value);
     if ($("rec-starred").checked) p.set("starred", "true");
     if ($("rec-all").checked) p.set("scope", "all");
+    const signal=$("rec-outcome").value;if(signal==="refused")p.set("outcome","refused");else if(signal==="noteworthy")p.set("signal","noteworthy");
     const r = $("rec-range").value;
     if (r !== "all" && S.meta) {
       const today = S.meta.today;
@@ -74,7 +75,7 @@ const Prompts = (() => {
   }
   function renderList() {
     $("rec-count").textContent = fmt(P.total) + ($("rec-all").checked ? " requests" : " saved records");
-    $("rec-count-sub").textContent = P.total ? "Showing " + fmt(P.rows.length) + ". Prompts stay hidden until you open one." : "";
+    $("rec-count-sub").textContent = P.total ? "Showing " + fmt(P.rows.length) + ". Open a record to inspect the full exchange." : "";
     const box = $("rec-items"); box.textContent = "";
     if (!P.rows.length) {
       box.append(h("div", { class: "empty", text: S.meta.capture.enabled ? "No records match. New requests appear here as they finish." : "No saved records yet." }));
@@ -89,7 +90,7 @@ const Prompts = (() => {
     const cb = h("input", { type: "checkbox", class: "rec-cb", "aria-label": "Select" });
     cb.checked = P.checked.has(id);
     cb.addEventListener("click", (e) => { e.stopPropagation(); if (cb.checked) P.checked.add(id); else P.checked.delete(id); updateBulk(); });
-    const title = n.title || (r.captured ? "Untitled prompt" : "Not saved (count only)");
+    const title = n.title || it.preview || (r.captured ? "Saved prompt" : "Not saved (count only)");
     const row = h("div", { class: "rec-item" + (P.sel === id ? " sel" : "") + (r.captured ? "" : " nofile"), role: "option", tabindex: "0", "data-id": id, "aria-selected": String(P.sel === id) },
       cb,
       h("div", { class: "ri-main" },
@@ -100,6 +101,8 @@ const Prompts = (() => {
         h("div", { class: "ri-meta" },
           swatchText(hostName(r.host), hostColorVar(r.host)),
           span(r.model, "ri-model"),
+          r.outcome==="refused"?span(r.signal==="likely_refusal"?"Likely refusal":"Refused", "tag err"):null,
+          ["structured","substantial","tool_call"].includes(r.signal)?span(r.signal.replace("_"," "),"tag"):null,
           (n.tags || []).map((t) => span(t, "tag"))),
         h("div", { class: "ri-nums" },
           h("b", { text: fmt(r.input + r.output) }), span(" combined", "label-sm"),
@@ -315,142 +318,7 @@ const Prompts = (() => {
   }
 
   // ================================================================ chat
-  function hostsForChat() { return S.meta.hosts.filter((x) => x.enabled && !x.removed); }
-  function fillChatHosts() {
-    const hs = $("chat-host");
-    const keep = hs.value || store.get("chat.host") || "";
-    hs.textContent = "";
-    for (const x of hostsForChat()) hs.append(h("option", { value: x.id, text: x.name + (x.lmstudio && !x.lmstudio.ok ? " (unreachable)" : "") }));
-    if ([...hs.options].some((o) => o.value === keep)) hs.value = keep;
-    fillChatModels();
-  }
-  function fillChatModels() {
-    const x = S.meta.hosts.find((y) => y.id === $("chat-host").value);
-    const ms = $("chat-model");
-    const keep = ms.value || store.get("chat.model") || "";
-    ms.textContent = "";
-    const models = (x && x.lmstudio && x.lmstudio.models) || [];
-    for (const m of models) ms.append(h("option", { value: m, text: m }));
-    if (!models.length) ms.append(h("option", { value: "", text: "No models loaded" }));
-    if ([...ms.options].some((o) => o.value === keep)) ms.value = keep;
-  }
-  function renderChat() {
-    const log = $("chat-log");
-    log.textContent = "";
-    if (!P.chat.length) {
-      log.append(h("div", { class: "chat-empty" }, h("img", { src: "/pip.svg", alt: "" }), h("p", { text: "Say hi to your model. Pip counts every token, both ways." }), S.meta.capture.enabled ? h("p", { class: "label-sm", text: "This chat is saved as records, like any other request." }) : h("p", { class: "label-sm", text: "Saving is off, so only the counts are kept." })));
-    }
-    for (const m of P.chat) log.append(bubble(m));
-    log.scrollTop = log.scrollHeight;
-  }
-  function bubble(m) {
-    const b = h("div", { class: "bubble " + m.role });
-    if (m.reasoning) b.append(h("details", { class: "reasoning" }, h("summary", { text: "Reasoning" }), richText(m.reasoning)));
-    b.append(richText(m.content || (m.pending ? "…" : "")));
-    if (m.stats) {
-      const s = m.stats;
-      const foot = h("div", { class: "bubble-foot" }, span(fmt(s.input) + " in · " + fmt(s.output) + " out · " + fmt(s.input + s.output) + " combined", ""),
-        s.tps ? span(" · " + s.tps.toFixed(1) + " tok/s", "") : null, s.ttft ? span(" · first token " + fmt(s.ttft) + " ms", "") : null);
-      if (s.id) foot.append(" · ", h("a", { href: "#/prompts/" + s.id, text: "Open record" }));
-      b.append(foot);
-    }
-    if (m.error) b.append(h("div", { class: "bubble-err", text: m.error }));
-    m.el = b;
-    return b;
-  }
-  async function send(text) {
-    if (P.streaming) return;
-    const host = $("chat-host").value, model = $("chat-model").value;
-    if (!host || !model) return toast("Pick a host and a model first.");
-    store.set("chat.host", host); store.set("chat.model", model);
-    P.chat.push({ role: "user", content: text });
-    const msgs = [];
-    const sys = $("chat-system").value.trim();
-    if (sys) msgs.push({ role: "system", content: sys });
-    for (const m of P.chat) if (!m.error) msgs.push({ role: m.role, content: m.content });
-    const reply = { role: "assistant", content: "", reasoning: "", pending: true };
-    P.chat.push(reply);
-    renderChat();
-    P.streaming = true;
-    $("chat-send").disabled = true;
-    const t0 = performance.now();
-    let first = 0, deltas = 0, usage = null;
-    const started = new Date();
-    try {
-      const resp = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ host, model, messages: msgs, temperature: num($("chat-temp")) }) });
-      if (!resp.ok) throw new Error((await resp.text()) || "HTTP " + resp.status);
-      const reader = resp.body.getReader();
-      const dec = new TextDecoder();
-      let buf = "";
-      const paint = () => { const log = $("chat-log"); log.lastChild.replaceWith(bubble(reply)); log.scrollTop = log.scrollHeight; };
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        let i;
-        while ((i = buf.indexOf("\n\n")) >= 0) {
-          const ev = buf.slice(0, i); buf = buf.slice(i + 2);
-          for (const line of ev.split("\n")) {
-            if (!line.startsWith("data:")) continue;
-            const data = line.slice(5).trim();
-            if (!data || data === "[DONE]") continue;
-            let j; try { j = JSON.parse(data); } catch (e) { continue; }
-            if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
-            if (j.usage) usage = j.usage;
-            for (const c of j.choices || []) {
-              const dl = c.delta || {};
-              const piece = dl.content || c.text || "";
-              const rs = dl.reasoning_content || dl.reasoning || "";
-              if (piece || rs) { if (!first) first = performance.now(); deltas++; }
-              reply.content += piece; reply.reasoning += rs;
-            }
-          }
-        }
-        reply.pending = false;
-        paint();
-      }
-      const out = usage ? usage.completion_tokens || 0 : deltas;
-      reply.stats = { input: usage ? usage.prompt_tokens || 0 : 0, output: out, ttft: first ? Math.round(first - t0) : 0, tps: first && out ? out / ((performance.now() - first) / 1000) : 0 };
-      reply.pending = false;
-      renderChat();
-      // Link the bubble to the record Toktail just wrote.
-      setTimeout(async () => {
-        try {
-          const r = await getJSON("/api/records?scope=all&limit=5&hosts=" + encodeURIComponent(host));
-          const hit = r.rows.find((x) => x.row.model === model && new Date(x.row.timestamp) >= new Date(started.getTime() - 2000));
-          if (hit) {
-            reply.stats.id = hit.row.request_id;
-            if (hit.row.output) { reply.stats.output = hit.row.output; reply.stats.input = hit.row.input; reply.stats.tps = hit.row.tokens_per_sec || reply.stats.tps; }
-            renderChat();
-          }
-        } catch (e) { /* the link is a nicety */ }
-      }, 700);
-    } catch (e) {
-      reply.pending = false;
-      reply.error = "Couldn't get an answer: " + e.message;
-      renderChat();
-    } finally {
-      P.streaming = false;
-      $("chat-send").disabled = false;
-    }
-  }
-  async function continueInChat(id, r) {
-    try {
-      const [p, resp] = await Promise.all([getJSON("/api/records/" + encodeURIComponent(id) + "/prompt"), getJSON("/api/records/" + encodeURIComponent(id) + "/response")]);
-      P.chat = [];
-      $("chat-system").value = "";
-      for (const m of p.content.messages || []) {
-        if (m.role === "system") { $("chat-system").value = m.text; $("chat-system").hidden = false; }
-        else P.chat.push({ role: m.role === "assistant" ? "assistant" : "user", content: m.text });
-      }
-      if (resp.content.content) P.chat.push({ role: "assistant", content: resp.content.content });
-      setMode("chat");
-      if ([...$("chat-host").options].some((o) => o.value === r.host)) { $("chat-host").value = r.host; fillChatModels(); }
-      if ([...$("chat-model").options].some((o) => o.value === r.model)) $("chat-model").value = r.model;
-      renderChat();
-      $("chat-text").focus();
-    } catch (e) { toast("Couldn't open it in chat: " + e.message); }
-  }
+  function continueInChat(id,row) { PipChat.continueRecord(id,row); }
 
   // ================================================================ page
   function setMode(v) {
@@ -459,7 +327,7 @@ const Prompts = (() => {
     $("chat-view").hidden = v !== "chat";
     const want = v === "chat" ? "#/prompts/chat" : P.sel ? "#/prompts/" + P.sel : "#/prompts";
     if (location.hash !== want) history.replaceState(null, "", want);
-    if (v === "chat") { fillChatHosts(); renderChat(); setTimeout(() => $("chat-text").focus(), 50); }
+    if (v === "chat") PipChat.showPage();
   }
   async function show(sub) {
     if (!S.meta) return;
@@ -480,7 +348,7 @@ const Prompts = (() => {
   function init() {
     let t;
     $("rec-search").addEventListener("input", () => { clearTimeout(t); t = setTimeout(() => loadList(false), 250); });
-    for (const id of ["rec-host", "rec-model", "rec-range", "rec-sort", "rec-starred", "rec-all"]) $(id).addEventListener("change", () => loadList(false));
+    for (const id of ["rec-host", "rec-model", "rec-range", "rec-sort", "rec-outcome", "rec-starred", "rec-all"]) $(id).addEventListener("change", () => loadList(false));
     $("rec-more").addEventListener("click", () => loadList(true));
     $("rec-select-all").addEventListener("click", () => {
       const ids = P.rows.filter((x) => x.row.captured || $("rec-all").checked).map((x) => x.row.request_id);
@@ -491,11 +359,9 @@ const Prompts = (() => {
     });
     $("rec-bulk-delete").addEventListener("click", () => remove([...P.checked]));
     $("prompts-mode").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) setMode(b.dataset.v); });
-    $("chat-host").addEventListener("change", fillChatModels);
-    $("chat-system-btn").addEventListener("click", () => { $("chat-system").hidden = !$("chat-system").hidden; });
-    $("chat-clear").addEventListener("click", () => { P.chat = []; renderChat(); });
-    $("chat-form").addEventListener("submit", (e) => { e.preventDefault(); const t2 = $("chat-text").value.trim(); if (!t2) return; $("chat-text").value = ""; send(t2); });
-    $("chat-text").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("chat-form").requestSubmit(); } });
+
   }
-  return { init, show, refresh };
+  function filter(signal){$("rec-outcome").value=signal;$("rec-all").checked=true;location.hash="#/prompts";setMode("records");loadList(false);}
+  return { init, show, refresh, filter };
 })();
+

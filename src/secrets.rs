@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Secrets live in the macOS Keychain, never in config.toml: the S3 secret
-//! access key, each host's LM Studio API token, the encryption password and
-//! key-store credentials. Off macOS (development, CI) they go in files only
-//! the current user can read. Environment variables override for testing.
+//! Secrets never go in config.toml: the S3 secret access key, each host's LM
+//! Studio API token, the encryption password and key-store credentials live
+//! in the macOS Keychain, the Windows Credential Manager, or on Linux in
+//! files only the current user can read. Environment variables override all
+//! of these (handy for servers and testing).
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -54,7 +55,29 @@ fn store_set(svc: &str, account: &str, value: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn store_get(svc: &str, account: &str) -> Option<String> {
+    keyring::Entry::new(svc, account)
+        .ok()?
+        .get_password()
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(windows)]
+fn store_set(svc: &str, account: &str, value: Option<&str>) -> Result<()> {
+    let e = keyring::Entry::new(svc, account)?;
+    match value {
+        Some(v) => e.set_password(v)?,
+        None => match e.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(err) => return Err(err.into()),
+        },
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn secret_file(svc: &str, account: &str) -> PathBuf {
     let safe = |s: &str| {
         s.chars()
@@ -74,7 +97,7 @@ fn secret_file(svc: &str, account: &str) -> PathBuf {
         .join(format!("{}--{}", safe(svc), safe(account)))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn store_get(svc: &str, account: &str) -> Option<String> {
     std::fs::read_to_string(secret_file(svc, account))
         .ok()
@@ -82,7 +105,7 @@ fn store_get(svc: &str, account: &str) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn store_set(svc: &str, account: &str, value: Option<&str>) -> Result<()> {
     let path = secret_file(svc, account);
     match value {
@@ -144,7 +167,10 @@ pub fn prompt_and_store(access_key_id: &str) -> Result<()> {
         anyhow::bail!("no secret entered");
     }
     set_s3_secret(access_key_id.trim(), Some(secret))?;
-    println!("Saved to the Keychain under \"{KEYCHAIN_SERVICE}\" / {access_key_id}.");
+    println!(
+        "Saved to the {} under \"{KEYCHAIN_SERVICE}\" / {access_key_id}.",
+        crate::platform::secret_store_name()
+    );
     Ok(())
 }
 
@@ -172,7 +198,7 @@ pub fn set_host_token(host_id: &str, token: Option<&str>) -> Result<()> {
 pub fn migrate_single_token(first_host: &str) {
     let legacy =
         env(ENV_LMSTUDIO_TOKEN).or_else(|| store_get(&service(LMSTUDIO_SERVICE), "api-token"));
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let legacy = legacy.or_else(|| {
         BASE.get()
             .and_then(|b| std::fs::read_to_string(b.join("lmstudio-token")).ok())
@@ -217,7 +243,7 @@ pub fn token_hint(token: &str) -> String {
     }
 }
 
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(all(test, not(any(target_os = "macos", windows))))]
 mod tests {
     use super::*;
     #[test]
