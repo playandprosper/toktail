@@ -5,7 +5,7 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 https://github.com/playandprosper/toktail
 
 The Pip the Token Fox mascot artwork (assets/pip.svg) and the images derived
-from it (packaging/AppIcon-1024.png, docs/*.png, docs/*.gif, assets/tray/*)
+from it (packaging/AppIcon-1024.png, packaging/toktail.ico, docs/*.png, docs/*.gif, assets/tray/*)
 are part of the Toktail project and are distributed under the same license.
 
 Public API prices in assets/pricing.json were collected on 2026-10-11 from

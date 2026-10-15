@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# Toktail as a systemd user service: `make service` installs it.
+# The portal answers on 127.0.0.1 only; reach it from another computer with
+#   ssh -L 8765:127.0.0.1:8765 <this host>
+[Unit]
+Description=Toktail: every token leaves a trail
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart="@BIN@" --headless
+Restart=on-failure
+RestartSec=5
+# Secrets can also come from the environment, e.g.
+# Environment=TOKTAIL_S3_SECRET_KEY=...
+
+[Install]
+WantedBy=default.target

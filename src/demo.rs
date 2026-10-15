@@ -600,7 +600,12 @@ fn demo_pip_answer(body: &Value) -> Option<String> {
     let tools: Vec<&Value> = msgs.iter().filter(|m| m["role"] == "tool").collect();
     // With a tool's answer in hand, the facts it repeats aren't needed.
     if tools.is_empty() {
-        for line in facts.split("\n- ").filter(|l| !l.starts_with("Today is")) {
+        // Context lines are for the model; the canned reply reads back the numbers.
+        let context = ["Today is", "Recorded history", "The latest question"];
+        for line in facts
+            .split("\n- ")
+            .filter(|l| !context.iter().any(|c| l.starts_with(c)))
+        {
             out += &format!("- {line}\n");
         }
     }

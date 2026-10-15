@@ -21,7 +21,7 @@
     <key>NSHumanReadableCopyright</key>
     <string>Licensed under the Apache License 2.0. Every token leaves a trail.</string>
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>11.0</string>
     <!-- Menu bar only: no Dock icon, no app menu. Pip lives in the menu bar. -->
     <key>LSUIElement</key>
     <true/>

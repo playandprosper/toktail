@@ -1,24 +1,51 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Builds dist/Toktail.app. With --install, also quits any running copy,
-# copies the app to /Applications and starts it.
+# Builds dist/Toktail.app on a Mac.
+#
+#   scripts/build-app.sh               this Mac's architecture
+#   scripts/build-app.sh --universal   Apple Silicon + Intel in one app (needs both Rust targets)
+#   scripts/build-app.sh --install     also quit any running copy, copy it to /Applications and start it
+#
+# Runs on macOS 11 Big Sur and later, so older Intel Macs can watch an
+# AI-capable machine over the network.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "build-app.sh builds a macOS .app; run it on the Mac." >&2
+  echo "build-app.sh builds a macOS .app; run it on a Mac. On Windows use scripts/build-windows.ps1, on Linux make build." >&2
   exit 1
 fi
 command -v cargo >/dev/null || { echo "Rust is not installed: https://rustup.rs" >&2; exit 1; }
 
-VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-echo "==> Building Toktail $VERSION (release)"
-cargo build --release
+UNIVERSAL=0
+INSTALL=0
+for a in "$@"; do
+  case "$a" in
+    --universal) UNIVERSAL=1 ;;
+    --install) INSTALL=1 ;;
+    *) echo "unknown option: $a" >&2; exit 2 ;;
+  esac
+done
 
+export MACOSX_DEPLOYMENT_TARGET=11.0
+VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 APP=dist/Toktail.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/Toktail "$APP/Contents/MacOS/Toktail"
+
+if [[ $UNIVERSAL == 1 ]]; then
+  echo "==> Building Toktail $VERSION for Apple Silicon and Intel"
+  if command -v rustup >/dev/null; then rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null; fi
+  cargo build --release --target aarch64-apple-darwin
+  cargo build --release --target x86_64-apple-darwin
+  lipo -create -output "$APP/Contents/MacOS/Toktail" \
+    target/aarch64-apple-darwin/release/Toktail target/x86_64-apple-darwin/release/Toktail
+  lipo -info "$APP/Contents/MacOS/Toktail"
+else
+  echo "==> Building Toktail $VERSION for $(uname -m)"
+  cargo build --release
+  cp target/release/Toktail "$APP/Contents/MacOS/Toktail"
+fi
 sed "s/__VERSION__/$VERSION/g" packaging/Info.plist > "$APP/Contents/Info.plist"
 
 # App icon: Pip on a midnight squircle, every size macOS asks for.
@@ -35,7 +62,7 @@ iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 codesign --force --sign - --timestamp=none "$APP"
 echo "==> Built $APP"
 
-if [[ "${1:-}" == "--install" ]]; then
+if [[ $INSTALL == 1 ]]; then
   for name in Toktail TokenLedger; do
     if pgrep -x "$name" >/dev/null; then
       echo "==> Quitting the running $name"
