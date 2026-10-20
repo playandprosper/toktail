@@ -1,8 +1,9 @@
-# Upgrading to Toktail 0.6
+# Upgrading to Toktail 0.0.2
 
-0.6 picks up from 0.4 (the last finished release) and from the unfinished
-0.5 preview. Your CSV history, settings and saved prompts carry over on their
-own; this page says what changes on disk and how to check that it went well.
+Toktail's version numbers start over at 0.0.2. It picks up from 0.6 (and,
+through 0.6's own migration, from 0.4 and the 0.5 preview). Your CSV history,
+settings, saved prompts and secrets carry over on their own; this page says
+what changes on disk and how to check that it went well.
 
 ## Before you start
 
@@ -17,108 +18,108 @@ Quit Toktail, then copy Toktail's folder somewhere safe:
 Nothing below needs the copy, but it costs nothing and makes every step
 reversible.
 
-## From 0.4
+## From 0.6
 
-**CSV files gain seven columns.** 0.4 wrote 16 columns; 0.6 writes 23
-(`outcome`, `signal`, `response_chars`, `prompt_blob`, `prompt_key`,
-`response_key`, `reference_key`). On first start each monthly file with the
-old header is copied to `tokens-YYYY-MM.csv.pre-v0.5.bak` and rewritten with
-the new header. Existing rows keep every value; the new columns start empty.
-The backup is made once and never overwritten. Delete the `.bak` files when
-you're happy.
+**CSV files gain nine columns.** 0.6 wrote 23 columns; 0.0.2 writes 32
+(`token_id`, `cache_read_tokens`, `cache_write_tokens`, `cache_hit`,
+`session_id`, `chain_node`, `prefix_tokens`, `agent`, `client`). On first
+start each monthly file with the old header is copied to
+`tokens-YYYY-MM.csv.pre-v0.0.2.bak` and rewritten with the new header.
+Existing rows keep every value; the new columns start empty. The backup is
+made once and never overwritten. Delete the `.bak` files when you're happy.
+(Files still carrying the 0.4 header are backed up as `.pre-v0.5.bak` and
+migrated the same way.)
 
-**Saved prompts share their system prompt and history.** With prompt saving
-on, the repeated part of a conversation (system prompt and earlier turns) is
-written once to `records/blobs/<first two hex>/<sha256>` and each record
-points at it through `prompt_blob`. Records saved by 0.4 stay where they are
-and still open on the Prompts page.
+**Saved prompts become session chains.** Twenty seconds after launch,
+Toktail folds every saved prompt blob into a chain in the background, oldest
+first: each blob is rewritten as only the bytes that are new over the prompt
+it grew from, plus a reference to that prompt by path and checksum. Every
+rewrite is verified to unfold back to the original before the original is
+replaced, and the original is copied to `records/.pre-v0.0.2/blobs/…` first.
+The Prompts → Sessions page shows the migration's progress and, when it's
+done, a **Free space** button that removes the originals. Until then
+everything stays readable twice over. Records open the same as before during
+and after the migration.
 
-**Token counts are never deleted.** When a saved file disappears (retention,
-a manual delete, a lifecycle rule on the bucket), the matching CSV row keeps
-its counts and only loses its file pointers. 0.4 and the 0.5 preview removed
-the whole row, which quietly lowered your totals; 0.6 doesn't.
+**Hosts get a type.** Every existing host is an **LM Studio** host, exactly
+as before: the stored API token replaces whatever your apps send. New host
+types (Anthropic, OpenAI, another OpenAI-compatible API) handle keys
+differently; see the README's *Public API hosts and keys*.
 
-**New things to look at.** The Models page, the live feed and budgets on the
-dashboard, the alerts bell, the ⌘K / Ctrl+K palette, `/metrics`, and Pip's
-chat (press `/`, double-click Pip, or **Ask Pip…** in the menu).
+**A secret for token ids.** The first time a request carries a credential,
+Toktail creates an install secret in your Keychain / Credential Manager /
+secret service (service "Toktail", item `install-secret`) and uses it to make the one-way
+`token_id` values in the CSV. Nothing to do; if you remove the secret, new
+ids simply won't match old ones.
 
-## From the 0.5 preview
+**Pip is in 3D.** The portal's Pip is now the same three.js fox as the
+landing page. Without WebGL, or with reduced motion, the SVG fox is used.
 
-The preview's CSV layout is the same as 0.6, so no files are rewritten. What
-changes:
-
-- **The purple brand is back.** The preview's grey theme is gone. Light and
-  dark mode follow the 0.4 palette; nothing to migrate.
-- **Pip's chat answers from your CSV.** Totals, comparisons, budgets, costs
-  and slowest requests are computed in Toktail and handed to the model, so the
-  model never does arithmetic and never answers from an empty context. The
-  receipts under each answer show the exact numbers used.
-- **Direct mode and the system prompt.** The chat's settings drawer has two
-  modes. *Pip* keeps the data tools and lets you replace Pip's persona with
-  your own system prompt. *Direct* sends your system prompt and messages
-  straight to the model you pick, with nothing added. **Continue in chat** on
-  a saved prompt opens it in Direct mode with that record's system prompt.
-- **Rows the preview deleted are gone.** If the preview's reconcile removed
-  rows after files vanished, 0.6 can't bring them back. If you kept a backup
-  of the CSV folder from before the preview, copy those monthly files back
-  while Toktail is quit; 0.6 reads them as they are.
+**Prices.** Market prices are checked once a day from LiteLLM and OpenRouter
+(no key needed) and kept under `market/` in Toktail's folder; the comparison
+uses them, dated, from the day they were fetched. The built-in `pricing.json`
+and your override still apply to days before the first snapshot. Turn it off
+in Settings → Cost comparison.
 
 ## New settings
 
-Both are optional and both can be edited in Settings instead.
+All optional; all editable in Settings.
 
 ```toml
-[[budgets]]
-id = "studio-day"
-name = "Mac Studio, daily"
-host = "studio"        # empty = every host
-model = ""             # empty = every model
-metric = "combined"    # "combined", "input" or "output"
-period = "day"         # "day", "week" or "month"
-limit = 50000000
-notify = true
+[cache]
+enabled = false          # answer identical requests from disk
+ttl_hours = 72
+max_mb = 2048
 
-[alerts]
-budgets = true
-host_down = true
-stampede = false
+[commentary]
+enabled = true           # Pip's one-liners about what your agents are doing
+every_minutes = 5
+
+[market]
+enabled = true           # daily LiteLLM / OpenRouter price check
+next_source = "litellm"  # alternates on its own
+
+[costs]
+cache_aware = false      # price repeated prompt prefixes at the cached-input rate
+market_prices = true     # use the daily market prices
+
+[[hosts]]
+# ...as before, plus:
+kind = "lmstudio"        # "lmstudio", "anthropic", "openai" or "other"
+inject_key = true        # public hosts: add the stored key for apps on this computer
+# gateway_keys = [...]   # issued in Settings → Hosts; only hashes are stored
 ```
 
 ## Per platform
 
-**macOS.** Builds now target macOS 11 or later. `make dist` makes a universal
-app that runs natively on Apple Silicon and Intel Macs; `make install` builds
-for the Mac you're on. The first start of a new build may ask for Keychain
-access again: choose **Always Allow**.
-
-**Windows (new).** Run `scripts\build-windows.ps1 -Install` from PowerShell, or
-`make install` from Git Bash. Toktail installs to
-`%LOCALAPPDATA%\Programs\Toktail`, adds a Start menu shortcut, starts at login
-through the per-user Run key, and keeps secrets in Credential Manager. The
-icon sits in the notification area (it may be under the ^ arrow at first).
+**macOS.** The first start of a new build may ask for Keychain access again:
+choose **Always Allow**.
 
 **Linux.** `make install` builds with the tray icon when GTK and
-libayatana-appindicator are installed, and headless otherwise. `make service`
-installs a systemd user service for machines with no desktop.
+libayatana-appindicator are installed, and headless otherwise. `make service` installs a
+systemd user service for machines with no desktop.
 
 ## Check that it worked
 
 From the source folder:
 
 ```sh
-make test        # Rust tests, including the CSV migration and calendar math
+make test        # Rust tests: chains fold and unfold byte for byte, keys, cache, migration
 make lint        # fmt and clippy
 make check-ui    # every portal script parses and is served
 make demo        # sample data on http://127.0.0.1:8799, your files untouched
 ```
 
 Then open Toktail and compare the dashboard's all-time total with the one you
-had before upgrading: it should match to the token. Ask Pip "how many tokens
-did I use last month?" and check the receipt against the dashboard.
+had before upgrading: it should match to the token. Open any saved prompt
+from before the upgrade and download the original: it's the same bytes. On
+Prompts → Sessions, wait for "Migration done".
 
 ## Going back
 
-Quit Toktail, restore the folder you copied, and reinstall 0.4. If you didn't
-copy the folder, rename each `tokens-YYYY-MM.csv.pre-v0.5.bak` back to
-`tokens-YYYY-MM.csv`: those are the files exactly as 0.4 left them. Requests
-made while 0.6 ran are only in the new files.
+Quit Toktail, restore the folder you copied, and reinstall 0.6. If you didn't
+copy the folder: rename each `tokens-YYYY-MM.csv.pre-v0.0.2.bak` back to
+`tokens-YYYY-MM.csv`, and copy `records/.pre-v0.0.2/blobs/` over
+`records/blobs/` (only if you haven't pressed **Free space**). Requests made
+while 0.0.2 ran are only in the new files, and prompts saved by 0.0.2 are
+chains that 0.6 can't open.

@@ -115,8 +115,17 @@ pub fn write_canonical(v: &Value, out: &mut String) {
 /// (e.g. Anthropic's message_start + message_delta).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Usage {
+    /// Every input token the model read, including what the provider served
+    /// from its prompt cache. Anthropic reports the cached part separately
+    /// (`cache_read_input_tokens`, `cache_creation_input_tokens`) and leaves it
+    /// out of `input_tokens`; it is added back here. OpenAI's `prompt_tokens`
+    /// already includes its `cached_tokens`.
     pub input: Option<u64>,
     pub output: Option<u64>,
+    /// Input tokens the provider served from its cache.
+    pub cache_read: u64,
+    /// Input tokens the provider wrote to its cache.
+    pub cache_write: u64,
 }
 
 impl Usage {
@@ -153,11 +162,34 @@ fn scan_usage_depth(v: &Value, u: &mut Usage, depth: u8) {
         Value::Object(m) => {
             for (k, val) in m {
                 if (k == "usage" || k == "stats") && val.is_object() {
+                    // Anthropic: cached input is reported beside input_tokens.
+                    let cache_read = val
+                        .get("cache_read_input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let cache_write = val
+                        .get("cache_creation_input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let anthropic_style = val.get("cache_read_input_tokens").is_some()
+                        || val.get("cache_creation_input_tokens").is_some();
                     for ik in INPUT_KEYS {
                         if let Some(n) = val.get(ik).and_then(Value::as_u64) {
-                            u.merge_in(n);
+                            u.merge_in(if anthropic_style {
+                                n + cache_read + cache_write
+                            } else {
+                                n
+                            });
                         }
                     }
+                    // OpenAI: prompt_tokens_details.cached_tokens is a part of prompt_tokens.
+                    let openai_cached = val
+                        .pointer("/prompt_tokens_details/cached_tokens")
+                        .or_else(|| val.pointer("/input_tokens_details/cached_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    u.cache_read = u.cache_read.max(cache_read.max(openai_cached));
+                    u.cache_write = u.cache_write.max(cache_write);
                     for ok in OUTPUT_KEYS {
                         if let Some(n) = val.get(ok).and_then(Value::as_u64) {
                             u.merge_out(n);
@@ -473,7 +505,8 @@ mod tests {
             u,
             Usage {
                 input: Some(12),
-                output: Some(34)
+                output: Some(34),
+                ..Default::default()
             }
         );
 
@@ -486,7 +519,8 @@ mod tests {
             u,
             Usage {
                 input: Some(5),
-                output: Some(9)
+                output: Some(9),
+                ..Default::default()
             }
         );
 
@@ -503,9 +537,25 @@ mod tests {
             u,
             Usage {
                 input: Some(25),
-                output: Some(15)
+                output: Some(15),
+                ..Default::default()
             }
         );
+
+        // Claude Code's turns are mostly cached input: it still counts.
+        let mut u = Usage::default();
+        scan_usage(
+            &json!({"type":"message_start","message":{"usage":{"input_tokens":120,"cache_read_input_tokens":180_000,"cache_creation_input_tokens":2_000,"output_tokens":1}}}),
+            &mut u,
+        );
+        assert_eq!(u.input, Some(182_120));
+        assert_eq!((u.cache_read, u.cache_write), (180_000, 2_000));
+        let mut u = Usage::default();
+        scan_usage(
+            &json!({"usage":{"prompt_tokens":5000,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":4096}}}),
+            &mut u,
+        );
+        assert_eq!((u.input, u.cache_read), (Some(5000), 4096));
 
         let mut u = Usage::default();
         scan_usage(
@@ -516,7 +566,8 @@ mod tests {
             u,
             Usage {
                 input: Some(7),
-                output: None
+                output: None,
+                ..Default::default()
             }
         );
     }
@@ -546,7 +597,8 @@ mod tests {
             t.usage,
             Usage {
                 input: Some(10),
-                output: Some(2)
+                output: Some(2),
+                ..Default::default()
             }
         );
         assert_eq!(t.deltas, 2);

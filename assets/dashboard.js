@@ -9,6 +9,7 @@ const Dashboard = (() => {
     const today = S.meta ? S.meta.today : isoD(new Date());
     switch (S.range) {
       case "today": return [today, today];
+      case "yesterday": { const y = addDays(today, -1); return [y, y]; }
       case "7": return [addDays(today, -6), today];
       case "30": return [addDays(today, -29), today];
       case "90": return [addDays(today, -89), today];
@@ -23,7 +24,7 @@ const Dashboard = (() => {
   }
   function rangeName() {
     const [f, t] = rangeDates();
-    return { today: "today", "7": "in the last 7 days", "30": "in the last 30 days", "90": "in the last 90 days", mtd: "this month", all: "since you started counting" }[S.range]
+    return { today: "today", yesterday: "yesterday", "7": "in the last 7 days", "30": "in the last 30 days", "90": "in the last 90 days", mtd: "this month", all: "since you started counting" }[S.range]
       || ("from " + dayLabel(f) + " to " + dayLabel(t));
   }
   function selectedModels() {
@@ -86,7 +87,7 @@ const Dashboard = (() => {
     let series = order.filter((k) => present.has(k));
     for (const k of present) if (!series.includes(k)) series.push(k);
     const byDay = new Map(days.map((d) => [d, new Map()]));
-    const blank = () => ({ input: 0, output: 0, requests: 0, gen_out: 0, gen_ms: 0, errors: 0, estimated: 0 });
+    const blank = () => ({ input: 0, output: 0, requests: 0, gen_out: 0, gen_ms: 0, errors: 0, estimated: 0, cache_hits: 0, cache_saved: 0, cache_read: 0, cache_write: 0 });
     const tot = blank();
     const perSeries = new Map();
     for (const e of S.daily) {
@@ -258,11 +259,13 @@ const Dashboard = (() => {
       const t = new Date(f.finished_at);
       const tags = [];
       if (f.status >= 400) tags.push(span(f.status === 499 ? "client left" : String(f.status), "tag err"));
+      if (f.cache_hit) tags.push(span("cache hit", "tag hit"));
+      if (f.agent) tags.push(span(f.agent, "tag agent"));
       if (f.outcome === "refused") tags.push(span("refused", "tag err"));
       else if (["structured", "substantial", "tool_call"].includes(f.signal)) tags.push(span(f.signal.replace("_", " "), "tag"));
       const what = h("span", { class: "what" }, swatchText(hostName(f.host), hostColorVar(f.host)), h("b", { text: f.model }), ...tags);
-      const n = h("span", { class: "n" }, document.createTextNode(fmt(f.input + f.output)), h("small", { text: " · " + fmt(f.output) + " out" + (f.tokens_per_sec ? " · " + f.tokens_per_sec.toFixed(0) + " tok/s" : "") }));
-      const li = h("li", { class: f.isNew ? "new" : "", title: fmt(f.input) + " in, " + fmt(f.output) + " out, " + (f.duration_ms / 1000).toFixed(2) + " s" + (f.ttft_ms != null ? ", first token " + fmt(f.ttft_ms) + " ms" : "") }, h("time", { text: t.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }) }), what, n);
+      const n = h("span", { class: "n" }, document.createTextNode(fmt(f.input + f.output)), h("small", { text: f.cache_hit ? " · not generated" : " · " + fmt(f.output) + " out" + (f.tokens_per_sec ? " · " + f.tokens_per_sec.toFixed(0) + " tok/s" : "") }));
+      const li = h("li", { class: (f.isNew ? "new" : "") + (f.cache_hit ? " hit" : ""), title: fmt(f.input) + " in, " + fmt(f.output) + " out, " + (f.duration_ms / 1000).toFixed(2) + " s" + (f.ttft_ms != null ? ", first token " + fmt(f.ttft_ms) + " ms" : "") }, h("time", { text: t.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }) }), what, n);
       li.addEventListener("click", () => { location.hash = "#/prompts/" + f.request_id; });
       li.style.cursor = "pointer";
       feed.append(li);
@@ -420,6 +423,7 @@ const Dashboard = (() => {
       ["Speed", tps ? tps.toFixed(1) + " tok/s" : "—", "output per request, while generating"],
       ["Input per output", ratio ? ratio.toFixed(1) + " to 1" : "—", "prompt tokens per token generated"],
       ["Errors", fmt(D.tot.errors), D.tot.errors ? "or clients that hung up early" : "every request finished"],
+      ["Cache hits", fmt(D.tot.cache_hits || 0), D.tot.cache_hits ? compact(D.tot.cache_saved || 0) + " tokens answered without a model" : "repeated prompts answered from Toktail's cache"],
     ];
     const box = $("stats"); box.textContent = "";
     for (const [k, v, d, id] of stats) {
@@ -662,7 +666,7 @@ const Dashboard = (() => {
       if (m.id === base.id) o.selected = true;
       sel.append(o);
     }
-    $("costs-sub").textContent = "List prices as of " + R.as_of + ", for " + scopeName().toLowerCase() + "' requests " + rangeName();
+    $("costs-sub").textContent = (R.market ? "Market prices as of " + R.as_of + " via " + R.market.replace(/ \(.*\)$/, "") : "List prices as of " + R.as_of) + ", for " + scopeName().toLowerCase() + "' requests " + rangeName() + (R.cache_aware ? ". Repeated prompt prefixes priced at the cached-input rate." : "");
     const local = R.local;
     const hw = R.hardware || { amortized: 0, machines: [], has_fleet: false };
     const yours = local.cost + hw.amortized;
@@ -752,7 +756,7 @@ const Dashboard = (() => {
     if (R.excluded_embedding_requests) lines.push(fmt(R.excluded_embedding_requests) + " embedding requests are left out, since chat prices don't apply to them.");
     for (const m of compared) if (m.note) lines.push(m.name + ": " + m.note);
     for (const l of lines) notes.append(h("div", { text: l }));
-    const src = h("div", {}, "Prices from " + (R.origin === "built-in" ? "Toktail's built-in list" : R.origin) + ": ");
+    const src = h("div", {}, "Prices from " + (R.origin === "built-in" ? "Toktail's built-in list" : R.origin) + (R.market ? ", updated from the market (" + R.market + ")" : "") + ": ");
     const seen = new Set();
     compared.forEach((m) => {
       if (!m.source || seen.has(m.provider)) return;
@@ -899,4 +903,5 @@ const Dashboard = (() => {
 
   return { derive, chartData, init, load, render, updateLive, ingestLive, renderFeed, rangeName, scopeName, get geom() { return dailyGeom; } };
 })();
+
 

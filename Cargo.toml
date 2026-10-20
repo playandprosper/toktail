@@ -1,6 +1,6 @@
 [package]
 name = "toktail"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "Toktail: every token leaves a trail. Counts the tokens your LM Studio hosts render, per model per day, into CSV mirrored to S3, with Pip the Token Fox in your menu bar or system tray."
 license = "Apache-2.0"
@@ -32,6 +32,8 @@ dirs = "6"
 flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
+hmac = "0.12"
+url = "2"
 log = "0.4"
 env_logger = "0.11"
 parking_lot = "0.12"
@@ -61,4 +63,5 @@ winresource = "0.1"
 opt-level = 3
 lto = "thin"
 strip = true
+
 

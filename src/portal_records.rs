@@ -9,7 +9,7 @@
 use crate::app::App;
 use crate::ledger::{self, percentile_rank, Row};
 use crate::portal::Q;
-use crate::portal_settings::bad_request;
+use crate::portal_settings::{bad_request, server_error};
 use crate::records::{self, Kind, Note};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -19,7 +19,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<App>> {
@@ -30,6 +30,10 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/api/records/{id}", get(detail).delete(delete_one))
         .route("/api/records/{id}/note", post(set_note))
         .route("/api/records/{id}/{kind}", get(content))
+        .route("/api/sessions", get(sessions))
+        .route("/api/sessions/{id}", get(session_detail))
+        .route("/api/chains/status", get(chains_status))
+        .route("/api/chains/free-space", post(chains_free_space))
         .route("/api/chat", post(chat))
 }
 
@@ -221,11 +225,13 @@ async fn detail(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response
         .host(&row.host)
         .map(|h| h.name.clone())
         .unwrap_or_else(|| row.host.to_string());
+    let chain = chain_json(&app, &row);
     Json(json!({
         "row": ledger::RecentRow::from(&row),
         "host_name": host_name,
         "fingerprint": row.fp_hex(),
         "stem": stem,
+        "chain": chain,
         "files": stem.as_ref().map(|s| json!({
             "prompt": format!("{s}.prompt"),
             "response": format!("{s}.response"),
@@ -236,6 +242,113 @@ async fn detail(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response
         "encryption": app.config.read().encryption.mode,
     }))
     .into_response()
+}
+
+/// Where a record's prompt sits in its session chain.
+fn chain_json(app: &App, row: &ledger::Row) -> serde_json::Value {
+    if row.prompt_blob.len() != 64 {
+        return serde_json::Value::Null;
+    }
+    let root = records::root(app);
+    let Some((s, n)) = app.chains.locate(&root, &row.prompt_blob) else {
+        return serde_json::Value::Null;
+    };
+    let (saved, full) = s.savings();
+    json!({
+        "session": s.id,
+        "node": n.node,
+        "parent": n.parent,
+        "depth": n.depth,
+        "prefix_bytes": n.prefix,
+        "size": n.size,
+        "snapshot": n.snapshot,
+        "missing": n.missing,
+        "children": s.children(&n.node).len(),
+        "session_nodes": s.nodes.len(),
+        "session_heads": s.heads.len(),
+        "session_saved_bytes": saved,
+        "session_full_bytes": full,
+        "agent": s.agent,
+        "project": s.project,
+        "root": s.root_of(&n.node).map(|r| r.node.clone()),
+    })
+}
+
+/// Sessions newest first, with their sizes and savings.
+async fn sessions(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    let root = records::root(&app);
+    let list = tokio::task::spawn_blocking(move || crate::chain::list_sessions(&root))
+        .await
+        .unwrap_or_default();
+    let out: Vec<serde_json::Value> = list
+        .iter()
+        .map(|s| {
+            let (saved, full) = s.savings();
+            let latest = s.nodes.values().map(|n| n.created.clone()).max().unwrap_or_default();
+            json!({
+                "id": s.id, "created": s.created, "latest": latest, "host": s.host, "agent": s.agent, "project": s.project,
+                "nodes": s.nodes.len(), "heads": s.heads.len(), "missing": s.nodes.values().filter(|n| n.missing).count(),
+                "saved_bytes": saved, "full_bytes": full,
+                "first_stem": s.nodes.values().min_by_key(|n| n.created.clone()).map(|n| n.stem.clone()),
+            })
+        })
+        .collect();
+    Json(json!({ "sessions": out }))
+}
+
+async fn session_detail(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+    if !crate::chain::valid_session_id(&id) {
+        return bad_request("bad session id");
+    }
+    let root = records::root(&app);
+    let Some(s) = app.chains.session(&root, &id) else {
+        return not_found("No such session.");
+    };
+    // Which record shows each node: the stem the node remembers, or any row.
+    let by_blob: HashMap<String, String> = app.ledger.with_data(|d| {
+        d.rows()
+            .filter(|r| r.record.is_some() && r.prompt_blob.len() == 64)
+            .map(|r| (r.prompt_blob.clone(), r.request_id.clone()))
+            .collect()
+    });
+    let mut nodes: Vec<&crate::chain::Node> = s.nodes.values().collect();
+    nodes.sort_by(|a, b| a.created.cmp(&b.created));
+    let (saved, full) = s.savings();
+    Json(json!({
+        "id": s.id, "created": s.created, "host": s.host, "agent": s.agent, "project": s.project,
+        "heads": s.heads, "saved_bytes": saved, "full_bytes": full,
+        "nodes": nodes.iter().map(|n| json!({
+            "node": n.node, "parent": n.parent, "content": n.content, "depth": n.depth, "prefix": n.prefix, "size": n.size,
+            "snapshot": n.snapshot, "missing": n.missing, "created": n.created, "stem": n.stem,
+            "request_id": by_blob.get(&n.content),
+        })).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+async fn chains_status(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    let m = app.chains.migration.lock().clone();
+    let a = app.clone();
+    let (pre, sessions) = tokio::task::spawn_blocking(move || {
+        (
+            records::pre_v2_bytes(&a),
+            crate::chain::list_sessions(&records::root(&a)).len(),
+        )
+    })
+    .await
+    .unwrap_or((0, 0));
+    Json(
+        json!({ "migration": m, "pre_v2_bytes": pre, "sessions": sessions, "snapshot_every": crate::chain::SNAPSHOT_EVERY }),
+    )
+}
+
+async fn chains_free_space(State(app): State<Arc<App>>) -> Response {
+    let a = app.clone();
+    match tokio::task::spawn_blocking(move || records::free_space(&a)).await {
+        Ok(Ok(bytes)) => Json(json!({ "ok": true, "freed_bytes": bytes })).into_response(),
+        Ok(Err(e)) => server_error(format!("{e:#}")),
+        Err(e) => server_error(e.to_string()),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,7 +469,16 @@ async fn delete_many(app: &Arc<App>, ids: Vec<String>, history: bool) -> Respons
     let mut files = 0;
     let mut errors = Vec::new();
     let mut successful = HashSet::new();
+    let mut blobs: Vec<String> = Vec::new();
     for id in &ids {
+        if let Some(h) = app
+            .ledger
+            .find(id)
+            .map(|r| r.prompt_blob.clone())
+            .filter(|h| h.len() == 64)
+        {
+            blobs.push(h);
+        }
         if let Some(stem) = app.ledger.find(id).and_then(|r| r.record.map(String::from)) {
             match records::delete_files(app, &stem).await {
                 Ok(()) => {
@@ -395,8 +517,18 @@ async fn delete_many(app: &Arc<App>, ids: Vec<String>, history: bool) -> Respons
     for id in cleared {
         app.retrieval.remove(&id);
     }
-    let _ = records::collect_blobs(app).await;
-    Json(json!({ "deleted_files": files, "deleted_rows": rows, "errors": errors })).into_response()
+    // Erase the prompts nothing refers to any more; each one's chain is
+    // patched and verified before the file goes, and before we answer.
+    blobs.sort();
+    blobs.dedup();
+    let mut released = 0;
+    if !blobs.is_empty() {
+        match records::release_blobs(app, blobs).await {
+            Ok(n) => released = n,
+            Err(e) => errors.push(format!("chain: {e:#}")),
+        }
+    }
+    Json(json!({ "deleted_files": files, "deleted_rows": rows, "released_prompts": released, "errors": errors })).into_response()
 }
 
 #[derive(Debug, Deserialize)]

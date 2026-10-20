@@ -23,7 +23,7 @@ const Palette = (() => {
     add("Pages", "⚙", "Settings", () => go("#/settings"), "g ,");
     for (const [id, name] of [["hosts", "Hosts"], ["capture", "Saving prompts"], ["encryption", "Encryption"], ["s3", "S3 mirror"], ["budgets", "Budgets and alerts"], ["pip", "Pip and the menu bar"], ["costs", "Cost comparison"], ["hardware", "Hardware"], ["api", "Metrics and API"]])
       add("Settings", "⚙", "Settings → " + name, () => go("#/settings/" + id));
-    for (const [r, name] of [["today", "Today"], ["7", "Last 7 days"], ["30", "Last 30 days"], ["90", "Last 90 days"], ["mtd", "This month"], ["all", "All time"]])
+    for (const [r, name] of [["today", "Today"], ["yesterday", "Yesterday"], ["7", "Last 7 days"], ["30", "Last 30 days"], ["90", "Last 90 days"], ["mtd", "This month"], ["all", "All time"]])
       add("Range", "◷", "Show " + name.toLowerCase(), () => setRange(r));
     if (S.meta) {
       add("Hosts", "●", "All hosts", () => focusHost(null));
@@ -152,3 +152,4 @@ const Palette = (() => {
   }
   return { init, open, close, shortcuts };
 })();
+

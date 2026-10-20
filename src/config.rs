@@ -31,6 +31,74 @@ pub struct Config {
     /// host or model. Toktail warns at 80% and again at 100%.
     pub budgets: Vec<BudgetConfig>,
     pub alerts: AlertsConfig,
+    /// Toktail's own prompt cache: an identical request gets the saved answer.
+    pub cache: CacheConfig,
+    /// Pip's one-line commentary on what your agents are doing.
+    pub commentary: CommentaryConfig,
+    /// Daily market prices for the cost comparison.
+    pub market: MarketConfig,
+}
+
+/// Toktail's prompt cache (see cache.rs). Off until turned on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    pub enabled: bool,
+    /// How long an answer stays good, in hours.
+    pub ttl_hours: u32,
+    /// Disk the cache may use, in megabytes; the oldest entries go first.
+    pub max_mb: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        CacheConfig {
+            enabled: false,
+            ttl_hours: 72,
+            max_mb: 2048,
+        }
+    }
+}
+
+/// Pip's commentary: one sentence from the same local model, at most once
+/// every `every_minutes`, about what a coding agent just did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CommentaryConfig {
+    pub enabled: bool,
+    pub every_minutes: u32,
+}
+
+impl Default for CommentaryConfig {
+    fn default() -> Self {
+        CommentaryConfig {
+            enabled: true,
+            every_minutes: 5,
+        }
+    }
+}
+
+/// Where daily market prices come from (see market.rs). Keys, when a source
+/// wants one, go to the secret store, never here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MarketConfig {
+    pub enabled: bool,
+    /// Which source to try first today; the other is the fallback. Alternates.
+    pub next_source: String,
+    pub litellm_url: String,
+    pub openrouter_url: String,
+}
+
+impl Default for MarketConfig {
+    fn default() -> Self {
+        MarketConfig {
+            enabled: true,
+            next_source: "litellm".into(),
+            litellm_url: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json".into(),
+            openrouter_url: "https://openrouter.ai/api/v1/models".into(),
+        }
+    }
 }
 
 /// One token budget.
@@ -107,6 +175,15 @@ pub struct HostConfig {
     /// Where Toktail listens for this host. Apps call this address.
     pub listen: String,
     pub enabled: bool,
+    /// "lmstudio" (the default: a local server whose token Toktail may hold),
+    /// "anthropic", "openai" or "other" (a public API: the agent's own key
+    /// passes through, or a gateway key stands in for a stored one).
+    pub kind: String,
+    /// Toktail-issued keys agents may use instead of the provider's.
+    pub gateway_keys: Vec<crate::tokens::GatewayKey>,
+    /// Add the stored provider key to requests from this machine that carry
+    /// none. Never for requests from the network.
+    pub inject_key: bool,
 }
 
 impl Default for HostConfig {
@@ -122,9 +199,37 @@ impl Default for HostConfig {
             upstream: "http://127.0.0.1:1235".into(),
             listen: "127.0.0.1:1234".into(),
             enabled: true,
+            kind: "lmstudio".into(),
+            gateway_keys: Vec::new(),
+            inject_key: true,
         }
     }
 }
+
+impl HostConfig {
+    /// A public API (Anthropic, OpenAI, another hosted provider): keys pass
+    /// through or come from a gateway key; Toktail never replaces them with
+    /// a stored LM Studio token.
+    pub fn is_public(&self) -> bool {
+        self.kind != "lmstudio"
+    }
+    /// Which header the provider expects its key in.
+    pub fn key_header(&self) -> &'static str {
+        if self.kind == "anthropic" {
+            "x-api-key"
+        } else {
+            "authorization"
+        }
+    }
+    /// Listening beyond this machine.
+    pub fn allows_lan(&self) -> bool {
+        let bind = self.listen.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+        matches!(bind, "0.0.0.0" | "::" | "[::]" | "")
+    }
+}
+
+/// Host kinds Settings accepts.
+pub const HOST_KINDS: [&str; 4] = ["lmstudio", "anthropic", "openai", "other"];
 
 /// Saving the prompts and responses themselves. Off unless turned on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +390,11 @@ pub struct CostsConfig {
     pub watts_while_generating: f64,
     /// What the host cost, for a payback estimate. 0 = don't show one.
     pub hardware_cost_usd: f64,
+    /// Price the part of each prompt that repeats the previous turn at the
+    /// provider's cached-input rate, the way an agent is really billed.
+    pub cache_aware: bool,
+    /// Use the daily market prices (market.rs) on top of the built-in list.
+    pub market_prices: bool,
 }
 
 impl Default for ProxyConfig {
@@ -341,6 +451,8 @@ impl Default for CostsConfig {
             electricity_usd_per_kwh: 0.18,
             watts_while_generating: 250.0,
             hardware_cost_usd: 0.0,
+            cache_aware: false,
+            market_prices: true,
         }
     }
 }
@@ -430,6 +542,11 @@ pub fn load() -> Result<(Config, Paths, bool)> {
         while !seen.insert(h.id.clone()) {
             h.id = format!("{base}-{n}");
             n += 1;
+        }
+    }
+    for h in &mut config.hosts {
+        if !HOST_KINDS.contains(&h.kind.as_str()) {
+            h.kind = "lmstudio".into();
         }
     }
     config.hosts.truncate(MAX_HOSTS);

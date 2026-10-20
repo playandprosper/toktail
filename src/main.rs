@@ -18,6 +18,9 @@
 
 mod app;
 mod budgets;
+mod cache;
+mod chain;
+mod commentary;
 mod config;
 mod crypto;
 mod demo;
@@ -26,6 +29,7 @@ mod intelligence;
 mod ledger;
 mod live;
 mod login;
+mod market;
 mod pip_agent;
 mod platform;
 mod portal;
@@ -41,6 +45,8 @@ mod secrets;
 mod stats;
 #[cfg(test)]
 mod test_support;
+mod threads;
+mod tokens;
 #[cfg(feature = "desktop")]
 mod tray;
 mod usage;
@@ -170,6 +176,7 @@ fn real_main() -> Result<()> {
     secrets::migrate_single_token(&default_host);
     let ledger = ledger::Ledger::open(paths.data_dir.clone(), &default_host)?;
     let paths_base = paths.base.clone();
+    let config_market_prices = cfg.costs.market_prices;
     log::info!("CSV ledger: {}", paths.data_dir.display());
     let app = Arc::new(app::App {
         config: RwLock::new(cfg),
@@ -179,7 +186,7 @@ fn real_main() -> Result<()> {
         sync_now: tokio::sync::Notify::new(),
         rt: runtime.handle().clone(),
         live: live::Live::new(),
-        prices: RwLock::new(pricing::PriceBook::load(&paths_base)),
+        prices: RwLock::new(market::book_with_market(&paths_base, config_market_prices)),
         demo,
         host_live: RwLock::new(Default::default()),
         host_tokens: RwLock::new(Default::default()),
@@ -195,6 +202,9 @@ fn real_main() -> Result<()> {
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()?,
         shutting_down: std::sync::atomic::AtomicBool::new(false),
+        cache: cache::PromptCache::new(),
+        commentary: commentary::State::new(),
+        chains: chain::Chains::new(),
     });
     app.load_host_tokens();
     app.configure_crypto();
@@ -213,6 +223,8 @@ fn real_main() -> Result<()> {
     runtime.spawn(portal::serve(app.clone(), portal_listener));
     runtime.spawn(s3sync::run(app.clone()));
     runtime.spawn(budgets::run(app.clone()));
+    runtime.spawn(cache::run(app.clone()));
+    runtime.spawn(market::run(app.clone()));
 
     if demo {
         runtime.spawn(demo::fake_lmstudios());

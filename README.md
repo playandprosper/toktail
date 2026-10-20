@@ -4,7 +4,9 @@
 
 # Toktail
 
-**Version 0.6:** Pip answers questions about your trail with your own models, a Models leaderboard, a live feed of what's streaming, token budgets with alerts, a ⌘K command palette, Prometheus metrics, and builds for Windows, Intel and Apple Silicon Macs, and Linux. Coming from 0.4 or the 0.5 preview? Read [UPGRADE.md](UPGRADE.md).
+**Version 0.0.2:** Toktail now sits in front of public APIs too (Anthropic, OpenAI, any OpenAI-compatible API) for opencode, Claude Code, Codex, goose and roc, with every key protected; a prompt cache that answers repeated requests without a model; session chains that store each saved prompt as only what's new; market prices checked daily; Pip in 3D, with commentary on what your agents are up to; chat threads; and a Yesterday button. Coming from 0.6 or earlier? Read [UPGRADE.md](UPGRADE.md) and [CHANGELOG.md](CHANGELOG.md).
+
+*Toktail's version numbers start over at 0.0.2: the earlier 0.4, 0.5 and 0.6 are the "pre-0.0.2" releases this one upgrades from.*
 
 *Pronounced "tock-tail". A mix of **token** and `tail -f`.*
 
@@ -68,6 +70,37 @@ seconds, and it naps wherever it is when nothing is streaming.
   host gets its own Toktail port. The dashboard shows every host as a live
   tile (status, tokens per second, today and the last 7 days), and you can
   look at all of them combined or click one (shift-click for several).
+- **Public APIs too.** Add Anthropic, OpenAI or any OpenAI-compatible API as
+  a host and point opencode, Claude Code, Codex, goose or roc at Toktail's
+  port. The agent's own key passes through untouched and is never stored,
+  logged or saved; the CSV only ever sees a one-way id of it. Or keep the
+  provider key in your Keychain and hand each agent a **Toktail gateway key**
+  that stands in for it, so the real key never leaves this computer. See
+  [Public API hosts and keys](#public-api-hosts-and-keys).
+- **Prompt cache.** Turn it on and an identical request (same host, body and
+  credential) is answered from disk at once, encrypted, for 72 hours (yours
+  to change); nothing runs. Hits are counted as their own rows, marked, and
+  shown as tokens not generated.
+- **Session chains.** Agents resend the whole conversation every turn. With
+  saving on, each prompt is stored as only what's new plus a reference to
+  the prompt it grew from, by path and checksum, in a per-session Merkle
+  tree; opening one puts the bytes back exactly. Erase a link and the rest
+  of the chain is refolded and verified before it goes.
+- **Market prices.** Once a day Toktail fetches the public price lists from
+  LiteLLM and OpenRouter (taking turns, no key needed), keeps the history and
+  prices each request at the rates of its own day. A toggle prices the
+  repeated prefix of agent prompts at the providers' cached-input rate.
+- **Pip in 3D, and talking.** The same toon fox as toktail.dev, in three.js,
+  with the live tokens/sec on the screen in its tail. When a coding agent
+  works through an LM Studio host on your network, Pip asks that same model
+  for one whimsical sentence about it and says it in a speech bubble (never
+  for public APIs; nothing leaves your network). Press **u** or **Space** on
+  the dashboard to ask Pip right away.
+- **Chat threads.** Prompts → New chat keeps every conversation as its own
+  thread, encrypted, with search, rename, pin and delete, apart from the
+  proxy's prompt history. A Full screen button fills the view with just the
+  chat, over a blurred page (your browser window is left alone); Esc
+  twice sizes it back down.
 - **Right now.** A live feed of every request streaming through your hosts
   (host, model, tokens so far, speed, how long it's been reading the prompt)
   and the ones that just finished, with refusals and errors flagged. Click one
@@ -119,7 +152,8 @@ seconds, and it naps wherever it is when nothing is streaming.
 - **The portal.** Five pages (Dashboard, Prompts, Models, Savings, Settings),
   a ⌘K palette to jump anywhere, keyboard shortcuts, Pip's intro, replay and
   platforming, insights, SVG export for every chart, CSV download for every
-  table, light and dark mode.
+  table, light and dark mode, and **Today** / **Yesterday** / 7 / 30 / 90
+  days / this month / all time / custom ranges.
 - **Metrics.** A Prometheus endpoint at `/metrics` and the JSON API behind
   every page, both on this computer only.
 
@@ -189,8 +223,8 @@ make service     # or: headless, as a systemd user service (servers, LM Studio b
 
 For the tray icon install `libgtk-3-dev libxdo-dev libayatana-appindicator3-dev`
 (Debian and Ubuntu names) before building; without them Toktail builds
-headless and you use the portal in a browser. The portal only answers on the
-machine it runs on: from another computer use `ssh -L 8765:127.0.0.1:8765 host`.
+headless. Either way the portal opens in your browser. The portal only answers on the machine it runs on: from another
+computer use `ssh -L 8765:127.0.0.1:8765 host`.
 
 ### Commands
 
@@ -237,6 +271,69 @@ apply right away: ports open and close without a restart. Then point each app
 at its host's `http://localhost:<port>/v1`. Up to 17 hosts.
 
 <p align="center"><img src="docs/settings-hosts.png" alt="Settings: three hosts, each forwarding a local port to its LM Studio, all reachable" width="720"></p>
+
+### Public API hosts and keys
+
+A host can also be **Anthropic**, **OpenAI** or **another OpenAI-compatible
+API** (pick the type in Settings → Hosts). Point your coding agent at that
+host's Toktail port and every token it spends is counted like any other,
+with the model, the agent (opencode, Claude Code, Codex, goose, roc) and the
+session. Nothing about how keys are handled is left to chance:
+
+- **Your agent's own key passes through.** Whatever the agent sends
+  (`x-api-key`, `Authorization: Bearer …`) goes to the provider exactly as it
+  came and exists in Toktail only for the life of that request. It is never
+  written to disk, never logged, and never shown in the portal. The CSV's
+  `token_id` column holds a one-way id of it (`tk_` + 16 hex, an HMAC with a
+  secret kept in your Keychain), so you can tell which key spent what without
+  the key ever being recoverable from Toktail's files.
+- **Or store the provider key once** in Settings → Hosts; it goes to the
+  Keychain (macOS), Credential Manager (Windows) or the secret service
+  (Linux), never to a file. Apps **on this computer** that send no key get it
+  added (turn that off with *Add the stored key for apps on this Mac*).
+  Apps on **other machines never get it**: a request from the network without
+  a key is refused with 401, and Toktail never lends its stored key out.
+- **Gateway keys** are how other machines (and apps you'd rather not hand the
+  real key to) use the stored key. Issue one per agent in Settings → Hosts:
+  it looks like `tkg_…`, you copy it once, Toktail keeps only a SHA-256 hash
+  of it, and when an agent sends it Toktail swaps in the real key for that
+  one request. Each gateway key has its own id in the CSV, can be marked
+  usable from the network or only from this computer, and can be revoked at
+  any time. Set it as `ANTHROPIC_AUTH_TOKEN`, `OPENAI_API_KEY` or
+  `ROC_AI_API_TOKEN`, with the base URL pointing at Toktail's port.
+- **Saved prompts and responses are scrubbed** of anything key-shaped
+  (`sk-…`, `sk-ant-…`, `tkg_…`, `ghp_…`, `AKIA…`, bearer tokens) before they
+  are written, and so are log lines.
+- A provider key arriving from another machine over plain HTTP is noted once
+  on the host's status line, with the suggestion to use a gateway key.
+- Public hosts are checked with a request that counts 401 and 403 as
+  "reachable" (the provider is there; the agents' keys do the rest), never
+  raise "host down" alerts, and are left out of Pip's own model list and of
+  the savings comparison (there's nothing local to compare).
+
+Agent settings, for reference: Claude Code uses `ANTHROPIC_BASE_URL` and
+`ANTHROPIC_AUTH_TOKEN`; roc passes `ROC_AI_API_TOKEN` by name and rewrites
+loopback to `host.docker.internal`, so let the host's port accept your
+network (or at least Docker's) in Settings; opencode, Codex and goose take
+`OPENAI_BASE_URL` / `OPENAI_API_KEY` or their own provider settings. Apps can
+also send `X-Toktail-Session`, `X-Toktail-Agent` and `X-Toktail-Project`
+headers to name their session, agent and project; Toktail reads them and
+strips them before forwarding.
+
+### Prompt cache
+
+**Settings → Prompt cache.** Off by default. When on, Toktail keys every
+inference request by its host, endpoint, canonical body and credential id,
+and stores complete, successful answers (encrypted like saved records, under
+`cache/` in Toktail's folder) for 72 hours and up to 2 GB, both yours to
+change. An identical request gets the saved bytes back at once, streams
+replayed as streams, with `X-Toktail-Cache: hit`; nothing runs on any host.
+Errors, refusals and cancelled requests are never cached. Apps skip the cache
+with `Cache-Control: no-cache` or `X-Toktail-Cache: bypass`, and refresh it
+with `X-Toktail-Cache: refresh`. Hits get their own CSV rows (`cache_hit` =
+true, `usage_source` = cached) so your history stays complete; they don't
+count toward budgets, live speed or electricity, and the dashboard shows them
+as tokens not generated.
 
 **Watching a remote LM Studio.** Run Toktail on your laptop, add the machine
 that runs LM Studio as a host, and point your laptop's apps at Toktail. Your
@@ -322,6 +419,54 @@ holds a sealed reference to it plus that request's own settings (model,
 temperature, tools…). Reading or downloading a record puts the original
 request back together exactly. A shared prompt and its key stay until the last
 request that uses it is deleted.
+
+### Session chains
+
+Every turn of an agent conversation repeats nearly all of the turn before
+it, so a blob is stored **folded**: only the bytes after the shared prefix,
+behind two lines that say where the rest is:
+
+```
+{{toktail:chain v=2 session="s_7c…" node="…" parent="…" content="<sha256>" depth=7 prefix=48213 snapshot=false created="…"}}
+{{toktail:ref path="blobs/3f/3f…e1.prompt" s3="records/blobs/3f/3f…e1.prompt" sha256="3f…e1" bytes="0-48213"}}
+<the new bytes, verbatim>
+```
+
+The reference names the parent by path (and S3 key, with a mirror
+configured), checksum and byte range. Opening a record puts the referenced
+bytes in front of the new ones, hop by hop, and checks the result against the
+content hash, so you get the request back byte for byte, line breaks and
+all. Every 32nd link is a snapshot (the full content) so no prompt is more
+than 32 hops from solid ground. The model never sees any of this: folding
+happens after the answer is counted and saved, unfolding only when you open
+a record; the request itself is forwarded exactly as the agent sent it (the
+tests in `src/chain.rs` and `src/records.rs` prove both).
+
+Each session is a Merkle tree: a node's id is the hash of its parent's id and
+its own content hash, so a session id plus a branch tip commits to the whole
+branch. A new prompt attaches to the node it shares the longest prefix with
+(ties go to the closest), which is how an edited conversation becomes a
+branch. Sessions come from the agent's `X-Toktail-Session` header, from a
+chat thread, or from the prefix match itself. The header on every blob is
+enough to rebuild the index (`<folder>/sessions/<id>.json`) from the files.
+**Prompts → Sessions** lists them with what each saved and a tree of its
+links; a record's page says where it sits. The CSV gets `session_id`,
+`chain_node` and `prefix_tokens` (the repeated part, as tokens, pro rata).
+
+**Erasing a link.** Delete a record and, if it was the last to use its
+prompt, the prompt's children are refolded against its parent (or made
+snapshots), each checked against its content hash, the index keeps a
+tombstone, and only then does the file go and the row leave the page (it's
+struck through until the chain is patched, then goes up in smoke). A blob
+that vanished behind Toktail's back is marked missing instead, and its
+descendants open with a `{{toktail:missing …}}` marker where the lost bytes
+were.
+
+**Coming from an earlier version:** twenty seconds after launch Toktail folds
+every saved prompt into chains in the background, oldest first, checking each
+one unfolds before replacing it. The originals are copied to
+`<folder>/.pre-v0.0.2/` and stay readable until **Free space** on the
+Sessions page removes them.
 
 If a record's files disappear (you deleted them in Finder or Explorer, or
 retention expired them here and in S3), Toktail notices and turns the row into
@@ -772,6 +917,18 @@ app.
 - **Pip won't move.** Your computer is set to reduce motion, or **Let Pip
   roam** is off in Settings. Pip still reacts; it just stays put. To stop the
   menu bar animation only, turn off **Animate Pip in the menu bar**.
+- **Pip is flat.** The 3D Pip needs WebGL and motion; with reduced motion or
+  without WebGL the portal shows the SVG fox instead. Everything else works
+  the same.
+- **Pip never comments.** Commentary only happens for requests from a coding
+  agent (opencode, Claude Code, Codex, goose, roc, or anything sending
+  `X-Toktail-Agent`) to an LM Studio host on your network or this computer,
+  with **Let Pip comment** on in Settings → Pip, at most once per the
+  interval you set. Public API hosts never get commentary. **u** or **Space**
+  on the dashboard asks for one right away (15 s between asks).
+- **"Requests from other machines need a Toktail gateway key".** A public
+  API host refuses network requests that carry no key. Give that machine a
+  gateway key (Settings → Hosts) or let the agent use its own provider key.
 - **Pip's answers say 0, or "No requests matched".** Pip shows the host and
   period it used on the card above the answer. If a host or model didn't
   match, the card says which hosts exist; ask again with one of those names.
@@ -798,10 +955,16 @@ TOKTAIL_HOME=/tmp/toktail-dev cargo run --no-default-features -- --headless
 
 | Path | What it does |
 |---|---|
-| `src/proxy.rs` | One proxy per host: forwards traffic to LM Studio (with its token), captures usage, hands bodies to records |
+| `src/proxy.rs` | One proxy per host: forwards traffic to LM Studio or a public API, handles keys and gateway keys, serves the prompt cache, captures usage, hands bodies to records |
+| `src/tokens.rs` | One-way token ids, gateway keys, private-address rules, scrubbing of key-shaped strings |
+| `src/cache.rs` | The prompt cache: keys, sealed entries, TTL and size sweeps |
+| `src/chain.rs` | Session chains: folded blobs with handlebars references, Merkle index, rebalancing deletes |
+| `src/commentary.rs` | Pip's commentary: agent detection, rate limits, the one-sentence ask to the same local model |
+| `src/market.rs` | Daily market prices from LiteLLM and OpenRouter, dated snapshots, matching to the price book |
+| `src/threads.rs` | Chat threads: sealed per-thread files, index, API |
 | `src/usage.rs` | Usage parsing, streamed text and prompt fingerprints |
 | `src/ledger.rs` | CSV reading, writing and queries |
-| `src/records.rs` | Saved prompts and responses: files, S3, notes, retention |
+| `src/records.rs` | Saved prompts and responses: files, chains, S3, notes, retention, the pre-0.0.2 migration |
 | `src/crypto.rs` | gzip, AES-256-GCM, Argon2id, key stores (file, 1Password, Vault) |
 | `src/hardware.rs` | Machines, lifecycles and the savings report |
 | `src/live.rs` | Live tokens per second, Pip's mood, and requests in flight / just finished |
@@ -818,6 +981,7 @@ TOKTAIL_HOME=/tmp/toktail-dev cargo run --no-default-features -- --headless
 | `assets/pip-chat.js`, `palette.js` | Pip's chat (panel and page), the ⌘K palette and shortcuts |
 | `assets/stage.js` | Pip's stage: intro, trail, replay, card platforming |
 | `assets/pip.js` | Pip's animated rig: drawing, gait and IK, leaps, tail, moods, footstep lights |
+| `assets/pip3d.js`, `pip-model.js`, `pip-clips.js`, `vendor/three.module.min.js` | Pip in 3D: the landing page's three.js model and clips, skinning the rig above |
 | `assets/pip.svg` | The mascot artwork (logo, app icon, banner) |
 | `src/tray.rs`, `assets/tray/` | Menu bar / system tray and Pip's run cycle |
 | `src/demo.rs` | `--demo`: three hosts, sample history, hardware, pretend LM Studios and traffic |
@@ -830,4 +994,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
 

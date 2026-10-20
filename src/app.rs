@@ -46,6 +46,12 @@ pub struct App {
     pub retrieval: crate::retrieval::Index,
     pub chat_client: reqwest::Client,
     pub shutting_down: std::sync::atomic::AtomicBool,
+    /// Answers kept for identical requests (cache.rs).
+    pub cache: crate::cache::PromptCache,
+    /// Pip's speech bubbles about what the agents are up to (commentary.rs).
+    pub commentary: crate::commentary::State,
+    /// Session chains of saved prompts (chain.rs).
+    pub chains: crate::chain::Chains,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -60,6 +66,8 @@ pub struct HostStatus {
     pub proxy_ok: bool,
     pub proxy_msg: String,
     pub upstream: UpstreamStatus,
+    /// A provider key arrived from this address over the LAN (public hosts).
+    pub lan_key_from: Option<String>,
 }
 
 /// Whether LM Studio answers at the configured address.

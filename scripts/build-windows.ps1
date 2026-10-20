@@ -50,3 +50,4 @@ if ($Install) {
   Write-Host "==> Installed to $dest. Pip is in your system tray (click ^ if it's hidden); the portal is at http://127.0.0.1:8765/"
   Start-Process (Join-Path $dest "Toktail.exe")
 }
+

@@ -226,6 +226,12 @@ pub struct Finished {
     pub outcome: String,
     pub signal: String,
     pub finished_at: String,
+    /// Answered from Toktail's prompt cache; no model ran.
+    #[serde(default)]
+    pub cache_hit: bool,
+    /// The coding agent that sent it, when known (opencode, claude-code…).
+    #[serde(default)]
+    pub agent: String,
 }
 
 const KEEP_FINISHED: usize = 300;
@@ -384,6 +390,8 @@ mod tests {
         assert_eq!((fl.len(), fl[0].output, done.len(), seq), (1, 12, 0, 0));
         drop(g);
         a.finish(Finished {
+            cache_hit: false,
+            agent: String::new(),
             seq: 0,
             request_id: "r".into(),
             host: "studio".into(),

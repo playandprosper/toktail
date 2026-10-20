@@ -18,6 +18,7 @@
 //! delete old files locally and in S3 on a rolling window.
 
 use crate::app::App;
+use crate::chain;
 use crate::s3sync;
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Local, NaiveDate};
@@ -265,6 +266,11 @@ pub fn start(app: Arc<App>) {
     });
     let a = app.clone();
     app.rt.spawn(async move {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        migrate_chains(a).await;
+    });
+    let a = app.clone();
+    app.rt.spawn(async move {
         tokio::time::sleep(Duration::from_secs(30)).await;
         let mut cycles = 0;
         loop {
@@ -440,6 +446,55 @@ fn blob_key(app: &App, hash: &str) -> String {
     s3_key(app, &blob_stem(hash), Kind::Prompt)
 }
 
+/// Reads and decrypts a blob by content hash from the local folder.
+pub fn blob_reader(app: &App) -> impl Fn(&str) -> Result<Option<Vec<u8>>> + '_ {
+    move |hash: &str| {
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("bad blob hash");
+        }
+        match std::fs::read(local_path(app, &blob_stem(hash), Kind::Prompt)) {
+            Ok(raw) => Ok(Some(app.crypto.open_file(&raw)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// Seals and writes a blob, forgetting the key of the file it replaces.
+pub fn blob_writer(app: &App) -> impl Fn(&str, &[u8]) -> Result<()> + '_ {
+    blob_writer_keeping(app, false)
+}
+
+/// Like `blob_writer`; with `keep_old_key` the replaced file's key stays
+/// (its copy under `.pre-v0.0.2/` must stay readable until "Free space").
+pub fn blob_writer_keeping(
+    app: &App,
+    keep_old_key: bool,
+) -> impl Fn(&str, &[u8]) -> Result<()> + '_ {
+    move |hash: &str, plain: &[u8]| {
+        let path = local_path(app, &blob_stem(hash), Kind::Prompt);
+        let old = std::fs::read(&path).ok();
+        let sealed = app.crypto.seal(plain)?;
+        write_atomic(&path, &sealed)?;
+        if let Some(old) = old.filter(|_| !keep_old_key) {
+            app.crypto.forget(&old);
+        }
+        app.records
+            .blob_cache
+            .lock()
+            .insert(hash.to_string(), crate::crypto::Crypto::key_id(&sealed));
+        if s3_on(app) {
+            queue_upload(app, &blob_stem(hash));
+        }
+        Ok(())
+    }
+}
+
+/// The S3 key a blob would have, when a mirror is configured.
+fn blob_s3_key(app: &App) -> impl Fn(&str) -> Option<String> + '_ {
+    move |hash: &str| (!app.config.read().s3.bucket.trim().is_empty()).then(|| blob_key(app, hash))
+}
+
 fn write_job(app: &App, job: &mut Job) -> Result<()> {
     let (Some(prompt), Some(response)) = (&job.prompt, &job.response) else {
         return Ok(());
@@ -448,18 +503,35 @@ fn write_job(app: &App, job: &mut Job) -> Result<()> {
     let hash = hex::encode(Sha256::digest(&content));
     let path = local_path(app, &blob_stem(&hash), Kind::Prompt);
     let cached_key = app.records.blob_cache.lock().get(&hash).cloned();
+    let mut chain_node = None;
     let key = if let Some(key) = cached_key {
         key
     } else {
         let previous = std::fs::read(&path).ok();
         let sealed = if let Some(old) = previous.filter(|raw| {
-            app.crypto
-                .open_file(raw)
-                .is_ok_and(|plain| plain == content)
+            app.crypto.open_file(raw).is_ok_and(|plain| {
+                plain == content
+                    || chain::unfold(&plain, &mut |r| blob_reader(app)(&r.sha256))
+                        .is_ok_and(|u| u.intact() && u.bytes == content)
+            })
         }) {
             old
         } else {
-            let sealed = app.crypto.seal(&content)?;
+            // A new prompt: store only what's new over the prompt it grew from.
+            let session_hint = Some(job.rec.meta.session_id.as_str()).filter(|s| !s.is_empty());
+            let plan = app.chains.plan(
+                &root(app),
+                &content,
+                &hash,
+                session_hint,
+                &job.rec.host,
+                &job.rec.meta.agent,
+                "",
+                &blob_s3_key(app),
+                &blob_reader(app),
+            )?;
+            chain_node = Some(plan.header.clone());
+            let sealed = app.crypto.seal(&plan.folded)?;
             write_atomic(&path, &sealed)?;
             sealed
         };
@@ -476,6 +548,24 @@ fn write_job(app: &App, job: &mut Job) -> Result<()> {
     let stem = app
         .records
         .allocate(&root(app), &job.rec.host, job.rec.timestamp);
+    // Chain facts for the CSV: the session, the node, and how much of the
+    // prompt was a repeat (as tokens, pro rata).
+    let located = match &chain_node {
+        Some(h) => Some((h.session.clone(), h.node.clone(), h.prefix, content.len())),
+        None => app
+            .chains
+            .locate(&root(app), &hash)
+            .map(|(s, n)| (s.id, n.node, n.prefix, n.size)),
+    };
+    if let Some((session, node, prefix, size)) = located {
+        app.chains.set_stem(&root(app), &session, &node, &stem);
+        job.rec.meta.session_id = session;
+        job.rec.meta.chain_node = node;
+        if size > 0 {
+            job.rec.meta.prefix_tokens =
+                (job.rec.input_tokens as u128 * prefix as u128 / size as u128) as u64;
+        }
+    }
     let reference =
         serde_json::to_vec(&serde_json::json!({"toktail_ref":1, "hash":hash, "params":params}))?;
     for (kind, bytes) in [
@@ -652,6 +742,61 @@ async fn read_sealed(app: &Arc<App>, stem: &str, kind: Kind) -> Result<Vec<u8>> 
     tokio::task::spawn_blocking(move || a.crypto.open_file(&raw)).await?
 }
 
+/// A prompt blob unfolded: each link is read here or from S3. A link that
+/// is gone everywhere is marked in the result, not fatal.
+pub async fn read_blob(app: &Arc<App>, hash: &str) -> Result<chain::Unfolded> {
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("bad prompt reference");
+    }
+    // Collect every layer first (async), then unfold (sync).
+    let mut layers: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+    let mut next = Some(hash.to_string());
+    while let Some(h) = next.take() {
+        if layers.len() > (chain::SNAPSHOT_EVERY * 2 + 2) as usize {
+            bail!("this prompt chain is longer than Toktail allows");
+        }
+        let raw = match read_sealed(app, &blob_stem(&h), Kind::Prompt).await {
+            Ok(b) => Some(b),
+            Err(e) if is_not_found(&e) => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(raw) = &raw {
+            if let chain::Parsed::Folded {
+                reference: Some(r), ..
+            } = chain::parse(raw)?
+            {
+                if !r.is_empty() {
+                    next = Some(r.sha256.clone());
+                }
+            }
+        }
+        layers.push((h, raw));
+    }
+    let (first, rest) = layers.split_first().unwrap();
+    let Some(top) = first.1.as_ref() else {
+        bail!("record is missing on disk and in S3");
+    };
+    let lookup: std::collections::HashMap<&str, &Option<Vec<u8>>> =
+        rest.iter().map(|(h, b)| (h.as_str(), b)).collect();
+    let u = chain::unfold(top, &mut |r| {
+        Ok(lookup.get(r.sha256.as_str()).and_then(|b| (*b).clone()))
+    })?;
+    if !u.intact() {
+        for (h, b) in rest {
+            if b.is_none() {
+                app.chains.mark_missing(&root(app), h);
+            }
+        }
+    }
+    Ok(u)
+}
+
+fn is_not_found(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        || e.to_string().contains("missing on disk and in S3")
+}
+
 /// Old raw captures and new shared request references are both readable.
 pub async fn read(app: &Arc<App>, stem: &str, kind: Kind) -> Result<Vec<u8>> {
     if !valid_stem(stem) {
@@ -667,7 +812,7 @@ pub async fn read(app: &Arc<App>, stem: &str, kind: Kind) -> Result<Vec<u8>> {
             if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
                 bail!("bad prompt reference");
             }
-            let blob = read_sealed(app, &blob_stem(hash), Kind::Prompt).await?;
+            let blob = read_blob(app, hash).await?.bytes;
             if let Some(params) = v["params"].as_object() {
                 let mut original: serde_json::Map<String, serde_json::Value> =
                     serde_json::from_slice(&blob)?;
@@ -819,6 +964,18 @@ pub async fn collect_blobs(app: &Arc<App>) -> Result<()> {
                     }) {
                         return;
                     }
+                    // Children of this prompt are refolded first, so erasing
+                    // a link never breaks the rest of the chain.
+                    if let Err(e) = a.chains.detach(
+                        &root(&a),
+                        &hash,
+                        &blob_s3_key(&a),
+                        &blob_reader(&a),
+                        &blob_writer(&a),
+                    ) {
+                        log::warn!("couldn't rebalance the chain around {hash}: {e:#}; keeping it");
+                        return;
+                    }
                     if let Ok(raw) = std::fs::read(&path) {
                         if std::fs::remove_file(&path).is_ok() {
                             a.records.blob_cache.lock().remove(&hash);
@@ -882,6 +1039,226 @@ pub async fn delete_files(app: &Arc<App>, stem: &str) -> Result<()> {
         Ok(())
     })
     .await?
+}
+
+/// Erases prompt blobs no record refers to any more, rebalancing their
+/// chains first. Called right after records are deleted so the person sees
+/// the deletion only once the chain is patched and verified.
+pub async fn release_blobs(app: &Arc<App>, hashes: Vec<String>) -> Result<usize> {
+    let _blobs = app.records.blobs.lock().await;
+    let mut released = 0;
+    for hash in hashes {
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let still_used = app.ledger.with_data(|d| {
+            d.rows()
+                .any(|r| r.record.is_some() && r.prompt_blob == hash)
+        });
+        if still_used {
+            continue;
+        }
+        if s3_on(app) {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                s3sync::delete_object(app, &blob_key(app, &hash)),
+            )
+            .await??;
+        }
+        let a = app.clone();
+        let h = hash.clone();
+        let ok = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let _guard = a.records.mutation.lock();
+            let n = a.chains.detach(
+                &root(&a),
+                &h,
+                &blob_s3_key(&a),
+                &blob_reader(&a),
+                &blob_writer(&a),
+            )?;
+            if n > 0 {
+                log::info!(
+                    "chain: {n} prompt(s) refolded around erased link {}",
+                    &h[..12]
+                );
+            }
+            let path = local_path(&a, &blob_stem(&h), Kind::Prompt);
+            match std::fs::read(&path) {
+                Ok(raw) => {
+                    std::fs::remove_file(&path)?;
+                    a.records.blob_cache.lock().remove(&h);
+                    a.crypto.forget(&raw);
+                    Ok(true)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await??;
+        if ok {
+            released += 1;
+        }
+    }
+    Ok(released)
+}
+
+/// Where originals go while a v1 (unfolded) blob is rewritten as a chain link.
+pub fn pre_v2_dir(app: &App) -> PathBuf {
+    root(app).join(".pre-v0.0.2")
+}
+
+fn migrated_marker(app: &App) -> PathBuf {
+    chain::sessions_dir(&root(app)).join(".migrated-v2")
+}
+
+/// Folds every saved prompt from before 0.0.2 into session chains, oldest
+/// first, in the background. Originals are copied to `.pre-v0.0.2/` and
+/// stay readable until "Free space" in Settings removes them.
+pub async fn migrate_chains(app: Arc<App>) {
+    if migrated_marker(&app).exists() || !root(&app).join("blobs").exists() {
+        app.chains.migration.lock().done = true;
+        return;
+    }
+    {
+        let mut m = app.chains.migration.lock();
+        m.running = true;
+    }
+    // Oldest request first, so chains grow the way they were made.
+    let mut order: Vec<(i64, String, String)> = app.ledger.with_data(|d| {
+        let mut by_hash: BTreeMap<String, (i64, String)> = BTreeMap::new();
+        for r in d
+            .rows()
+            .filter(|r| r.record.is_some() && r.prompt_blob.len() == 64)
+        {
+            let e = by_hash
+                .entry(r.prompt_blob.clone())
+                .or_insert((r.ts_ms, r.meta.session_id.clone()));
+            if r.ts_ms < e.0 {
+                *e = (r.ts_ms, r.meta.session_id.clone());
+            }
+        }
+        by_hash.into_iter().map(|(h, (t, s))| (t, h, s)).collect()
+    });
+    order.sort();
+    app.chains.migration.lock().total = order.len();
+    let backup_root = pre_v2_dir(&app);
+    for (_, hash, session_hint) in order {
+        let a = app.clone();
+        let backup = backup_root.clone();
+        let r = tokio::task::spawn_blocking(move || -> Result<Option<u64>> {
+            let _blobs = a.rt.block_on(a.records.blobs.lock());
+            let _guard = a.records.mutation.lock();
+            let path = local_path(&a, &blob_stem(&hash), Kind::Prompt);
+            let Ok(raw) = std::fs::read(&path) else {
+                return Ok(None);
+            };
+            let plain = a.crypto.open_file(&raw)?;
+            if chain::is_folded(&plain) {
+                return Ok(None);
+            }
+            let copy = backup.join(chain::blob_rel_path(&hash));
+            if !copy.exists() {
+                write_atomic(&copy, &raw)?;
+            }
+            let plan = a.chains.plan(
+                &root(&a),
+                &plain,
+                &hash,
+                Some(session_hint.as_str()).filter(|s| !s.is_empty()),
+                "",
+                "",
+                "",
+                &blob_s3_key(&a),
+                &blob_reader(&a),
+            )?;
+            // Prove it unfolds before replacing the original.
+            let check = chain::unfold(&plan.folded, &mut |r| blob_reader(&a)(&r.sha256))?;
+            if !check.intact() || check.bytes != plain {
+                bail!("the folded prompt did not unfold to the original; left as it was");
+            }
+            blob_writer_keeping(&a, true)(&hash, &plan.folded)?;
+            Ok(Some(
+                plain.len() as u64 - (plan.folded.len() as u64).min(plain.len() as u64),
+            ))
+        })
+        .await;
+        {
+            let mut m = app.chains.migration.lock();
+            match r {
+                Ok(Ok(Some(saved))) => {
+                    m.folded += 1;
+                    m.saved_bytes += saved;
+                }
+                Ok(Ok(None)) => m.skipped += 1,
+                Ok(Err(e)) => {
+                    m.skipped += 1;
+                    m.error = Some(format!("{e:#}"));
+                }
+                Err(e) => m.error = Some(e.to_string()),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = std::fs::create_dir_all(chain::sessions_dir(&root(&app)));
+    let _ = std::fs::write(migrated_marker(&app), Local::now().to_rfc3339());
+    let done = {
+        let mut m = app.chains.migration.lock();
+        m.running = false;
+        m.done = true;
+        m.clone()
+    };
+    log::info!(
+        "chain: migration done: {} prompts folded, {} skipped, {} MB saved",
+        done.folded,
+        done.skipped,
+        done.saved_bytes / 1_048_576
+    );
+}
+
+/// Bytes held by pre-0.0.2 originals.
+pub fn pre_v2_bytes(app: &App) -> u64 {
+    fn walk(p: &Path) -> u64 {
+        std::fs::read_dir(p)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| {
+                        let p = e.path();
+                        if p.is_dir() {
+                            walk(&p)
+                        } else {
+                            e.metadata().map(|m| m.len()).unwrap_or(0)
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+    walk(&pre_v2_dir(app))
+}
+
+/// "Free space": removes the pre-0.0.2 originals and forgets their keys.
+pub fn free_space(app: &App) -> Result<u64> {
+    let _guard = app.records.mutation.lock();
+    let dir = pre_v2_dir(app);
+    let bytes = pre_v2_bytes(app);
+    fn forget_all(app: &App, p: &Path) {
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    forget_all(app, &p);
+                } else if let Ok(raw) = std::fs::read(&p) {
+                    app.crypto.forget(&raw);
+                }
+            }
+        }
+    }
+    forget_all(app, &dir);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn set_note(app: &App, stem: &str, note: Note) -> Result<()> {
@@ -1224,6 +1601,228 @@ mod integration_tests {
         assert!(app.ledger.find(&count_only.request_id).is_some());
         std::fs::remove_dir_all(&app.paths.base).ok();
     }
+    /// The model sees the request the agent sent; the chain lives only on disk.
+    #[tokio::test]
+    async fn session_chains_fold_on_disk_and_unfold_exactly() {
+        let app = test_support::app();
+        app.crypto
+            .fixture_per_file(app.paths.base.join("keystore.tkt"));
+        let turn = |n: usize| {
+            let mut s = String::from("{\"model\":\"qwen\",\"stream\":true,\"messages\":[{\"role\":\"system\",\"content\":\"You are opencode.\\n\\nWorking directory: /Users/me/roc-app\\n\"}");
+            for i in 0..n {
+                s.push_str(&format!(",{{\"role\":\"user\",\"content\":\"edit file{i}.rs\\n\\n{}\"}},{{\"role\":\"assistant\",\"content\":\"done {i}\\n\\n\\n\"}}", "y".repeat(400)));
+            }
+            s.push_str(",{\"role\":\"user\",\"content\":\"next\"}]}");
+            s.into_bytes()
+        };
+        let response = br#"{"choices":[{"message":{"content":"ok"}}]}"#.to_vec();
+        let mut jobs = Vec::new();
+        for n in 1..=5 {
+            let mut rec = test_support::record("qwen");
+            rec.input_tokens = 1000;
+            let mut job = Job {
+                rec,
+                prompt: Some(turn(n)),
+                response: Some(response.clone()),
+                _permit: None,
+            };
+            write_job(&app, &mut job).unwrap();
+            app.ledger.append(&job.rec).unwrap();
+            jobs.push(job);
+        }
+        app.crypto.flush().unwrap();
+        app.ledger.flush().unwrap();
+        // One session, growing depth, repeated prefix counted as tokens.
+        let session = jobs[0].rec.meta.session_id.clone();
+        assert!(session.starts_with("s_"));
+        assert!(jobs.iter().all(|j| j.rec.meta.session_id == session));
+        assert_eq!(jobs[0].rec.meta.prefix_tokens, 0);
+        assert!(
+            jobs[4].rec.meta.prefix_tokens > 700,
+            "{}",
+            jobs[4].rec.meta.prefix_tokens
+        );
+        assert!(!jobs[4].rec.meta.chain_node.is_empty());
+        // On disk: the fifth blob is far smaller than its content, and folded.
+        let on_disk = |j: &Job| {
+            std::fs::read(local_path(
+                &app,
+                &blob_stem(&j.rec.prompt_blob),
+                Kind::Prompt,
+            ))
+            .unwrap()
+        };
+        let plain5 = app.crypto.open_file(&on_disk(&jobs[4])).unwrap();
+        assert!(chain::is_folded(&plain5));
+        assert!(
+            plain5.len() < turn(5).len() / 2,
+            "{} vs {}",
+            plain5.len(),
+            turn(5).len()
+        );
+        assert!(
+            !plain5.windows(20).any(|w| w == &turn(5)[100..120]),
+            "the shared prefix is not stored twice"
+        );
+        assert!(plain5.starts_with(b"{{toktail:chain v=2 session=\"s_"));
+        assert!(
+            plain5.windows(14).any(|w| w == b"{{toktail:ref "),
+            "the file points at its parent by path and checksum"
+        );
+        // Reading gives back the exact request, params and all.
+        for (i, j) in jobs.iter().enumerate() {
+            let got = read(&app, &j.rec.record, Kind::Prompt).await.unwrap();
+            let want: serde_json::Value = serde_json::from_slice(&turn(i + 1)).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&got).unwrap(),
+                want,
+                "turn {}",
+                i + 1
+            );
+        }
+        let u = read_blob(&app, &jobs[4].rec.prompt_blob).await.unwrap();
+        assert!(u.intact() && u.depth == 4);
+        // Erase turn 3: its files go, the chain is patched, the rest still read.
+        delete_files(&app, &jobs[2].rec.record).await.unwrap();
+        app.ledger
+            .forget_records(&[jobs[2].rec.request_id.clone()].into_iter().collect())
+            .unwrap();
+        assert_eq!(
+            release_blobs(&app, vec![jobs[2].rec.prompt_blob.clone()])
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!local_path(&app, &blob_stem(&jobs[2].rec.prompt_blob), Kind::Prompt).exists());
+        for (i, j) in jobs.iter().enumerate() {
+            if i == 2 {
+                continue;
+            }
+            let got = read(&app, &j.rec.record, Kind::Prompt).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&got).unwrap(),
+                serde_json::from_slice::<serde_json::Value>(&turn(i + 1)).unwrap(),
+                "turn {} after erasing turn 3",
+                i + 1
+            );
+        }
+        let s = app.chains.session(&root(&app), &session).unwrap();
+        assert!(s.by_content(&jobs[2].rec.prompt_blob).unwrap().missing);
+        assert_eq!(s.by_content(&jobs[3].rec.prompt_blob).unwrap().depth, 2);
+        // A blob lost behind Toktail's back is marked, and the rest shows the gap.
+        std::fs::remove_file(local_path(
+            &app,
+            &blob_stem(&jobs[0].rec.prompt_blob),
+            Kind::Prompt,
+        ))
+        .unwrap();
+        let u = read_blob(&app, &jobs[1].rec.prompt_blob).await.unwrap();
+        assert!(!u.intact());
+        assert!(u.bytes.starts_with(b"{{toktail:missing "));
+        assert!(
+            app.chains
+                .session(&root(&app), &session)
+                .unwrap()
+                .by_content(&jobs[0].rec.prompt_blob)
+                .unwrap()
+                .missing
+        );
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
+    #[tokio::test]
+    async fn pre_v2_blobs_migrate_in_place_with_originals_kept() {
+        let app = test_support::app();
+        app.crypto
+            .fixture_per_file(app.paths.base.join("keystore.tkt"));
+        let turn = |n: usize| {
+            format!(
+                "{{\"messages\":[{{\"role\":\"system\",\"content\":\"{}\"}}{}]}}",
+                "s".repeat(300),
+                (0..n)
+                    .map(|i| format!(
+                        ",{{\"role\":\"user\",\"content\":\"q{i} {}\"}}",
+                        "z".repeat(200)
+                    ))
+                    .collect::<String>()
+            )
+            .into_bytes()
+        };
+        // Three v1 blobs: raw content, plus records pointing at them.
+        let mut recs = Vec::new();
+        for n in 1..=3 {
+            let content = turn(n);
+            let hash = hex::encode(Sha256::digest(&content));
+            write_atomic(
+                &local_path(&app, &blob_stem(&hash), Kind::Prompt),
+                &app.crypto.seal(&content).unwrap(),
+            )
+            .unwrap();
+            let mut rec = test_support::record("m");
+            rec.timestamp = rec.timestamp + chrono::Duration::seconds(n as i64);
+            rec.prompt_blob = hash.clone();
+            let stem = app.records.allocate(&root(&app), &rec.host, rec.timestamp);
+            let reference = serde_json::to_vec(
+                &serde_json::json!({"toktail_ref":1, "hash":hash, "params":{"model":"m"}}),
+            )
+            .unwrap();
+            write_atomic(
+                &local_path(&app, &stem, Kind::Prompt),
+                &app.crypto.seal(&reference).unwrap(),
+            )
+            .unwrap();
+            write_atomic(
+                &local_path(&app, &stem, Kind::Response),
+                &app.crypto.seal(b"{}").unwrap(),
+            )
+            .unwrap();
+            rec.record = stem;
+            app.ledger.append(&rec).unwrap();
+            recs.push(rec);
+        }
+        app.ledger.flush().unwrap();
+        migrate_chains(app.clone()).await;
+        let m = app.chains.migration.lock().clone();
+        assert!(m.done && m.folded == 3 && m.error.is_none(), "{m:?}");
+        assert!(m.saved_bytes > 0);
+        for (i, r) in recs.iter().enumerate() {
+            let got = read(&app, &r.record, Kind::Prompt).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&got).unwrap();
+            assert_eq!(
+                v["messages"],
+                serde_json::from_slice::<serde_json::Value>(&turn(i + 1)).unwrap()["messages"]
+            );
+            let plain = app
+                .crypto
+                .open_file(
+                    &std::fs::read(local_path(&app, &blob_stem(&r.prompt_blob), Kind::Prompt))
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(chain::is_folded(&plain));
+            // The original is kept, readable, until "Free space".
+            let copy = pre_v2_dir(&app).join(chain::blob_rel_path(&r.prompt_blob));
+            assert_eq!(
+                app.crypto
+                    .open_file(&std::fs::read(&copy).unwrap())
+                    .unwrap(),
+                turn(i + 1)
+            );
+        }
+        assert_eq!(
+            chain::list_sessions(&root(&app)).len(),
+            1,
+            "one session, found by prefix"
+        );
+        assert!(pre_v2_bytes(&app) > 0);
+        assert!(free_space(&app).unwrap() > 0);
+        assert!(!pre_v2_dir(&app).exists());
+        // Running again is a no-op.
+        migrate_chains(app.clone()).await;
+        assert_eq!(app.chains.migration.lock().folded, 3);
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
     #[tokio::test]
     async fn legacy_capture_remains_readable() {
         let app = test_support::app();

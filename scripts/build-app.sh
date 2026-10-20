@@ -76,3 +76,4 @@ if [[ $INSTALL == 1 ]]; then
   echo "==> Installed /Applications/Toktail.app"
   open /Applications/Toktail.app
 fi
+

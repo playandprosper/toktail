@@ -8,6 +8,7 @@
 <meta name="description" content="Toktail: every token leaves a trail.">
 <link rel="icon" href="/pip.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
+<script type="importmap">{ "imports": { "three": "/vendor/three.module.min.js" } }</script>
 <script>
   // Apply a saved theme before first paint so there's no flash.
   try { const t = localStorage.getItem("toktail.theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
@@ -60,6 +61,7 @@
     <div class="filters" role="toolbar" aria-label="Filters">
       <div class="seg" id="ranges" role="group" aria-label="Date range">
         <button type="button" data-r="today">Today</button>
+        <button type="button" data-r="yesterday">Yesterday</button>
         <button type="button" data-r="7">7 days</button>
         <button type="button" data-r="30">30 days</button>
         <button type="button" data-r="90">90 days</button>
@@ -222,6 +224,7 @@
       </div>
       <div class="seg" id="prompts-mode" role="group" aria-label="Prompts view">
         <button type="button" data-v="records">Records</button>
+        <button type="button" data-v="sessions">Sessions</button>
         <button type="button" data-v="chat">New chat</button>
       </div>
     </div>
@@ -233,7 +236,7 @@
         <select id="rec-host" aria-label="Host"></select>
         <select id="rec-model" aria-label="Model"></select>
         <select id="rec-range" aria-label="Date range">
-          <option value="all">All time</option><option value="today">Today</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option><option value="365">1 year</option>
+          <option value="all">All time</option><option value="today">Today</option><option value="yesterday">Yesterday</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option><option value="365">1 year</option>
         </select>
         <select id="rec-outcome" aria-label="Response signal"><option value="">All responses</option><option value="refused">Refusals</option><option value="noteworthy">Noteworthy outputs</option></select>
         <select id="rec-sort" aria-label="Sort">
@@ -257,6 +260,14 @@
         <section class="card rec-detail" id="rec-detail" aria-live="polite">
           <div class="empty">Pick a record to see its prompt, response and how it performed.</div>
         </section>
+      </div>
+    </section>
+
+    <section id="sessions-view" hidden>
+      <div class="card" id="sessions-card">
+        <div class="card-head"><div><h2>Sessions</h2><div class="sub" id="sessions-sub">Each agent conversation, saved as a chain: every prompt keeps only what's new over the one before it, plus a reference to it by path and checksum.</div></div></div>
+        <div id="sessions-list"></div>
+        <div id="session-detail" hidden></div>
       </div>
     </section>
 
@@ -389,6 +400,8 @@
 <script src="/palette.js"></script>
 <script src="/stage.js"></script>
 <script src="/main.js"></script>
+<script type="module" src="/pip3d.js"></script>
 </body>
 </html>
+
 

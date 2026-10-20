@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-pub const HEADER: [&str; 23] = [
+pub const HEADER: [&str; 32] = [
     "request_id",
     "timestamp",
     "local_date",
@@ -41,7 +41,49 @@ pub const HEADER: [&str; 23] = [
     "prompt_key",
     "response_key",
     "reference_key",
+    // 0.0.2: who paid, what the provider cached, Toktail's own cache, and
+    // where the request sits in its conversation's chain.
+    "token_id",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "cache_hit",
+    "session_id",
+    "chain_node",
+    "prefix_tokens",
+    "agent",
+    "client",
 ];
+
+/// Columns added in 0.0.2. Kept together so every place that builds a row
+/// only has one more field to fill, and old CSVs read back with defaults.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Meta {
+    /// A one-way id of the credential the client sent (`tk_…`), or the id of
+    /// the Toktail gateway key it used (`tkg_…`). Never the credential itself.
+    pub token_id: String,
+    /// Input tokens the provider served from its prompt cache (Anthropic
+    /// `cache_read_input_tokens`, OpenAI `cached_tokens`). Part of `input`.
+    pub cache_read: u64,
+    /// Input tokens the provider wrote to its prompt cache. Part of `input`.
+    pub cache_write: u64,
+    /// True when Toktail answered from its own prompt cache: the counts are
+    /// the original request's, nothing was generated.
+    pub cache_hit: bool,
+    /// The conversation this request belongs to (hex), when its prompt was
+    /// saved and chained.
+    pub session_id: String,
+    /// This request's node in the session's Merkle chain (hex).
+    pub chain_node: String,
+    /// Input tokens that repeat the previous request in the same session: the
+    /// part a provider would have served from cache.
+    pub prefix_tokens: u64,
+    /// The coding agent that sent it, when Toktail could tell:
+    /// "opencode", "claudecode", "codex", "goose" or "".
+    pub agent: String,
+    /// What made the request on Toktail's behalf: "" for an app, "pip" for
+    /// Pip's chat, "portal-chat", or "commentary" for Pip's one-liners.
+    pub client: String,
+}
 
 /// One finished request, ready to be appended.
 #[derive(Debug, Clone)]
@@ -72,6 +114,7 @@ pub struct Record {
     pub prompt_key: String,
     pub response_key: String,
     pub reference_key: String,
+    pub meta: Meta,
 }
 
 /// Generation time: from first token to end for streams, whole request otherwise.
@@ -116,6 +159,7 @@ pub struct Row {
     pub prompt_key: String,
     pub response_key: String,
     pub reference_key: String,
+    pub meta: Meta,
 }
 
 impl Row {
@@ -132,7 +176,7 @@ impl Row {
     pub fn tokens_per_sec(&self) -> Option<f64> {
         tps(self.output, self.gen_ms)
     }
-    fn to_csv_fields(&self) -> [String; 23] {
+    fn to_csv_fields(&self) -> [String; 32] {
         [
             self.request_id.clone(),
             self.timestamp()
@@ -160,6 +204,15 @@ impl Row {
             self.prompt_key.clone(),
             self.response_key.clone(),
             self.reference_key.clone(),
+            self.meta.token_id.clone(),
+            self.meta.cache_read.to_string(),
+            self.meta.cache_write.to_string(),
+            self.meta.cache_hit.to_string(),
+            self.meta.session_id.clone(),
+            self.meta.chain_node.clone(),
+            self.meta.prefix_tokens.to_string(),
+            self.meta.agent.clone(),
+            self.meta.client.clone(),
         ]
     }
 }
@@ -211,6 +264,24 @@ struct CsvRow {
     response_key: String,
     #[serde(default)]
     reference_key: String,
+    #[serde(default)]
+    token_id: String,
+    #[serde(default)]
+    cache_read_tokens: String,
+    #[serde(default)]
+    cache_write_tokens: String,
+    #[serde(default)]
+    cache_hit: String,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    chain_node: String,
+    #[serde(default)]
+    prefix_tokens: String,
+    #[serde(default)]
+    agent: String,
+    #[serde(default)]
+    client: String,
 }
 
 #[derive(Default)]
@@ -306,15 +377,21 @@ impl Ledger {
             let mut tmp = Data::default();
             match parse_file(&path, &mut tmp, &self.default_host) {
                 Ok((rows, _)) => {
-                    let backup = path.with_extension("csv.pre-v0.5.bak");
+                    // Files from 0.4 were backed up as .pre-v0.5.bak; files from the
+                    // 0.5/0.6 line get a .pre-v0.0.2.bak. Each backup is made once.
+                    let backup = path.with_extension(if header_has_host(&path) {
+                        "csv.pre-v0.0.2.bak"
+                    } else {
+                        "csv.pre-v0.5.bak"
+                    });
                     if !backup.exists() && std::fs::copy(&path, &backup).is_err() {
                         log::warn!("{name}: could not create migration backup");
                         continue;
                     }
                     if let Err(e) = write_rows(&path, rows.iter()) {
-                        log::warn!("{name}: could not add the host column: {e:#}");
+                        log::warn!("{name}: could not add the new columns: {e:#}");
                     } else {
-                        log::info!("{name}: added host and record columns");
+                        log::info!("{name}: brought the header up to {} columns", HEADER.len());
                     }
                 }
                 Err(e) => log::warn!("{name}: {e:#}"),
@@ -510,6 +587,15 @@ impl Ledger {
                 &rec.prompt_key,
                 &rec.response_key,
                 &rec.reference_key,
+                &rec.meta.token_id,
+                &rec.meta.cache_read.to_string(),
+                &rec.meta.cache_write.to_string(),
+                &rec.meta.cache_hit.to_string(),
+                &rec.meta.session_id,
+                &rec.meta.chain_node,
+                &rec.meta.prefix_tokens.to_string(),
+                &rec.meta.agent,
+                &rec.meta.client,
             ])?;
             w.flush()?;
         }
@@ -560,6 +646,7 @@ impl Ledger {
                 prompt_key: rec.prompt_key.clone(),
                 response_key: rec.response_key.clone(),
                 reference_key: rec.reference_key.clone(),
+                meta: rec.meta.clone(),
             };
             let f = data.files.entry(name).or_default();
             f.rows.push(row);
@@ -628,6 +715,15 @@ impl Ledger {
         self.refresh(false);
         f(&self.data.read())
     }
+}
+
+/// True when a CSV already has the 0.5-era columns (so a migration is from
+/// 0.5/0.6, not from 0.4).
+fn header_has_host(path: &Path) -> bool {
+    csv::Reader::from_path(path)
+        .and_then(|mut r| r.headers().cloned())
+        .map(|h| h.iter().any(|c| c == "host"))
+        .unwrap_or(false)
 }
 
 fn parse_fp(s: &str) -> Option<[u8; 32]> {
@@ -711,6 +807,17 @@ fn parse_file(path: &Path, data: &mut Data, default_host: &str) -> Result<(Vec<R
             prompt_key: r.prompt_key,
             response_key: r.response_key,
             reference_key: r.reference_key,
+            meta: Meta {
+                token_id: r.token_id.trim().to_string(),
+                cache_read: num(&r.cache_read_tokens),
+                cache_write: num(&r.cache_write_tokens),
+                cache_hit: r.cache_hit.trim().eq_ignore_ascii_case("true"),
+                session_id: r.session_id.trim().to_string(),
+                chain_node: r.chain_node.trim().to_string(),
+                prefix_tokens: num(&r.prefix_tokens),
+                agent: r.agent.trim().to_string(),
+                client: r.client.trim().to_string(),
+            },
         });
     }
     Ok((rows, bad))
@@ -745,6 +852,13 @@ pub struct Totals {
     pub gen_ms: u64,
     pub errors: u64,
     pub estimated: u64,
+    /// Requests Toktail answered from its own prompt cache (their tokens are
+    /// counted above, since the client received them, but nothing ran).
+    pub cache_hits: u64,
+    /// Tokens (in + out) those hits handed back without a model running.
+    pub cache_saved: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
 }
 
 impl Totals {
@@ -752,7 +866,13 @@ impl Totals {
         self.requests += 1;
         self.input += r.input;
         self.output += r.output;
-        if r.output > 0 && r.gen_ms > 0 {
+        self.cache_read += r.meta.cache_read;
+        self.cache_write += r.meta.cache_write;
+        if r.meta.cache_hit {
+            self.cache_hits += 1;
+            self.cache_saved += r.input + r.output;
+        }
+        if r.output > 0 && r.gen_ms > 0 && !r.meta.cache_hit {
             self.gen_out += r.output;
             self.gen_ms += r.gen_ms;
         }
@@ -885,6 +1005,8 @@ pub struct RecentRow {
     /// Their path stem under the capture folder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record: Option<String>,
+    #[serde(flatten)]
+    pub meta: Meta,
 }
 
 impl From<&Row> for RecentRow {
@@ -911,6 +1033,7 @@ impl From<&Row> for RecentRow {
             signal: r.signal.clone(),
             response_chars: r.response_chars,
             record: r.record.as_deref().map(String::from),
+            meta: r.meta.clone(),
         }
     }
 }
@@ -1086,6 +1209,7 @@ mod tests {
             prompt_key: String::new(),
             response_key: String::new(),
             reference_key: String::new(),
+            meta: Meta::default(),
         }
     }
 

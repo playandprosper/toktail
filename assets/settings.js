@@ -7,7 +7,7 @@
 const Settings = (() => {
   let st = null;
   const SECTIONS = [
-    ["hosts", "Hosts"], ["capture", "Saving prompts"], ["encryption", "Encryption"], ["s3", "S3 mirror"],
+    ["hosts", "Hosts"], ["cache", "Prompt cache"], ["capture", "Saving prompts"], ["encryption", "Encryption"], ["s3", "S3 mirror"],
     ["budgets", "Budgets & alerts"], ["pip", "Pip & menu bar"], ["costs", "Cost comparison"], ["hardware", "Hardware"], ["api", "Metrics & API"],
   ];
 
@@ -51,14 +51,14 @@ const Settings = (() => {
     const nav = $("settings-nav"); nav.textContent = "";
     for (const [id, name] of SECTIONS) nav.append(h("a", { href: "#/settings/" + id, text: name }));
     const body = $("settings-body"); body.textContent = "";
-    body.append(hostsSection(), captureSection(), encryptionSection(), s3Section(), budgetsSection(), pipSection(), costsSection(), hardwareSection(), apiSection());
+    body.append(hostsSection(), cacheSection(), captureSection(), encryptionSection(), s3Section(), budgetsSection(), pipSection(), costsSection(), hardwareSection(), apiSection());
     body.append(h("p", { class: "label-sm" }, "Settings live in " + st.config_file + ". Secrets are in your " + (st.secret_store || "Keychain") + ". Your CSV is in " + st.data_dir + ". ", h("button", { type: "button", class: "small", text: "Open the folder", onclick: () => getJSON("/api/open-data-folder", { method: "POST" }).catch((e) => toast(e.message)) })));
     if ((typeof Stage !== "undefined")) Stage.platformsChanged();
   }
 
   // ---------------------------------------------------------------- hosts
   function hostsSection() {
-    const sec = section("hosts", "Hosts", "The LM Studio servers Toktail watches, up to " + st.max_hosts + ". Each one gets its own Toktail port: point an app at that port and its tokens are counted for that host.");
+    const sec = section("hosts", "Hosts", "The servers Toktail watches, up to " + st.max_hosts + ": LM Studio on your network, or a public API like Anthropic or OpenAI. Each one gets its own Toktail port: point an app (opencode, Claude Code, Codex, Goose, roc…) at that port and its tokens are counted for that host.");
     const list = h("div", { class: "host-list" });
     for (const x of st.hosts) list.append(hostRow(x));
     sec.append(list);
@@ -66,41 +66,105 @@ const Settings = (() => {
     add.addEventListener("click", () => {
       const used = new Set(st.hosts.map((x) => x.listen_port));
       let port = 1240; while (used.has(port) || port === st.portal_port) port++;
-      list.append(hostRow({ id: "", name: "", url: "http://", listen_port: port, allow_lan: false, enabled: true, has_token: false }, true));
+      list.append(hostRow({ id: "", name: "", url: "http://", listen_port: port, allow_lan: false, enabled: true, has_token: false, kind: "lmstudio", inject_key: true, gateway_keys: [] }, true));
       add.disabled = true;
     });
     sec.append(h("div", { class: "row-end" }, span(st.hosts.length + " of " + st.max_hosts + " hosts", "label-sm"), add));
     return sec;
   }
+  const KINDS = [["lmstudio", "LM Studio (on this machine or your network)"], ["anthropic", "Anthropic API"], ["openai", "OpenAI API"], ["other", "Another OpenAI-compatible API"]];
+  const KIND_URL = { anthropic: "https://api.anthropic.com", openai: "https://api.openai.com", other: "https://", lmstudio: "http://127.0.0.1:1235" };
+  const kindName = (k) => ({ anthropic: "Anthropic", openai: "OpenAI", other: "the API" })[k] || "LM Studio";
   function hostRow(x, isNew) {
     const ok = x.enabled && x.proxy_ok && x.ok;
+    const isPublic = (k) => k !== "lmstudio";
     const row = h("div", { class: "host-row" + (isNew ? " open" : "") });
     const summary = h("button", { type: "button", class: "host-sum" },
       h("span", { class: "ht-dot " + (isNew ? "" : !x.enabled ? "" : ok ? "ok" : "bad") }),
       h("b", { text: x.name || "New host" }),
-      isNew ? null : span(x.url.replace(/^https?:\/\//, "") + " → localhost:" + x.listen_port, "label-sm"),
-      isNew ? null : span(!x.enabled ? "turned off" : ok ? "✓ " + (x.models || []).length + " models" : "⚠ " + (x.proxy_ok ? x.message : x.proxy_message), "label-sm host-state"));
+      isNew ? null : span((x.public ? "☁ " : "") + x.url.replace(/^https?:\/\//, "") + " → localhost:" + x.listen_port, "label-sm"),
+      isNew ? null : span(!x.enabled ? "turned off" : ok ? (x.public ? "✓ reachable" : "✓ " + (x.models || []).length + " models") : "⚠ " + (x.proxy_ok ? x.message : x.proxy_message), "label-sm host-state"));
     const form = h("div", { class: "host-form" });
+    const kind = selectField("Host type", "LM Studio hosts take an optional API token that Toktail adds for every app. Public API hosts keep each app's own key, or hand out Toktail gateway keys that stand in for a key stored here.", KINDS, x.kind || "lmstudio");
     const name = textField("Name", "What the dashboard calls it", x.name, "Mac Studio");
     const url = textField("LM Studio's address", "Its server address and port, like http://127.0.0.1:1235 or http://studio.local:1234", x.url, "http://127.0.0.1:1235");
-    const tok = secretField("API token", x.has_token ? "Saved in your " + vault() + ". Type a new one to replace it." : "Only if this LM Studio asks for one. " + "Kept in your " + vault() + ", never in a file.", { saved: x.has_token, hint: x.token_hint });
+    const tok = secretField("API token", "", { saved: x.has_token, hint: x.token_hint });
     const clear = x.has_token ? toggleField("Remove the saved token", null, false) : null;
-    const port = numberField("Toktail listens on port", "Apps call this port instead of LM Studio's.", x.listen_port, "1", "", 1, 65535);
+    const inject = toggleField("Add the stored key for apps on this Mac that send none", "Only for requests from this computer. Apps on other machines always need their own key or a gateway key; Toktail never lends its stored key over the network.", x.inject_key !== false);
+    const port = numberField("Toktail listens on port", "Apps call this port instead of the server's.", x.listen_port, "1", "", 1, 65535);
     const lan = toggleField("Let other devices on your network use it", "Off means only apps on this Mac can reach this port.", x.allow_lan);
     const en = toggleField("Watch this host", "Off stops the proxy for this host; its history stays.", x.enabled);
     const hint = h("div", { class: "label-sm client-hint" });
-    const showHint = () => { hint.textContent = "Apps use http://" + (lan.input.checked ? "<this Mac's name or IP>" : "localhost") + ":" + (port.input.value || x.listen_port) + "/v1"; };
-    showHint(); port.input.addEventListener("input", showHint); lan.input.addEventListener("change", showHint);
-    form.append(name.row, url.row, tok.row);
+    const lanNote = h("div", { class: "label-sm warn-note", hidden: true });
+    const tokLabel = tok.row.querySelector(".row-label");
+    tokLabel.append(h("div", { class: "hint" }));
+    const tokHint = tokLabel.querySelector(".hint");
+    const setLabel = (f, text) => { const l = f.row.querySelector(".row-label"); if (l && l.firstChild && l.firstChild.nodeType === 3) l.firstChild.textContent = text; };
+    const applyKind = () => {
+      const k = kind.input.value, pub = isPublic(k);
+      setLabel(url, pub ? kindName(k) + "'s address" : "LM Studio's address");
+      url.input.placeholder = KIND_URL[k];
+      if ((x.kind || "lmstudio") !== k && (url.input.value === "" || url.input.value === "http://" || url.input.value === KIND_URL[x.kind || "lmstudio"])) url.input.value = KIND_URL[k];
+      setLabel(tok, pub ? kindName(k) + " API key" : "API token");
+      if (tokHint) tokHint.textContent = pub
+        ? (x.has_token ? "Stored in your " + vault() + ", used only on this computer or behind a gateway key. Type a new one to replace it." : "Optional. Kept in your " + vault() + ", never in a file, never logged, never sent to another machine. Apps that bring their own key don't need it.")
+        : (x.has_token ? "Saved in your " + vault() + ". Type a new one to replace it." : "Only if this LM Studio asks for one. Kept in your " + vault() + ", never in a file.");
+      inject.row.hidden = !pub;
+      gw.hidden = !pub || isNew;
+      lanNote.hidden = !(pub && lan.input.checked);
+      lanNote.textContent = "Other machines reach " + kindName(k) + " through this port with their own key (sent over plain HTTP on your LAN) or, better, with a Toktail gateway key issued below. Requests without either are refused.";
+    };
+    const showHint = () => { hint.textContent = "Apps use http://" + (lan.input.checked ? "<this Mac's name or IP>" : "localhost") + ":" + (port.input.value || x.listen_port) + (kind.input.value === "anthropic" ? "  (ANTHROPIC_BASE_URL; Claude Code and roc point there)" : "/v1"); applyKind(); };
+    // Gateway keys (public hosts only).
+    const gw = h("div", { class: "gateway-keys", hidden: true });
+    const gwList = h("div", { class: "gw-list" });
+    const renderKeys = () => {
+      gwList.textContent = "";
+      for (const k of (x.gateway_keys || [])) {
+        const rm = h("button", { type: "button", class: "small danger", text: "Revoke" });
+        rm.addEventListener("click", async () => {
+          if (!(await confirmBox("Revoke " + (k.label || k.id) + "?", "Apps using this gateway key stop working at once.", "Revoke", true))) return;
+          try { st = await getJSON("/api/hosts/" + encodeURIComponent(x.id) + "/gateway-keys/" + encodeURIComponent(k.id), { method: "DELETE" }); S.settings = st; x.gateway_keys = (st.hosts.find((hh) => hh.id === x.id) || {}).gateway_keys || []; renderKeys(); } catch (e) { toast(e.message); }
+        });
+        gwList.append(h("div", { class: "gw-row" }, h("code", { text: k.id }), span(k.label || "", ""), span(k.lan ? "this Mac + network" : "this Mac only", "label-sm"), span(new Date(k.created).toLocaleDateString(), "label-sm"), rm));
+      }
+      if (!(x.gateway_keys || []).length) gwList.append(h("div", { class: "label-sm", text: "No gateway keys yet." }));
+    };
+    renderKeys();
+    const gwLabel = h("input", { type: "text", placeholder: "Label, like roc on the laptop", class: "wide" });
+    const gwLan = h("label", { class: "inline" }, h("input", { type: "checkbox" }), " usable from other machines");
+    const issue = h("button", { type: "button", class: "small", text: "Issue a gateway key" });
+    const reveal = h("div", { class: "gw-reveal", hidden: true });
+    issue.addEventListener("click", async () => {
+      issue.disabled = true;
+      try {
+        const r = await postJSON("/api/hosts/" + encodeURIComponent(x.id) + "/gateway-keys", { label: gwLabel.value, lan: gwLan.querySelector("input").checked });
+        st = r.settings; S.settings = st; x.gateway_keys = (st.hosts.find((hh) => hh.id === x.id) || {}).gateway_keys || []; renderKeys();
+        reveal.hidden = false; reveal.textContent = "";
+        const code = h("code", { class: "gw-key", text: r.key });
+        const copy = h("button", { type: "button", class: "small", text: "Copy" });
+        copy.addEventListener("click", () => { navigator.clipboard && navigator.clipboard.writeText(r.key).then(() => toast("Gateway key copied")); });
+        reveal.append(h("div", { class: "label-sm", text: "Copy it now. Toktail keeps only a hash and can't show it again." }), h("div", { class: "with-btn" }, code, copy),
+          h("div", { class: "label-sm", text: "Use it as the API key: ANTHROPIC_AUTH_TOKEN / OPENAI_API_KEY / ROC_AI_API_TOKEN = this key, base URL = the address above." }));
+        gwLabel.value = "";
+      } catch (e) { toast(e.message); }
+      issue.disabled = false;
+    });
+    gw.append(h("div", { class: "label-sm", style: "margin-top:12px", text: "Gateway keys" }),
+      h("div", { class: "hint", text: "A gateway key is a stand-in: an app sends it, Toktail swaps in the stored " + kindName(x.kind) + " key for the life of the request, and the real key never leaves this Mac's " + vault() + ". Each key has its own one-way id in the CSV, so you can see what each app spent." }),
+      gwList, h("div", { class: "with-btn" }, gwLabel, gwLan, issue), reveal);
+    showHint(); port.input.addEventListener("input", showHint); lan.input.addEventListener("change", showHint); kind.input.addEventListener("change", showHint);
+    form.append(kind.row, name.row, url.row, tok.row);
     if (clear) form.append(clear.row);
-    form.append(port.row, lan.row, en.row, hint);
+    form.append(inject.row, port.row, lan.row, lanNote, en.row, hint, gw);
+    if (x.lan_key_from) form.append(h("div", { class: "label-sm warn-note", text: "⚠ A provider key arrived from " + x.lan_key_from + " over plain HTTP. Give that machine a gateway key instead." }));
     const testMsg = h("span", { class: "test-msg" });
     if (!isNew && x.checked) { testMsg.textContent = (x.ok ? "✓ " : "⚠ ") + x.message; testMsg.dataset.ok = x.ok ? "1" : "0"; }
     const test = h("button", { type: "button", class: "small", text: "Test connection" });
     test.addEventListener("click", async () => {
-      test.disabled = true; testMsg.textContent = "Knocking on LM Studio's door…"; testMsg.dataset.ok = "";
+      test.disabled = true; testMsg.textContent = "Knocking on " + kindName(kind.input.value) + "'s door…"; testMsg.dataset.ok = "";
       try {
-        const r = await postJSON("/api/hosts/test", { url: url.input.value, token: tok.input.value, id: x.id || null });
+        const r = await postJSON("/api/hosts/test", { url: url.input.value, token: tok.input.value, id: x.id || null, kind: kind.input.value });
         testMsg.dataset.ok = r.ok ? "1" : "0";
         testMsg.textContent = (r.ok ? "✓ " : "⚠ ") + r.message + (r.ok && r.models.length ? ": " + r.models.slice(0, 4).join(", ") + (r.models.length > 4 ? "…" : "") : "") + (r.ok ? " (" + r.ms + " ms)" : "");
       } catch (e) { testMsg.dataset.ok = "0"; testMsg.textContent = "⚠ " + e.message; }
@@ -110,7 +174,7 @@ const Settings = (() => {
     save.addEventListener("click", async () => {
       save.disabled = true;
       try {
-        const r = await postJSON("/api/hosts", { id: x.id || null, name: name.input.value, url: url.input.value, listen_port: parseInt(port.input.value, 10) || 0, allow_lan: lan.input.checked, enabled: en.input.checked, token: tok.input.value || null, clear_token: clear ? clear.input.checked : false });
+        const r = await postJSON("/api/hosts", { id: x.id || null, name: name.input.value, url: url.input.value, listen_port: parseInt(port.input.value, 10) || 0, allow_lan: lan.input.checked, enabled: en.input.checked, token: tok.input.value || null, clear_token: clear ? clear.input.checked : false, kind: kind.input.value, inject_key: inject.input.checked });
         st = r.settings; S.settings = st;
         toast(isNew ? "Added. Pip is watching " + name.input.value + "." : "Saved");
         render();
@@ -120,13 +184,34 @@ const Settings = (() => {
     const del = isNew ? h("button", { type: "button", class: "small", text: "Cancel", onclick: () => render() })
       : h("button", { type: "button", class: "small danger", text: "Remove", disabled: st.hosts.length <= 1, title: st.hosts.length <= 1 ? "Toktail needs at least one host" : "" });
     if (!isNew) del.addEventListener("click", async () => {
-      if (!(await confirmBox("Remove " + x.name + "?", "Toktail stops listening on port " + x.listen_port + " and forgets this host's API token. Its token history stays in your CSV and on the dashboard.", "Remove", true))) return;
+      if (!(await confirmBox("Remove " + x.name + "?", "Toktail stops listening on port " + x.listen_port + " and forgets this host's stored key. Its token history stays in your CSV and on the dashboard.", "Remove", true))) return;
       try { st = await getJSON("/api/hosts/" + encodeURIComponent(x.id), { method: "DELETE" }); S.settings = st; render(); if ((typeof Main !== "undefined")) Main.refreshMeta(); } catch (e) { toast(e.message); }
     });
     form.append(h("div", { class: "row-end" }, testMsg, test, del, save));
     summary.addEventListener("click", () => row.classList.toggle("open"));
     row.append(summary, form);
     return row;
+  }
+
+  // ---------------------------------------------------------------- prompt cache
+  function cacheSection() {
+    const c = st.cache || { enabled: false, ttl_hours: 72, max_mb: 2048 };
+    const sec = section("cache", "Prompt cache", "When on, a request identical to one already answered (same host, endpoint, body and credential) gets the saved answer back at once; no model runs. Answers are encrypted on disk like saved records. Streams are replayed as streams. Errors, refusals and cancelled requests are never cached. Apps can skip it with Cache-Control: no-cache or X-Toktail-Cache: bypass.");
+    const en = toggleField("Answer repeated prompts from the cache", "Applies to every host Toktail listens for.", c.enabled);
+    const ttl = numberField("Keep answers for", "Each answer expires this long after it was stored.", c.ttl_hours, "1", "hours", 1, 8760);
+    const cap = numberField("Cache size", "Oldest answers go first when the cache is full.", c.max_mb, "64", "MB", 16, 1048576);
+    sec.append(en.row, ttl.row, cap.row);
+    const stat = h("div", { class: "label-sm cache-stat", text: "…" });
+    const refreshStat = () => getJSON("/api/cache").then((r) => { stat.textContent = fmt(r.entries) + " answers, " + (r.bytes / 1048576).toFixed(1) + " MB · " + fmt(r.hits) + " hits, " + fmt(r.misses) + " misses since launch · in " + r.dir; }).catch(() => { stat.textContent = ""; });
+    refreshStat();
+    const clear = h("button", { type: "button", class: "small danger", text: "Empty the cache" });
+    clear.addEventListener("click", async () => {
+      if (!(await confirmBox("Empty the prompt cache?", "Every saved answer is deleted. Your CSV and saved records are untouched.", "Empty", true))) return;
+      try { const r = await getJSON("/api/cache/clear", { method: "POST" }); toast("Removed " + fmt(r.removed) + " answers"); refreshStat(); } catch (e) { toast(e.message); }
+    });
+    sec.append(stat);
+    saveRow(sec, "Save", (msg) => post({ cache: { enabled: en.input.checked, ttl_hours: num(ttl.input), max_mb: num(cap.input) } }, msg), [clear]);
+    return sec;
   }
 
   // ---------------------------------------------------------------- capture
@@ -279,8 +364,11 @@ const Settings = (() => {
     const anim = toggleField("Animate Pip in the menu bar", "Off keeps Pip still in the menu bar: awake while tokens flow, asleep otherwise.", st.app.animate_menu_bar);
     const count = toggleField("Show today's count in the menu bar", null, st.app.show_count_in_menu_bar);
     const stamp = numberField("Stampede at", "0 means automatic: three times your usual speed.", st.app.stampede_tokens_per_sec, "10", "tokens/sec");
-    sec.append(intro.row, roams.row, anim.row, count.row, stamp.row);
-    saveRow(sec, "Save", (msg) => post({ portal: { intro_animation: intro.input.checked, pip_roams: roams.input.checked }, app: { animate_menu_bar: anim.input.checked, show_count_in_menu_bar: count.input.checked, stampede_tokens_per_sec: num(stamp.input) } }, msg).then(() => { if ((typeof Stage !== "undefined")) Stage.applySettings(); }));
+    const cm = st.commentary || { enabled: true, every_minutes: 5 };
+    const talk = toggleField("Let Pip comment on what your agents are doing", "When opencode, Claude Code, Codex, Goose or roc send a prompt to an LM Studio host on your network, Pip asks that same local model for one whimsical sentence about it and says it in a speech bubble. Never for public API hosts; nothing leaves your network. Press u or Space on the dashboard to ask Pip right away.", cm.enabled);
+    const every = numberField("At most once every", "Pip waits this long between comments.", cm.every_minutes, "1", "minutes", 1, 1440);
+    sec.append(intro.row, roams.row, anim.row, count.row, stamp.row, talk.row, every.row);
+    saveRow(sec, "Save", (msg) => post({ portal: { intro_animation: intro.input.checked, pip_roams: roams.input.checked }, app: { animate_menu_bar: anim.input.checked, show_count_in_menu_bar: count.input.checked, stampede_tokens_per_sec: num(stamp.input) }, commentary: { enabled: talk.input.checked, every_minutes: num(every.input) } }, msg).then(() => { if ((typeof Stage !== "undefined")) Stage.applySettings(); }));
     return sec;
   }
 
@@ -292,7 +380,21 @@ const Settings = (() => {
     const base = selectField("Measure savings against", null, st.prices.models.map((m) => [m.id, m.provider + " " + m.name.replace(m.provider + " ", "")]), c.baseline);
     const kwh = numberField("Electricity price", null, c.electricity_usd_per_kwh, "0.01", "$ per kWh");
     const watts = numberField("Power while generating", "Used for hosts without a machine on the Savings page.", c.watts_while_generating, "10", "W");
-    sec.append(show.row, base.row, kwh.row, watts.row);
+    const cacheAware = toggleField("Price repeated prompt prefixes at the providers' cached-input rate", "Coding agents resend the whole conversation each turn. Providers charge the repeated part (the prefix a prompt cache would hit) less, typically a tenth of the input price. On, the cloud estimate uses that rate for the repeated tokens; off, every input token costs full price.", c.cache_aware !== false && c.cache_aware === true);
+    const mk = st.market || { enabled: true };
+    const market = toggleField("Check market prices once a day", "Fetches the public model price lists from LiteLLM and OpenRouter, alternating, keeps a dated history, and uses the newest prices for the comparison. No API key needed; the OpenRouter key below is optional.", c.market_prices !== false && mk.enabled !== false);
+    const orKey = secretField("OpenRouter API key (optional)", "Only if OpenRouter's public model list ever requires one. Kept in your " + vault() + ".", mk.openrouter_key || { saved: false, hint: null });
+    sec.append(show.row, base.row, kwh.row, watts.row, cacheAware.row, market.row, orKey.row);
+    const mst = mk.status || {};
+    const mline = h("div", { class: "label-sm cache-stat", text: mst.latest ? "Latest: " + mst.latest.models + " models from " + mst.latest.source + " on " + mst.latest.date + " · " + mst.days + " day" + (mst.days === 1 ? "" : "s") + " of history in " + mst.dir + (mk.applied ? " · in use" : " · not in use") : "No market prices fetched yet. Toktail checks a minute after launch, then once a day." });
+    const check = h("button", { type: "button", class: "small", text: "Check prices now" });
+    check.addEventListener("click", async () => {
+      check.disabled = true; mline.textContent = "Asking " + (mk.next_source || "litellm") + "…";
+      try { const r = await postJSON("/api/market/check", {}); if (r.settings) { st = r.settings; S.settings = st; } mline.textContent = (r.ok ? "✓ " : "⚠ ") + r.message; if (r.ok) toast("Prices updated"); }
+      catch (e) { mline.textContent = "⚠ " + e.message; }
+      check.disabled = false;
+    });
+    sec.append(h("div", { class: "with-btn" }, mline, check));
     const pick = h("div", { class: "models" });
     for (const m of st.prices.models) {
       const i = h("input", { type: "checkbox", value: m.id, class: "set-compare" });
@@ -301,7 +403,7 @@ const Settings = (() => {
     }
     sec.append(h("div", { class: "label-sm", style: "margin-top:10px", text: "Compare against:" }), pick);
     sec.append(h("p", { class: "label-sm", text: "To update prices, put your own pricing.json next to " + st.config_file + "." }));
-    saveRow(sec, "Save", (msg) => post({ costs: { show_comparison: show.input.checked, baseline: base.input.value, electricity_usd_per_kwh: num(kwh.input), watts_while_generating: num(watts.input), compare: [...sec.querySelectorAll(".set-compare:checked")].map((i) => i.value) } }, msg));
+    saveRow(sec, "Save", (msg) => post({ costs: { show_comparison: show.input.checked, baseline: base.input.value, electricity_usd_per_kwh: num(kwh.input), watts_while_generating: num(watts.input), cache_aware: cacheAware.input.checked, market_prices: market.input.checked, compare: [...sec.querySelectorAll(".set-compare:checked")].map((i) => i.value) }, market: { enabled: market.input.checked, openrouter_key: orKey.input.value || undefined } }, msg).then(() => { orKey.input.value = ""; }));
     return sec;
   }
 
@@ -385,4 +487,5 @@ const Settings = (() => {
 
   return { show };
 })();
+
 

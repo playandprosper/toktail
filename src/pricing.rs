@@ -29,6 +29,9 @@ pub struct PriceBook {
     /// "built-in" or the path of the user's override file.
     #[serde(default, skip_deserializing)]
     pub origin: String,
+    /// "litellm (2026-10-14)" when market snapshots are applied (market.rs).
+    #[serde(default, skip_deserializing)]
+    pub market: Option<String>,
 }
 
 fn usd() -> String {
@@ -60,6 +63,17 @@ pub struct PublicModel {
     pub note: String,
     #[serde(default)]
     pub source: String,
+    /// USD per 1M tokens read from the provider's prompt cache; None means
+    /// a tenth of the input price, the common rate.
+    #[serde(default)]
+    pub cached_input: Option<f64>,
+    /// Ids this model goes by on LiteLLM / OpenRouter, when the canonical
+    /// form of `id` isn't enough to match.
+    #[serde(default)]
+    pub market_ids: Vec<String>,
+    /// Which market snapshot last priced it.
+    #[serde(default, skip_deserializing)]
+    pub market_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,13 +113,26 @@ impl PublicModel {
         r
     }
 
-    pub fn cost_of(&self, r: &Row) -> (f64, f64, f64) {
+    /// The cached-input rate on `date`: the listed one, else a tenth of input.
+    pub fn cached_rate(&self, date: NaiveDate, input_tokens: u64) -> f64 {
+        let (i, _) = self.rates(date, input_tokens);
+        self.cached_input.unwrap_or(i / 10.0).min(i)
+    }
+
+    /// (input, output, per-request) USD for one row. With `cache_aware`, the
+    /// repeated prefix (what a provider's prompt cache would have served:
+    /// the provider-reported cache reads, or the prefix Toktail's own
+    /// deduplication found) is priced at the cached-input rate.
+    pub fn cost_of(&self, r: &Row, cache_aware: bool) -> (f64, f64, f64) {
         let (i, o) = self.rates(r.date, r.input);
-        (
-            r.input as f64 * i / 1e6,
-            r.output as f64 * o / 1e6,
-            self.per_request,
-        )
+        let input_cost = if cache_aware {
+            let cached = r.meta.cache_read.max(r.meta.prefix_tokens).min(r.input);
+            let fresh = r.input - cached;
+            fresh as f64 * i / 1e6 + cached as f64 * self.cached_rate(r.date, r.input) / 1e6
+        } else {
+            r.input as f64 * i / 1e6
+        };
+        (input_cost, r.output as f64 * o / 1e6, self.per_request)
     }
 }
 
@@ -197,6 +224,8 @@ pub struct DayCost {
 pub struct CostReport {
     pub as_of: String,
     pub origin: String,
+    pub market: Option<String>,
+    pub cache_aware: bool,
     pub currency: String,
     pub notes: Vec<String>,
     pub baseline: String,
@@ -276,7 +305,7 @@ pub fn report(data: &Data, f: &Filter, book: &PriceBook, cfg: &CostsConfig) -> C
         let day = daily.entry(r.date).or_default();
         day.0.push((r.ts_ms - r.duration_ms as i64, r.ts_ms));
         for (m, mc) in book.models.iter().zip(models.iter_mut()) {
-            let (ic, oc, rc) = m.cost_of(r);
+            let (ic, oc, rc) = m.cost_of(r, cfg.cache_aware);
             mc.input_cost += ic;
             mc.output_cost += oc;
             mc.request_cost += rc;
@@ -313,6 +342,8 @@ pub fn report(data: &Data, f: &Filter, book: &PriceBook, cfg: &CostsConfig) -> C
     CostReport {
         as_of: book.as_of.clone(),
         origin: book.origin.clone(),
+        market: book.market.clone(),
+        cache_aware: cfg.cache_aware,
         currency: book.currency.clone(),
         notes: book.notes.clone(),
         baseline: if book.find(&cfg.baseline).is_some() {

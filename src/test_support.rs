@@ -34,6 +34,9 @@ pub fn app() -> Arc<app::App> {
         retrieval: retrieval::Index::new(),
         chat_client: reqwest::Client::new(),
         shutting_down: AtomicBool::new(false),
+        cache: cache::PromptCache::new(),
+        commentary: commentary::State::new(),
+        chains: chain::Chains::new(),
     })
 }
 pub fn record(model: &str) -> ledger::Record {
@@ -59,5 +62,6 @@ pub fn record(model: &str) -> ledger::Record {
         prompt_key: String::new(),
         response_key: String::new(),
         reference_key: String::new(),
+        meta: Default::default(),
     }
 }

@@ -195,7 +195,13 @@ pub struct Report {
 
 /// Per-model statistics for the rows the filter keeps (embeddings left out
 /// of speed, but counted).
-pub fn models(data: &Data, f: &Filter, book: &PriceBook, baseline: &str) -> Report {
+pub fn models(
+    data: &Data,
+    f: &Filter,
+    book: &PriceBook,
+    baseline: &str,
+    cache_aware: bool,
+) -> Report {
     let base = book.find(baseline);
     let mut per: BTreeMap<String, Acc> = BTreeMap::new();
     let mut per_host: BTreeMap<(String, String), Acc> = BTreeMap::new();
@@ -203,7 +209,7 @@ pub fn models(data: &Data, f: &Filter, book: &PriceBook, baseline: &str) -> Repo
     for r in data.rows().filter(|r| f.matches(r)) {
         let cost = match base {
             Some(m) if !pricing::is_embedding(r) => {
-                let (i, o, q) = m.cost_of(r);
+                let (i, o, q) = m.cost_of(r, cache_aware);
                 i + o + if r.input + r.output > 0 { q } else { 0.0 }
             }
             _ => 0.0,
@@ -277,7 +283,7 @@ mod tests {
         let book = PriceBook::built_in();
         let rep = app
             .ledger
-            .with_data(|d| models(d, &Filter::default(), &book, "claude-sonnet-5.5"));
+            .with_data(|d| models(d, &Filter::default(), &book, "claude-sonnet-5.5", false));
         let a = rep.models.iter().find(|m| m.model == "a").unwrap();
         assert_eq!((a.requests, a.output, a.errors), (2, 400, 0));
         assert_eq!(

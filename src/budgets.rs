@@ -86,10 +86,10 @@ pub fn status(data: &Data, budgets: &[BudgetConfig], now: DateTime<Local>) -> Ve
             let n = ((today - start).num_days() + 1).max(1) as usize;
             let mut daily = vec![0u64; n];
             let mut used = 0u64;
-            for r in data
-                .rows()
-                .filter(|r| r.date >= start && r.date <= today && in_scope(b, r))
-            {
+            // Cache hits cost nothing to run, so they don't spend a budget.
+            for r in data.rows().filter(|r| {
+                r.date >= start && r.date <= today && !r.meta.cache_hit && in_scope(b, r)
+            }) {
                 let c = counts(b, r);
                 used += c;
                 daily[(r.date - start).num_days() as usize] += c;
@@ -363,7 +363,8 @@ pub fn check(app: &Arc<App>) -> Vec<Alert> {
 
     // ---- hosts that stop answering for a minute, and come back
     let st = app.status.read().clone();
-    for h in cfg.hosts.iter().filter(|h| h.enabled) {
+    // Public APIs come and go on their own schedule; only local hosts alert.
+    for h in cfg.hosts.iter().filter(|h| h.enabled && !h.is_public()) {
         let Some(hs) = st.hosts.get(&h.id) else {
             continue;
         };

@@ -290,6 +290,7 @@ pub fn savings(
     book: &PriceBook,
     cfg: &CostsConfig,
     default_lifecycle: u32,
+    local_hosts: Option<&std::collections::HashSet<String>>,
 ) -> Savings {
     let today = Local::now().date_naive();
     let compared_ids = book.compared(cfg);
@@ -375,6 +376,10 @@ pub fn savings(
         if pricing::is_embedding(r) || (r.input == 0 && r.output == 0) {
             continue;
         }
+        // Tokens a public API rendered aren't savings; only your hosts' are.
+        if local_hosts.is_some_and(|l| !l.contains(&*r.host)) {
+            continue;
+        }
         let mut base_cost = 0.0;
         let p = months.get_mut(&month_start(r.date));
         if let Some(p) = p {
@@ -382,7 +387,7 @@ pub fn savings(
             p.input_tokens += r.input;
             p.output_tokens += r.output;
             for pm in &models {
-                let (i, o, q) = pm.cost_of(r);
+                let (i, o, q) = pm.cost_of(r, cfg.cache_aware);
                 *p.cloud.entry(pm.id.clone()).or_default() += i + o + q;
                 if pm.id == baseline {
                     base_cost = i + o + q;

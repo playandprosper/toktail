@@ -49,8 +49,10 @@ ifeq ($(PLATFORM),linux)
   LOG        := $(DATA_DIR)/logs/toktail.log
   OPEN       := xdg-open
   # The tray icon needs GTK; without it Toktail builds as a headless server.
-  CARGO_GUI  := $(if $(shell pkg-config --exists gtk+-3.0 ayatana-appindicator3-0.1 2>/dev/null && echo yes),,--no-default-features)
-  TRAY       := $(if $(CARGO_GUI),browser,system tray)
+  # GTK + AppIndicator give the tray; without them Toktail builds headless.
+  HAS_GTK    := $(shell pkg-config --exists gtk+-3.0 ayatana-appindicator3-0.1 2>/dev/null && echo yes)
+  CARGO_GUI  := $(if $(HAS_GTK),,--no-default-features)
+  TRAY       := $(if $(HAS_GTK),system tray,browser)
 endif
 ifeq ($(PLATFORM),windows)
   EXE        := .exe
@@ -90,7 +92,7 @@ doctor: ## Check that this computer has what Toktail needs
 	@if [ "$(PLATFORM)" = "macos" ]; then echo "  ✓ macOS $$(sw_vers -productVersion) on $$(uname -m) (Toktail needs 11 Big Sur or later)"; \
 	  if xcode-select -p >/dev/null 2>&1; then echo "  ✓ Xcode Command Line Tools"; else echo "  ✗ Xcode Command Line Tools missing: run  xcode-select --install"; fi; fi
 	@if [ "$(PLATFORM)" = "linux" ]; then \
-	  if [ -z "$(CARGO_GUI)" ]; then echo "  ✓ GTK and AppIndicator: Pip goes in the system tray"; \
+	  if [ -n "$(HAS_GTK)" ]; then echo "  ✓ GTK and AppIndicator: Pip goes in the system tray"; \
 	  else echo "  · No GTK/AppIndicator dev files: Toktail builds headless (portal in the browser). For the tray: sudo apt install libgtk-3-dev libxdo-dev libayatana-appindicator3-dev"; fi; fi
 	@if command -v cargo >/dev/null 2>&1; then echo "  ✓ Rust $$(cargo --version | cut -d' ' -f2)"; \
 	  else echo "  ✗ Rust missing: run  make rust"; fi
@@ -257,3 +259,4 @@ endif
 clean: ## Remove build output
 	cargo clean
 	rm -rf dist
+

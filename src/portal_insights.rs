@@ -29,11 +29,14 @@ pub fn routes() -> Router<Arc<App>> {
 async fn model_stats(State(app): State<Arc<App>>, Query(q): Query<Q>) -> Response {
     let f = q.filter();
     let book = app.prices.read().clone();
-    let baseline = app.config.read().costs.baseline.clone();
+    let (baseline, cache_aware) = {
+        let c = app.config.read();
+        (c.costs.baseline.clone(), c.costs.cache_aware)
+    };
     let a = app.clone();
     match tokio::task::spawn_blocking(move || {
         a.ledger
-            .with_data(|d| stats::models(d, &f, &book, &baseline))
+            .with_data(|d| stats::models(d, &f, &book, &baseline, cache_aware))
     })
     .await
     {

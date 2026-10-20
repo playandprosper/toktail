@@ -17,12 +17,15 @@ const PipChat = (() => {
     mode: store.get("pip.mode") === "direct" ? "direct" : "pip",
     system: "", context: true, temperature: 0.3, maxTokens: 0,
     busy: false, abort: null, open: false,
+    // Threads: every conversation is a thread kept (encrypted) by Toktail.
+    threadId: store.get("pip.thread") || "", threads: [], threadQuery: "", focus: false,
   };
   const views = [];
-  let panel, launcher, modelLoading = null, returnFocus = null;
+  let panel, launcher, modelLoading = null, returnFocus = null, sidebar = null, saveTimer = null;
 
   // ================================================================ persistence
   function save() {
+    persistThread();
     try {
       const keep = C.messages.filter((m) => !m.pending).slice(-40).map((m) => ({ ...m, el: undefined }));
       let text = JSON.stringify({ messages: keep, system: C.system, context: C.context, temperature: C.temperature, maxTokens: C.maxTokens });
@@ -40,6 +43,120 @@ const PipChat = (() => {
       if (Number.isFinite(v.temperature)) C.temperature = v.temperature;
       if (Number.isFinite(v.maxTokens)) C.maxTokens = v.maxTokens;
     } catch (e) { /* ignore a damaged copy */ }
+  }
+
+  // ================================================================ threads
+  function threadBody() {
+    const sel = selected();
+    return { id: C.threadId, host: sel ? sel[0] : "", model: sel ? sel[1] : "", mode: C.mode, system: C.system, context: C.context, temperature: C.temperature, max_tokens: C.maxTokens || null,
+      messages: C.messages.filter((m) => !m.pending).map((m) => ({ ...m, el: undefined })) };
+  }
+  /** Writes the current thread to Toktail (debounced); empty threads aren't kept. */
+  function persistThread() {
+    clearTimeout(saveTimer);
+    if (!C.messages.some((m) => !m.pending && m.content)) return;
+    saveTimer = setTimeout(async () => {
+      try {
+        const e = await postJSON("/api/threads", threadBody());
+        if (e.id && e.id !== C.threadId) { C.threadId = e.id; store.set("pip.thread", e.id); }
+        const i = C.threads.findIndex((t) => t.id === e.id);
+        if (i >= 0) C.threads[i] = e; else C.threads.unshift(e);
+        renderThreads();
+      } catch (err) { /* kept in this browser meanwhile */ }
+    }, 400);
+  }
+  async function loadThreads(q) {
+    try {
+      const r = await getJSON("/api/threads" + (q ? "?q=" + encodeURIComponent(q) : ""));
+      C.threads = r.threads || [];
+      renderThreads();
+    } catch (e) { /* sidebar stays as it was */ }
+  }
+  async function openThread(id) {
+    if (C.busy) return toast("Stop the current answer first.");
+    try {
+      const t = await getJSON("/api/threads/" + encodeURIComponent(id));
+      C.threadId = t.id; store.set("pip.thread", t.id);
+      C.messages = Array.isArray(t.messages) ? t.messages : [];
+      C.system = t.system || ""; C.context = t.context !== false;
+      if (Number.isFinite(t.temperature)) C.temperature = t.temperature;
+      C.maxTokens = t.max_tokens || 0;
+      if (t.mode === "direct" || t.mode === "pip") { C.mode = t.mode; store.set("pip.mode", t.mode); }
+      if (t.host && t.model) { C.selection = JSON.stringify([t.host, t.model]); store.set("pip.model", C.selection); for (const v of views) v.model.value = C.selection; }
+      C.draft = "";
+      render(); renderThreads();
+    } catch (e) { toast(e.message); }
+  }
+  function newThread() {
+    if (C.busy) return;
+    C.threadId = ""; store.set("pip.thread", "");
+    C.messages = []; C.draft = "";
+    try { localStorage.removeItem("toktail." + SAVE_KEY); } catch (e) { /* fine */ }
+    render(); renderThreads();
+  }
+  async function renameThread(t) {
+    const input = h("input", { type: "text", class: "wide", value: t.title, maxlength: "80", "aria-label": "Title" });
+    const ok = await modal("Rename chat", input, [{ label: "Cancel", value: false }, { label: "Save", value: true, cls: "primary" }]);
+    if (!ok) return;
+    try { const e = await postJSON("/api/threads/" + encodeURIComponent(t.id) + "/meta", { title: input.value }); Object.assign(t, e); renderThreads(); } catch (err) { toast(err.message); }
+  }
+  async function pinThread(t) {
+    try { const e = await postJSON("/api/threads/" + encodeURIComponent(t.id) + "/meta", { pinned: !t.pinned }); Object.assign(t, e); C.threads.sort((a, b) => (b.pinned - a.pinned) || (b.updated > a.updated ? 1 : -1)); renderThreads(); } catch (err) { toast(err.message); }
+  }
+  async function deleteThread(t) {
+    if (!(await confirmBox("Delete this chat?", "“" + t.title + "” is removed from Toktail" + (S.meta && S.meta.capture && S.meta.capture.encryption === "per_file" ? " and its key destroyed" : "") + ". The token counts of its turns stay in your history.", "Delete", true))) return;
+    try {
+      await getJSON("/api/threads/" + encodeURIComponent(t.id), { method: "DELETE" });
+      C.threads = C.threads.filter((x) => x.id !== t.id);
+      if (C.threadId === t.id) newThread(); else renderThreads();
+    } catch (err) { toast(err.message); }
+  }
+  function renderThreads() {
+    if (!sidebar) return;
+    const list = sidebar.querySelector(".thread-list");
+    list.textContent = "";
+    if (!C.threads.length) list.append(h("div", { class: "label-sm", style: "padding:8px", text: C.threadQuery ? "No chats match." : "Your chats appear here. Each one is kept encrypted by Toktail, apart from the proxy's prompt history." }));
+    for (const t of C.threads) {
+      const row = h("div", { class: "thread" + (t.id === C.threadId ? " sel" : "") + (t.pinned ? " pinned" : ""), role: "button", tabindex: "0", title: t.preview || "" },
+        h("div", { class: "th-main" }, h("div", { class: "th-title" }, t.pinned ? span("📌 ", "") : null, document.createTextNode(t.title || "New chat")), h("div", { class: "label-sm", text: when(t.updated) + " · " + t.messages + (t.model ? " · " + t.model : "") })),
+        h("div", { class: "th-tools" },
+          h("button", { type: "button", class: "tiny", title: t.pinned ? "Unpin" : "Pin", "aria-label": t.pinned ? "Unpin" : "Pin", text: t.pinned ? "⊝" : "📌", onclick: (e) => { e.stopPropagation(); pinThread(t); } }),
+          h("button", { type: "button", class: "tiny", title: "Rename", "aria-label": "Rename", text: "✎", onclick: (e) => { e.stopPropagation(); renameThread(t); } }),
+          h("button", { type: "button", class: "tiny danger", title: "Delete", "aria-label": "Delete", text: "×", onclick: (e) => { e.stopPropagation(); deleteThread(t); } })));
+      row.onclick = () => openThread(t.id);
+      row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openThread(t.id); } };
+      list.append(row);
+    }
+  }
+  function buildSidebar() {
+    const search = h("input", { type: "search", placeholder: "Search chats", "aria-label": "Search chats", class: "wide" });
+    let t;
+    search.oninput = () => { C.threadQuery = search.value.trim(); clearTimeout(t); t = setTimeout(() => loadThreads(C.threadQuery), 250); };
+    const add = h("button", { type: "button", class: "small primary", text: "+ New chat", onclick: newThread });
+    sidebar = h("aside", { class: "thread-side", "aria-label": "Chats" }, h("div", { class: "thread-head" }, search, add), h("div", { class: "thread-list" }));
+    return sidebar;
+  }
+
+  // ================================================================ focus mode
+  /** Full-viewport chat: a modal over a blurred page, only the thread list,
+   *  the conversation and the input. Never the window itself: the green
+   *  button is for that. Esc, pressed twice, sizes it back down. */
+  let escAt = 0;
+  function setFocus(on) {
+    C.focus = on;
+    document.body.classList.toggle("chat-focus", on);
+    for (const v of views) if (v.focusBtn) { v.focusBtn.textContent = on ? "⤡ Exit full screen" : "⤢ Full screen"; v.focusBtn.setAttribute("aria-pressed", String(on)); }
+    if (on) { const v = views.find((x) => x.root === $("chat-card")); if (v) setTimeout(() => v.text.focus(), 50); }
+    else escAt = 0;
+  }
+  /** Esc once warns, Esc again within 1.5 s leaves. Returns true when handled. */
+  function focusEscape() {
+    if (!C.focus) return false;
+    const now = performance.now();
+    if (now - escAt < 1500) { setFocus(false); return true; }
+    escAt = now;
+    toast("Press Esc again to exit full screen");
+    return true;
   }
 
   // ================================================================ models
@@ -316,6 +433,7 @@ const PipChat = (() => {
     if (!content) return;
     if (C.busy) return toast("Pip is still answering. Stop it first.");
     if (!C.selection) { await loadModels(true); if (!C.selection) return toast("No chat model is available on your hosts right now."); }
+    if (!C.threadId) { C.threadId = "t_" + Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, "0")).join(""); store.set("pip.thread", C.threadId); }
     C.messages.push({ role: "user", content });
     C.draft = "";
     for (const v of views) { v.text.value = ""; v.text.style.height = ""; }
@@ -342,7 +460,7 @@ const PipChat = (() => {
     try {
       const resp = await fetch("/api/pip/chat", {
         method: "POST", headers: { "Content-Type": "application/json" }, signal: C.abort.signal,
-        body: JSON.stringify({ host, model, mode: C.mode, system: C.system || null, context: C.context, temperature: C.temperature, max_tokens: C.maxTokens || null, messages: msgs }),
+        body: JSON.stringify({ host, model, mode: C.mode, system: C.system || null, context: C.context, temperature: C.temperature, max_tokens: C.maxTokens || null, messages: msgs, thread: C.threadId || null }),
       });
       if (!resp.ok) throw new Error((await resp.text()) || "HTTP " + resp.status);
       const reader = resp.body.getReader(), dec = new TextDecoder();
@@ -412,7 +530,9 @@ const PipChat = (() => {
     const refresh = h("button", { type: "button", class: "small", text: "↻", title: "Refresh models", "aria-label": "Refresh models" });
     refresh.onclick = () => loadModels(true);
     const clear = h("button", { type: "button", class: "small", text: "New chat" });
-    clear.onclick = () => { if (C.busy) return; C.messages = []; C.draft = ""; save(); render(); };
+    clear.onclick = () => { if (C.busy) return; newThread(); };
+    const focusBtn = compactView ? null : h("button", { type: "button", class: "small", text: "⤢ Full screen", "aria-pressed": "false", title: "Fill the view with the chat (Esc twice to leave)" });
+    if (focusBtn) focusBtn.onclick = () => setFocus(!C.focus);
 
     const system = h("textarea", { rows: 3, placeholder: "System prompt (optional), e.g. You are a terse senior Rust reviewer.", "aria-label": "System prompt", spellcheck: "false" });
     system.oninput = () => { C.system = system.value; for (const v of views) if (v.system !== system) v.system.value = C.system; for (const v of views) v.sysBadge.hidden = !C.system.trim(); save(); };
@@ -441,9 +561,11 @@ const PipChat = (() => {
     form.onsubmit = (e) => { e.preventDefault(); send(text.value); };
     text.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); form.requestSubmit(); } };
     const status = h("div", { class: "pip-chat-status" });
-    const v = { root, model, modeSeg, log, text, send: sendBtn, stop, status, system, sysNote, sysBadge, context, contextRow, temperature, maxTokens };
+    const v = { root, model, modeSeg, log, text, send: sendBtn, stop, status, system, sysNote, sysBadge, context, contextRow, temperature, maxTokens, focusBtn };
     views.push(v);
-    root.append(h("div", { class: "pip-chat-toolbar" }, model, modeSeg, refresh, clear), options, log, form, status);
+    const toolbar = h("div", { class: "pip-chat-toolbar" }, model, modeSeg, refresh, clear);
+    if (focusBtn) toolbar.append(h("span", { class: "grow" }), focusBtn);
+    root.append(toolbar, options, log, form, status);
     fillModels(v);
   }
 
@@ -466,13 +588,14 @@ const PipChat = (() => {
     if (launcher) launcher.setAttribute("aria-expanded", "false");
     if (returnFocus && returnFocus.focus) returnFocus.focus();
   }
-  function showPage() { close(); render(); loadModels(); }
+  function showPage() { close(); render(); loadModels(); loadThreads(C.threadQuery); }
 
   /** Re-runs a saved request in Direct mode: same system prompt, same turns, same model. */
   async function continueRecord(id, row) {
     if (C.busy) return toast("Stop the current answer first.");
     try {
       const [p, r] = await Promise.all([getJSON("/api/records/" + encodeURIComponent(id) + "/prompt"), getJSON("/api/records/" + encodeURIComponent(id) + "/response")]);
+      C.threadId = ""; store.set("pip.thread", "");
       C.messages = [];
       C.system = "";
       for (const m of p.content.messages || []) {
@@ -505,10 +628,19 @@ const PipChat = (() => {
       h("div", { class: "t" }, h("b", { text: "Pip" }), h("small", {}, "pip> counting with your own models", h("span", { class: "caret" }))), expand, closeBtn), body);
     document.body.append(launcher, panel);
     mount(body, true);
-    mount($("chat-card"), false);
+    const card = $("chat-card");
+    const wrap = h("div", { class: "chat-wrap" });
+    card.parentNode.insertBefore(wrap, card);
+    wrap.append(buildSidebar(), card);
+    mount(card, false);
     render();
-    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && C.open && !document.querySelector("dialog[open]")) { e.preventDefault(); close(); } });
+    document.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape" || document.querySelector("dialog[open]")) return;
+      if (focusEscape()) { e.preventDefault(); return; }
+      if (C.open) { e.preventDefault(); close(); }
+    });
   }
 
   return { init, open, close, showPage, continueRecord, send, isOpen: () => C.open };
 })();
+

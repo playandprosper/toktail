@@ -26,7 +26,32 @@ use std::sync::Arc;
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const PIP_SVG: &str = include_str!("../assets/pip.svg");
 /// Page scripts and styles, served from memory.
-const ASSETS: [(&str, &str, &str); 12] = [
+const ASSETS: [(&str, &str, &str); 17] = [
+    (
+        "/vendor/BufferGeometryUtils.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/vendor/BufferGeometryUtils.js"),
+    ),
+    (
+        "/pip3d.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/pip3d.js"),
+    ),
+    (
+        "/pip-model.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/pip-model.js"),
+    ),
+    (
+        "/pip-clips.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/pip-clips.js"),
+    ),
+    (
+        "/vendor/three.module.min.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/vendor/three.module.min.js"),
+    ),
     (
         "/pip-chat.js",
         "text/javascript; charset=utf-8",
@@ -105,6 +130,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/open-data-folder", post(open_data_folder))
         .route("/pip.svg", get(pip_svg))
         .route("/api/live", get(live))
+        .route("/api/pip/commentary", get(commentary_lines))
+        .route("/api/pip/commentary/now", post(commentary_now))
+        .route("/api/cache", get(cache_summary))
+        .route("/api/cache/clear", post(cache_clear))
         .route("/api/costs", get(costs));
     for (path, ct, body) in ASSETS {
         r = r.route(
@@ -116,6 +145,7 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(portal_records::routes())
         .merge(crate::pip_agent::routes())
         .merge(crate::portal_insights::routes())
+        .merge(crate::threads::routes())
         .layer(middleware::from_fn_with_state(app.clone(), local_only))
         .with_state(app)
 }
@@ -434,11 +464,59 @@ async fn live(State(app): State<Arc<App>>, Query(q): Query<LiveQ>) -> Json<serde
         "stampede_tps": stampede,
         "typical_tps": app.typical_tps(),
         "hosts": hosts,
+        "commentary": { "seq": app.commentary.seq(), "latest": app.commentary.latest() },
+        "cache": app.cache.quick(),
     }))
 }
 
+/// Pip's last few speech bubbles.
+async fn commentary_lines(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    Json(json!({ "seq": app.commentary.seq(), "lines": app.commentary.recent(12) }))
+}
+
+/// The `u` / Space easter egg: asks Pip to speak up about the latest exchange.
+async fn commentary_now(State(app): State<Arc<App>>) -> Response {
+    match crate::commentary::ask_now(&app) {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(msg) => Json(json!({ "ok": false, "message": msg })).into_response(),
+    }
+}
+
+async fn cache_summary(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    let a = app.clone();
+    let v = tokio::task::spawn_blocking(move || crate::cache::summary(&a))
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    Json(v)
+}
+
+async fn cache_clear(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    let a = app.clone();
+    let n = tokio::task::spawn_blocking(move || crate::cache::clear(&a))
+        .await
+        .unwrap_or(0);
+    Json(json!({ "ok": true, "removed": n }))
+}
+
 async fn costs(State(app): State<Arc<App>>, Query(q): Query<Q>) -> Response {
-    let f = q.filter();
+    let mut f = q.filter();
+    // The comparison is about what your own hosts rendered; a public API's
+    // tokens were already paid for at its prices.
+    {
+        let c = app.config.read();
+        let local: std::collections::HashSet<String> = c
+            .hosts
+            .iter()
+            .filter(|h| !h.is_public())
+            .map(|h| h.id.clone())
+            .collect();
+        if c.hosts.iter().any(|h| h.is_public()) {
+            f.hosts = Some(match f.hosts.take() {
+                Some(h) => h.intersection(&local).cloned().collect(),
+                None => local,
+            });
+        }
+    }
     let cfg = app.config.read().costs.clone();
     let book = app.prices.read().clone();
     let fleet = app.hardware.read().clone();

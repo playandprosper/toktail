@@ -315,12 +315,52 @@ const Stage = (() => {
         }
       }
       if (pip) pip.setTail(L.per_second, Math.max(L.typical_tps || 0, 5));
-      $("ticker-text").textContent = LINES[state](L) + (L.active_requests > 1 ? " (" + L.active_requests + " requests at once)" : "");
+      commentary(L.commentary);
+      $("ticker-text").textContent = tickerLine || (LINES[state](L) + (L.active_requests > 1 ? " (" + L.active_requests + " requests at once)" : ""));
       if ((typeof Dashboard !== "undefined") && S.page === "dashboard") Dashboard.updateLive(L);
     } catch (e) {
       $("ticker-text").textContent = "Pip can't reach Toktail right now.";
     }
     liveTimer = setTimeout(poll, document.hidden ? 5000 : 1000);
+  }
+
+  // ---------------------------------------------------------------- Pip's commentary
+  // One whimsical sentence from the same local model that just answered an
+  // agent (opencode, Claude Code, Codex, Goose, roc…). The server decides
+  // when; the portal just says what's new.
+  let saidSeq = 0, tickerLine = "", tickerUntil = 0, lastAsk = 0;
+  function commentary(c) {
+    if (!c) return;
+    if (!saidSeq) { saidSeq = c.seq || 0; return; } // don't replay old lines on open
+    if (c.latest && c.latest.seq > saidSeq) {
+      saidSeq = c.latest.seq;
+      const line = c.latest;
+      const text = line.text + (line.agent ? "" : "");
+      if (pip && phase === "trail") { pip.say(text, Math.min(9000, 2600 + text.length * 55)); if (!reduced()) pip.emote(["happy", "excited", "flick"][Math.floor(Math.random() * 3)]); }
+      tickerLine = "🦊 " + text + (line.agent ? "  (" + line.agent + (line.project ? " · " + line.project : "") + ")" : "");
+      tickerUntil = performance.now() + 12000;
+      $("ticker-text").textContent = tickerLine;
+      setTimeout(() => { if (performance.now() >= tickerUntil) tickerLine = ""; }, 12100);
+    }
+    if (tickerLine && performance.now() >= tickerUntil) tickerLine = "";
+  }
+  /** `u` or Space on the dashboard: ask Pip about the latest exchange now. */
+  async function askPip() {
+    const now = performance.now();
+    if (now - lastAsk < 15000) { if (pip) pip.say("Give me a moment, I'm still thinking about the last one!", 2200); return; }
+    lastAsk = now;
+    if (pip) pip.say("Hmm, let me have a look…", 1800);
+    try {
+      const r = await getJSON("/api/pip/commentary/now", { method: "POST" });
+      if (!r.ok && pip) pip.say(r.message || "Nothing to say yet.", 3200);
+    } catch (e) { if (pip) pip.say("I couldn't ask the model: " + e.message, 3200); }
+  }
+  function onGlobalKey(e) {
+    if (S.page !== "dashboard") return;
+    const t = e.target, tag = t && t.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (t && t.isContentEditable)) return;
+    if (document.querySelector(".modal:not([hidden]), .pip-chat.open")) return;
+    if (e.key === "u" || e.key === "U" || e.key === " ") { e.preventDefault(); askPip(); }
   }
 
   // Token squares drift off Pip's tail while it eats.
@@ -353,7 +393,7 @@ const Stage = (() => {
     clearTimeout(clickTimer);
     clickTimer = setTimeout(() => {
       pip.say(QUIPS[quip++ % QUIPS.length](), 3600);
-      if (!reduced() && !pip.leapT) pip.hop();
+      if (!reduced() && !pip.leapT) { if (!(Pip.hasSkin() && Math.random() < 0.5 && pip.emote(["shake", "lick", "stretch", "bat", "happy"][Math.floor(Math.random() * 5)]))) pip.hop(); }
     }, 230);
   }
   function onPipDouble() {
@@ -435,6 +475,7 @@ const Stage = (() => {
       if (c !== pointer.card) { pointer.card = c; pointer.since = pointer.t; }
     }, { passive: true });
     addEventListener("scroll", () => { pointer.card = pointer.x >= 0 ? cardAt(pointer.x, pointer.y) : null; }, { passive: true });
+    addEventListener("keydown", onGlobalKey);
     poll();
     requestAnimationFrame(sparkles);
     requestAnimationFrame(follow);
@@ -455,6 +496,7 @@ const Stage = (() => {
   return {
     start, replay,
     cheer(msg) { if (pip && phase === "trail") pip.say(msg, 2600); },
+    askPip,
     applySettings() { nextMoveAt = 0; },
     /** Pages and cards changed: re-check the card Pip stands on. */
     platformsChanged() {
@@ -463,4 +505,5 @@ const Stage = (() => {
     },
   };
 })();
+
 

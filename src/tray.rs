@@ -43,6 +43,8 @@ struct Ui {
     sleep: Icon,
     pip_line: MenuItem,
     today: MenuItem,
+    /// The "out · in" split, shown on its own line under `today`.
+    today_split: MenuItem,
     requests: MenuItem,
     by_model: Submenu,
     by_host: Submenu,
@@ -169,6 +171,7 @@ impl Ui {
     fn new(app: &Arc<App>) -> anyhow::Result<Ui> {
         let pip_line = MenuItem::new("Pip is waking up…", false, None);
         let today = MenuItem::new("Today: —", false, None);
+        let today_split = MenuItem::new("    — out · — in", false, None);
         let requests = MenuItem::new("Requests today: —", false, None);
         let by_model = Submenu::new("Today by model", true);
         let by_host = Submenu::new("Today by host", true);
@@ -213,6 +216,7 @@ impl Ui {
             &pip_line,
             &PredefinedMenuItem::separator(),
             &today,
+            &today_split,
             &requests,
             &by_host,
             &by_model,
@@ -254,6 +258,7 @@ impl Ui {
             sleep,
             pip_line,
             today,
+            today_split,
             requests,
             by_model,
             open_portal,
@@ -341,9 +346,11 @@ impl Ui {
                 a.2 + m.totals.requests,
             )
         });
-        self.today.set_text(format!(
-            "Today: {} tokens ({} out · {} in)",
-            fmt_thousands(out + inp),
+        // Two lines: the total, then the split indented beneath it.
+        self.today
+            .set_text(format!("Today: {} tokens", fmt_thousands(out + inp)));
+        self.today_split.set_text(format!(
+            "    {} out · {} in",
             fmt_thousands(out),
             fmt_thousands(inp)
         ));

@@ -9,19 +9,36 @@ const vm = require("vm");
 const assert = require("assert");
 
 const dir = path.join(__dirname, "..", "assets");
-const scripts = fs.readdirSync(dir).filter((f) => f.endsWith(".js"));
+const all = fs.readdirSync(dir).filter((f) => f.endsWith(".js"));
+// ES modules (the 3D Pip) parse as modules; the rest as classic scripts.
+const isModule = (f) => /^(import|export)\b/m.test(fs.readFileSync(path.join(dir, f), "utf8"));
+const scripts = all.filter((f) => !isModule(f));
+const modules = all.filter(isModule);
 for (const f of scripts) {
   try { new vm.Script(fs.readFileSync(path.join(dir, f), "utf8"), { filename: f }); }
   catch (e) { console.error("✗ " + f + ": " + e.message); process.exit(1); }
 }
-console.log("✓ " + scripts.length + " portal scripts parse");
+for (const f of modules) {
+  if (typeof vm.SourceTextModule === "function") {
+    try { new vm.SourceTextModule(fs.readFileSync(path.join(dir, f), "utf8"), { identifier: f }); }
+    catch (e) { console.error("✗ " + f + ": " + e.message); process.exit(1); }
+  } else {
+    // Without --experimental-vm-modules, a syntax check through node itself.
+    const r = require("child_process").spawnSync(process.execPath, ["--check", path.join(dir, f)], { encoding: "utf8" });
+    if (r.status !== 0) { console.error("✗ " + f + ": " + r.stderr.trim()); process.exit(1); }
+  }
+}
+console.log("✓ " + scripts.length + " portal scripts and " + modules.length + " modules parse");
 
 // The page loads these in this order; every global they use must exist.
 const html = fs.readFileSync(path.join(dir, "index.html"), "utf8");
 const order = [...html.matchAll(/<script src="\/([\w-]+\.js)"><\/script>/g)].map((m) => m[1]);
+const moduleTags = [...html.matchAll(/<script type="module" src="\/([\w-]+\.js)"><\/script>/g)].map((m) => m[1]);
 for (const f of scripts) assert.ok(order.includes(f), f + " is never loaded by index.html");
 const served = fs.readFileSync(path.join(__dirname, "..", "src", "portal.rs"), "utf8");
-for (const f of order) assert.ok(served.includes('"/' + f + '"'), f + " isn't served by portal.rs");
+for (const f of order.concat(moduleTags)) assert.ok(served.includes('"/' + f + '"'), f + " isn't served by portal.rs");
+for (const f of modules) assert.ok(served.includes('"/' + f + '"'), f + " isn't served by portal.rs");
+for (const v of ["vendor/three.module.min.js", "vendor/BufferGeometryUtils.js"]) assert.ok(served.includes('"/' + v + '"'), v + " isn't served by portal.rs");
 console.log("✓ index.html loads every script and portal.rs serves them");
 
 // common.js in a tiny fake page.
@@ -52,3 +69,4 @@ assert.strictEqual(t.monthLabel("2026-10"), "Oct 2026");
 assert.strictEqual(t.mv({ input: 3, output: 4 }, "combined"), 7);
 assert.strictEqual(t.mv({ input: 3, output: 4 }, "output"), 4);
 console.log("✓ formatting, dates and CSV helpers");
+

@@ -21,8 +21,9 @@ const Prompts = (() => {
     const r = $("rec-range").value;
     if (r !== "all" && S.meta) {
       const today = S.meta.today;
-      p.set("from", r === "today" ? today : addDays(today, -(+r - 1)));
-      p.set("to", today);
+      const y = addDays(today, -1);
+      p.set("from", r === "today" ? today : r === "yesterday" ? y : addDays(today, -(+r - 1)));
+      p.set("to", r === "yesterday" ? y : today);
     }
     return p;
   }
@@ -196,6 +197,20 @@ const Prompts = (() => {
     box.append(h("h3", { text: "How it ranks" }), ranks);
     if (pf.same_prompt_count > 1) box.append(h("p", { class: "label-sm", text: "This exact prompt was sent " + fmt(pf.same_prompt_count) + " times (same fingerprint)." }));
 
+    // ---- where this prompt sits in its session chain
+    if (d.chain) {
+      const c = d.chain;
+      const pct = c.size ? Math.round(100 * c.prefix_bytes / c.size) : 0;
+      const line = h("div", { class: "rd-chain" },
+        h("div", { class: "k", text: "Session chain" }),
+        h("div", {},
+          c.missing ? span("This link was erased; its descendants were refolded.", "tag err") : null,
+          span(c.snapshot ? (c.depth === 0 ? "Root of the chain (full copy)" : "Snapshot (full copy) at link " + (c.depth + 1)) : "Link " + (c.depth + 1) + ": only " + fmt(Math.max(0, c.size - c.prefix_bytes)) + " of " + fmt(c.size) + " bytes stored, " + pct + "% was a repeat of the link before", ""),
+          c.children > 1 ? span(" · " + c.children + " branches continue from here", "label-sm") : null,
+          h("div", { class: "label-sm" }, "Session ", h("a", { href: "#/prompts/session/" + encodeURIComponent(c.session), text: c.session }), " · " + fmt(c.session_nodes) + " prompts, " + c.session_heads + " branch tip" + (c.session_heads === 1 ? "" : "s") + " · " + human(c.session_saved_bytes) + " saved of " + human(c.session_full_bytes) + (c.agent ? " · " + c.agent : "") + (c.project ? " · " + c.project : ""))));
+      box.append(line);
+    }
+
     // ---- prompt and response, hidden until clicked
     if (r.captured) {
       box.append(reveal(id, "prompt", "Prompt", d), reveal(id, "response", "Response", d));
@@ -308,32 +323,139 @@ const Prompts = (() => {
     body.append(h("label", { class: "inline" }, hist, " Also remove ", ids.length === 1 ? "it" : "them", " from the token history (the CSV). Leave this off to keep the counts."));
     const ok = await modal("Delete " + (ids.length === 1 ? "record" : fmt(ids.length) + " records"), body, [{ label: "Cancel", value: false }, { label: "Delete", value: true, cls: "primary danger" }]);
     if (!ok) return;
+    // Struck out while the chain is patched and verified; gone only once it is.
+    const rows = ids.map((id) => document.querySelector(`.rec-item[data-id="${id}"]`)).filter(Boolean);
+    for (const el of rows) { el.classList.add("deleting"); el.setAttribute("aria-busy", "true"); }
     try {
       const r = await postJSON("/api/records/delete", { ids, history: hist.checked });
-      toast("Deleted " + fmt(r.deleted_files) + " record" + (r.deleted_files === 1 ? "" : "s") + (r.deleted_rows ? " and " + fmt(r.deleted_rows) + " history rows" : "") + (r.errors.length ? ". Some failed: " + r.errors[0] : ""));
+      toast("Deleted " + fmt(r.deleted_files) + " record" + (r.deleted_files === 1 ? "" : "s") + (r.deleted_rows ? " and " + fmt(r.deleted_rows) + " history rows" : "") + (r.released_prompts ? ", chain patched" : "") + (r.errors.length ? ". Some failed: " + r.errors[0] : ""));
       for (const id of ids) P.checked.delete(id);
       if (ids.includes(P.sel)) { P.sel = null; $("rec-detail").textContent = ""; $("rec-detail").append(h("div", { class: "empty", text: "Deleted." })); }
-      loadList(false);
-    } catch (e) { toast("Couldn't delete: " + e.message); }
+      const keep = !hist.checked && $("rec-all").checked;
+      if (keep) {
+        for (const el of rows) el.classList.remove("deleting");
+        loadList(false);
+      } else {
+        await poof(rows);
+        P.rows = P.rows.filter((x) => !ids.includes(x.row.request_id));
+        P.total = Math.max(0, P.total - ids.length);
+        $("rec-count").textContent = fmt(P.total) + ($("rec-all").checked ? " requests" : " saved records");
+        updateBulk();
+        if (!P.rows.length) loadList(false);
+      }
+    } catch (e) {
+      for (const el of rows) { el.classList.remove("deleting"); el.removeAttribute("aria-busy"); }
+      toast("Couldn't delete: " + e.message);
+    }
+  }
+  /** Each row turns to a puff of smoke, then the rows below slide up. */
+  function poof(rows) {
+    if (!rows.length) return Promise.resolve();
+    if (reduced()) { for (const el of rows) el.remove(); return Promise.resolve(); }
+    return new Promise((done) => {
+      for (const el of rows) {
+        el.classList.remove("deleting");
+        const r = el.getBoundingClientRect();
+        const smoke = h("div", { class: "smoke", "aria-hidden": "true" });
+        for (let i = 0; i < 9; i++) {
+          const p = h("i");
+          p.style.setProperty("--dx", ((i % 3) - 1) * (18 + Math.random() * 22) + "px");
+          p.style.setProperty("--dy", -(10 + Math.random() * 34) + "px");
+          p.style.setProperty("--d", (Math.random() * 120) + "ms");
+          p.style.left = (10 + (i / 9) * 80) + "%";
+          smoke.append(p);
+        }
+        el.style.height = r.height + "px";
+        el.append(smoke);
+        el.classList.add("poof");
+        requestAnimationFrame(() => { el.classList.add("gone"); });
+      }
+      setTimeout(() => { for (const el of rows) el.remove(); done(); }, 760);
+    });
+  }
+
+  // ================================================================ sessions
+  function human(b) { return b < 1024 ? b + " B" : b < 1048576 ? (b / 1024).toFixed(1) + " KB" : b < 1073741824 ? (b / 1048576).toFixed(1) + " MB" : (b / 1073741824).toFixed(2) + " GB"; }
+  async function showSessions(id) {
+    const list = $("sessions-list"), det = $("session-detail");
+    if (id) { list.hidden = true; det.hidden = false; return showSession(id); }
+    list.hidden = false; det.hidden = true; list.textContent = "";
+    list.append(h("div", { class: "empty", text: "Loading…" }));
+    let r, st;
+    try { [r, st] = await Promise.all([getJSON("/api/sessions"), getJSON("/api/chains/status")]); }
+    catch (e) { list.textContent = ""; list.append(h("div", { class: "empty", text: e.message })); return; }
+    list.textContent = "";
+    const m = st.migration || {};
+    if (m.running) list.append(h("div", { class: "banner" }, h("b", { text: "Folding earlier prompts into chains… " }), fmt(m.folded + m.skipped) + " of " + fmt(m.total) + " done, " + human(m.saved_bytes) + " saved so far. Originals stay in .pre-v0.0.2 until you free the space."));
+    else if (st.pre_v2_bytes > 0) {
+      const free = h("button", { type: "button", class: "small", text: "Free " + human(st.pre_v2_bytes) });
+      free.addEventListener("click", async () => { free.disabled = true; try { const x = await postJSON("/api/chains/free-space", {}); toast("Freed " + human(x.freed_bytes)); showSessions(); } catch (e) { toast(e.message); free.disabled = false; } });
+      list.append(h("div", { class: "banner" }, h("b", { text: "Migration done. " }), "The pre-0.0.2 originals of " + fmt(m.folded) + " prompts are still on disk, verified against the new chains. ", free));
+    }
+    const total = r.sessions.reduce((a, s) => a + s.saved_bytes, 0), full = r.sessions.reduce((a, s) => a + s.full_bytes, 0);
+    $("sessions-sub").textContent = r.sessions.length ? fmt(r.sessions.length) + " sessions · " + human(total) + " saved of " + human(full) + " (" + (full ? Math.round(100 * total / full) : 0) + "%) by storing only what changed. Every " + st.snapshot_every + "nd link is a full snapshot." : "No sessions yet. Chains form as agents send prompts to a host with saving on.";
+    if (!r.sessions.length) list.append(h("div", { class: "empty", text: "No sessions yet." }));
+    for (const s of r.sessions) {
+      const row = h("div", { class: "sess-row", role: "button", tabindex: "0" },
+        h("div", { class: "sess-main" },
+          h("div", { class: "ri-top" }, h("b", { text: (s.agent || "session") + (s.project ? " · " + s.project : "") }), span(when(s.latest || s.created), "ri-time")),
+          h("div", { class: "ri-meta" }, s.host ? swatchText(hostName(s.host), hostColorVar(s.host)) : null, span(s.id, "label-sm mono"), s.missing ? span(s.missing + " erased", "tag err") : null, s.heads > 1 ? span(s.heads + " branches", "tag") : null)),
+        h("div", { class: "sess-nums" }, h("b", { text: fmt(s.nodes) + " prompts" }), span(human(s.saved_bytes) + " saved of " + human(s.full_bytes), "label-sm")));
+      row.addEventListener("click", () => { location.hash = "#/prompts/session/" + encodeURIComponent(s.id); });
+      row.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); row.click(); } });
+      list.append(row);
+    }
+  }
+  async function showSession(id) {
+    const det = $("session-detail"); det.textContent = "";
+    det.append(h("div", { class: "empty", text: "Loading…" }));
+    let s;
+    try { s = await getJSON("/api/sessions/" + encodeURIComponent(id)); }
+    catch (e) { det.textContent = ""; det.append(h("div", { class: "empty", text: e.message })); return; }
+    det.textContent = "";
+    det.append(h("div", { class: "row-end", style: "justify-content:flex-start" }, h("a", { href: "#/prompts/sessions", class: "btn small", text: "← All sessions" }), h("b", { text: (s.agent || "session") + (s.project ? " · " + s.project : "") }), span(s.id, "label-sm mono")));
+    det.append(h("p", { class: "label-sm", text: fmt(s.nodes.length) + " prompts · " + s.heads.length + " branch tip" + (s.heads.length === 1 ? "" : "s") + " · " + human(s.saved_bytes) + " saved of " + human(s.full_bytes) + ". Each node's id is the hash of its parent's id and its own content, so a tip commits to its whole branch." }));
+    // A tree, drawn as an indented list by depth with branch glyphs.
+    const byParent = new Map();
+    for (const n of s.nodes) { const k = n.parent || ""; if (!byParent.has(k)) byParent.set(k, []); byParent.get(k).push(n); }
+    const tree = h("div", { class: "sess-tree" });
+    const walk = (parent, depth) => {
+      for (const n of (byParent.get(parent) || [])) {
+        const kids = (byParent.get(n.node) || []).length;
+        const el = h("div", { class: "sess-node" + (n.missing ? " missing" : "") + (n.snapshot ? " snap" : "") + (s.heads.includes(n.node) ? " head" : ""), style: "--depth:" + depth },
+          span(n.missing ? "✕" : n.snapshot ? "◆" : "●", "glyph"),
+          h("div", { class: "sn-main" },
+            h("div", {}, n.request_id ? h("a", { href: "#/prompts/" + n.request_id, text: n.stem ? n.stem.split("/").pop() : n.content.slice(0, 12) }) : span(n.stem ? n.stem.split("/").pop() : n.content.slice(0, 12), ""), n.missing ? span(" erased", "tag err") : null, kids > 1 ? span(" " + kids + " branches", "tag") : null, s.heads.includes(n.node) ? span(" tip", "tag") : null),
+            span(when(n.created) + " · " + (n.snapshot ? "full copy, " + human(n.size) : human(Math.max(0, n.size - n.prefix)) + " new of " + human(n.size) + " (" + (n.size ? Math.round(100 * n.prefix / n.size) : 0) + "% repeated)") + " · " + n.node.slice(0, 10), "label-sm")));
+        tree.append(el);
+        walk(n.node, depth + 1);
+      }
+    };
+    walk("", 0);
+    det.append(tree);
   }
 
   // ================================================================ chat
   function continueInChat(id,row) { PipChat.continueRecord(id,row); }
 
   // ================================================================ page
-  function setMode(v) {
+  function setMode(v, sessionId) {
     for (const b of $("prompts-mode").children) b.setAttribute("aria-pressed", String(b.dataset.v === v));
     $("records-view").hidden = v !== "records";
+    $("sessions-view").hidden = v !== "sessions";
     $("chat-view").hidden = v !== "chat";
-    const want = v === "chat" ? "#/prompts/chat" : P.sel ? "#/prompts/" + P.sel : "#/prompts";
+    const want = v === "chat" ? "#/prompts/chat" : v === "sessions" ? (sessionId ? "#/prompts/session/" + encodeURIComponent(sessionId) : "#/prompts/sessions") : P.sel ? "#/prompts/" + P.sel : "#/prompts";
     if (location.hash !== want) history.replaceState(null, "", want);
     if (v === "chat") PipChat.showPage();
+    if (v === "sessions") showSessions(sessionId);
   }
   async function show(sub) {
     if (!S.meta) return;
     renderBanner();
     fillFilters();
     if (sub === "chat") { setMode("chat"); return; }
+    if (sub === "sessions") { setMode("sessions"); return; }
+    if (sub && sub.startsWith("session/")) { setMode("sessions", decodeURIComponent(sub.slice(8))); return; }
     setMode("records");
     await loadList(false);
     if (sub) open(sub);
@@ -364,4 +486,5 @@ const Prompts = (() => {
   function filter(signal){$("rec-outcome").value=signal;$("rec-all").checked=true;location.hash="#/prompts";setMode("records");loadList(false);}
   return { init, show, refresh, filter };
 })();
+
 

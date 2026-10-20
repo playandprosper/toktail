@@ -10,6 +10,7 @@
 use crate::app::App;
 use crate::config::{self, HostConfig, MAX_HOSTS};
 use crate::hardware::{self, Machine};
+use crate::tokens;
 use crate::{proxy, s3sync, secrets};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -26,9 +27,15 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/api/hosts", post(save_host))
         .route("/api/hosts/{id}", delete(delete_host))
         .route("/api/hosts/test", post(test_host))
+        .route("/api/hosts/{id}/gateway-keys", post(issue_gateway_key))
+        .route(
+            "/api/hosts/{id}/gateway-keys/{key}",
+            delete(revoke_gateway_key),
+        )
         .route("/api/lmstudio/test", post(test_host))
         .route("/api/encryption/test", post(test_encryption))
         .route("/api/s3/test", post(test_s3))
+        .route("/api/market/check", post(market_check))
         .route("/api/pick-folder", post(pick_folder))
         .route("/api/hardware", get(get_hardware).post(save_machine))
         .route("/api/hardware/{id}", delete(delete_machine))
@@ -40,7 +47,7 @@ pub fn bad_request(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, msg.into()).into_response()
 }
 
-fn server_error(msg: impl Into<String>) -> Response {
+pub fn server_error(msg: impl Into<String>) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, msg.into()).into_response()
 }
 
@@ -81,6 +88,13 @@ fn host_json(app: &App, h: &HostConfig) -> serde_json::Value {
         "client_url": format!("{}/v1", proxy::local_url(&h.listen)),
         "has_token": token.is_some(),
         "token_hint": token.as_deref().map(secrets::token_hint),
+        "kind": h.kind,
+        "public": h.is_public(),
+        "inject_key": h.inject_key,
+        "gateway_keys": h.gateway_keys.iter().map(|k| json!({
+            "id": k.id, "label": k.label, "created": k.created, "lan": k.lan,
+        })).collect::<Vec<_>>(),
+        "lan_key_from": st.lan_key_from,
         "proxy_ok": st.proxy_ok,
         "proxy_message": st.proxy_msg,
         "checked": st.upstream.checked,
@@ -109,6 +123,24 @@ pub fn settings_json(app: &App) -> serde_json::Value {
             "electricity_usd_per_kwh": cfg.costs.electricity_usd_per_kwh,
             "watts_while_generating": cfg.costs.watts_while_generating,
             "hardware_cost_usd": cfg.costs.hardware_cost_usd,
+            "cache_aware": cfg.costs.cache_aware,
+            "market_prices": cfg.costs.market_prices,
+        },
+        "cache": {
+            "enabled": cfg.cache.enabled,
+            "ttl_hours": cfg.cache.ttl_hours,
+            "max_mb": cfg.cache.max_mb,
+        },
+        "commentary": {
+            "enabled": cfg.commentary.enabled,
+            "every_minutes": cfg.commentary.every_minutes,
+        },
+        "market": {
+            "enabled": cfg.market.enabled,
+            "next_source": cfg.market.next_source,
+            "status": crate::market::summary(&app.paths.base),
+            "applied": book.market,
+            "openrouter_key": hint(secrets::get_named_secret("openrouter-key")),
         },
         "app": {
             "stampede_tokens_per_sec": cfg.app.stampede_tokens_per_sec,
@@ -187,6 +219,26 @@ struct SettingsIn {
     encryption: Option<EncryptionIn>,
     s3: Option<S3In>,
     hardware: Option<HardwareIn>,
+    cache: Option<CacheIn>,
+    commentary: Option<CommentaryIn>,
+    market: Option<MarketIn>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct CacheIn {
+    enabled: Option<bool>,
+    ttl_hours: Option<u32>,
+    max_mb: Option<u64>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct CommentaryIn {
+    enabled: Option<bool>,
+    every_minutes: Option<u32>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct MarketIn {
+    enabled: Option<bool>,
+    openrouter_key: Option<String>,
+    clear_openrouter_key: Option<bool>,
 }
 #[derive(Debug, Default, Deserialize)]
 struct PortalIn {
@@ -201,6 +253,8 @@ struct CostsIn {
     electricity_usd_per_kwh: Option<f64>,
     watts_while_generating: Option<f64>,
     hardware_cost_usd: Option<f64>,
+    cache_aware: Option<bool>,
+    market_prices: Option<bool>,
 }
 #[derive(Debug, Default, Deserialize)]
 struct AppIn {
@@ -275,9 +329,52 @@ async fn set_settings(State(app): State<Arc<App>>, Json(body): Json<SettingsIn>)
             cfg.portal.pip_roams = v;
         }
     }
+    if let Some(c) = body.cache {
+        if let Some(v) = c.enabled {
+            cfg.cache.enabled = v;
+        }
+        if let Some(v) = c.ttl_hours {
+            cfg.cache.ttl_hours = v.clamp(1, 24 * 365);
+        }
+        if let Some(v) = c.max_mb {
+            cfg.cache.max_mb = v.clamp(16, 1024 * 1024);
+        }
+    }
+    if let Some(c) = body.commentary {
+        if let Some(v) = c.enabled {
+            cfg.commentary.enabled = v;
+        }
+        if let Some(v) = c.every_minutes {
+            cfg.commentary.every_minutes = v.clamp(1, 24 * 60);
+        }
+    }
+    if let Some(m) = body.market {
+        if let Some(v) = m.enabled {
+            cfg.market.enabled = v;
+        }
+        if m.clear_openrouter_key == Some(true) {
+            if let Err(e) = secrets::set_named_secret("openrouter-key", None) {
+                return server_error(format!("{e:#}"));
+            }
+        } else if let Some(k) = nonempty(m.openrouter_key) {
+            if let Err(e) = secrets::set_named_secret("openrouter-key", Some(&k)) {
+                return server_error(format!("Couldn't save the OpenRouter key: {e:#}"));
+            }
+        }
+    }
     if let Some(c) = body.costs {
         if let Some(v) = c.show_comparison {
             cfg.costs.show_comparison = v;
+        }
+        if let Some(v) = c.cache_aware {
+            cfg.costs.cache_aware = v;
+        }
+        if let Some(v) = c.market_prices {
+            let changed = cfg.costs.market_prices != v;
+            cfg.costs.market_prices = v;
+            if changed {
+                *app.prices.write() = crate::market::book_with_market(&app.paths.base, v);
+            }
         }
         if let Some(v) = c.baseline.filter(|b| known.contains(b)) {
             cfg.costs.baseline = v;
@@ -530,6 +627,13 @@ struct HostIn {
     token: Option<String>,
     #[serde(default)]
     clear_token: bool,
+    /// "lmstudio" (default), "anthropic", "openai" or "other".
+    #[serde(default)]
+    kind: Option<String>,
+    /// Public hosts: add the stored key for requests from this machine
+    /// that carry none.
+    #[serde(default = "yes")]
+    inject_key: bool,
 }
 
 fn yes() -> bool {
@@ -546,6 +650,16 @@ async fn save_host(State(app): State<Arc<App>>, Json(h): Json<HostIn>) -> Respon
         Ok(u) => u,
         Err(e) => return bad_request(e),
     };
+    let kind = h.kind.clone().unwrap_or_else(|| "lmstudio".into());
+    if !config::HOST_KINDS.contains(&kind.as_str()) {
+        return bad_request("Pick a host type: LM Studio, Anthropic, OpenAI or another API.");
+    }
+    if kind != "lmstudio" && tokens::is_private_url(&upstream) {
+        return bad_request("A public API host points at a service on the internet. For a server on this machine or your network, pick LM Studio.");
+    }
+    if kind == "lmstudio" && !tokens::is_private_url(&upstream) {
+        return bad_request("That address is on the internet. Pick Anthropic, OpenAI or another API as the host type so keys are handled safely.");
+    }
     let port = h.listen_port;
     if port == 0 {
         return bad_request("Pick a port between 1 and 65535 for Toktail to listen on.");
@@ -584,6 +698,8 @@ async fn save_host(State(app): State<Arc<App>>, Json(h): Json<HostIn>) -> Respon
             slot.upstream = upstream;
             slot.listen = listen;
             slot.enabled = h.enabled;
+            slot.kind = kind;
+            slot.inject_key = h.inject_key;
             id.clone()
         }
         None => {
@@ -603,6 +719,9 @@ async fn save_host(State(app): State<Arc<App>>, Json(h): Json<HostIn>) -> Respon
                 upstream,
                 listen,
                 enabled: h.enabled,
+                kind,
+                inject_key: h.inject_key,
+                gateway_keys: vec![],
             });
             id
         }
@@ -626,6 +745,66 @@ async fn save_host(State(app): State<Arc<App>>, Json(h): Json<HostIn>) -> Respon
     // Give the proxy a moment to bind so the answer shows the new state.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     Json(json!({ "id": id, "settings": settings_json(&app) })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewayKeyIn {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    lan: bool,
+}
+
+/// Mints a Toktail gateway key for a public host. The key itself is shown
+/// once in the answer and never stored; only its hash is kept.
+async fn issue_gateway_key(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(body): Json<GatewayKeyIn>,
+) -> Response {
+    let mut cfg = app.config.read().clone();
+    let Some(h) = cfg.hosts.iter_mut().find(|x| x.id == id) else {
+        return bad_request("No such host.");
+    };
+    if !h.is_public() {
+        return bad_request(
+            "Gateway keys are for public API hosts. LM Studio hosts take an API token instead.",
+        );
+    }
+    if h.gateway_keys.len() >= 32 {
+        return bad_request("That's enough gateway keys for one host. Revoke one first.");
+    }
+    let label = body.label.trim().chars().take(40).collect::<String>();
+    let (plain, mut key) =
+        tokens::issue_gateway_key(if label.is_empty() { "agent" } else { &label });
+    key.lan = body.lan;
+    let entry = json!({ "id": key.id, "label": key.label, "created": key.created, "lan": key.lan });
+    h.gateway_keys.push(key);
+    if let Err(e) = config::save(&app.paths.config_file, &cfg) {
+        return server_error(format!("could not save settings: {e:#}"));
+    }
+    *app.config.write() = cfg;
+    Json(json!({ "key": plain, "entry": entry, "settings": settings_json(&app) })).into_response()
+}
+
+async fn revoke_gateway_key(
+    State(app): State<Arc<App>>,
+    Path((id, key)): Path<(String, String)>,
+) -> Response {
+    let mut cfg = app.config.read().clone();
+    let Some(h) = cfg.hosts.iter_mut().find(|x| x.id == id) else {
+        return bad_request("No such host.");
+    };
+    let before = h.gateway_keys.len();
+    h.gateway_keys.retain(|k| k.id != key);
+    if h.gateway_keys.len() == before {
+        return bad_request("No such gateway key.");
+    }
+    if let Err(e) = config::save(&app.paths.config_file, &cfg) {
+        return server_error(format!("could not save settings: {e:#}"));
+    }
+    *app.config.write() = cfg;
+    Json(settings_json(&app)).into_response()
 }
 
 async fn delete_host(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
@@ -654,6 +833,8 @@ struct TestIn {
     /// Empty = use the saved token of `id`.
     token: Option<String>,
     id: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 /// "Test connection": tries an address and token before saving.
@@ -677,7 +858,20 @@ async fn test_host(
         .build()
         .unwrap_or_default();
     let started = std::time::Instant::now();
-    let p = proxy::probe(&client, &url, token.as_deref()).await;
+    let kind = body.kind.clone().or_else(|| {
+        let c = app.config.read();
+        body.id
+            .as_deref()
+            .and_then(|i| c.host(i))
+            .map(|h| h.kind.clone())
+    });
+    let p = proxy::probe(
+        &client,
+        &url,
+        token.as_deref(),
+        kind.as_deref().unwrap_or("lmstudio"),
+    )
+    .await;
     Json(
         json!({ "ok": p.ok, "message": p.message, "models": p.models, "url": url, "ms": started.elapsed().as_millis() as u64 }),
     )
@@ -690,6 +884,20 @@ async fn test_encryption(State(app): State<Arc<App>>) -> Json<serde_json::Value>
         Ok(Ok(msg)) => Json(json!({ "ok": true, "message": msg })),
         Ok(Err(e)) => Json(json!({ "ok": false, "message": format!("{e:#}") })),
         Err(e) => Json(json!({ "ok": false, "message": e.to_string() })),
+    }
+}
+
+/// "Check prices now": today's market fetch, on demand.
+async fn market_check(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    match crate::market::check_today(&app, &client).await {
+        Ok(s) => Json(
+            json!({ "ok": true, "message": format!("{} models priced from {} ({})", s.quotes.len(), s.source, s.date), "settings": settings_json(&app) }),
+        ),
+        Err(e) => Json(json!({ "ok": false, "message": format!("{e:#}") })),
     }
 }
 
@@ -788,14 +996,22 @@ async fn replace_machine(
 async fn savings(State(app): State<Arc<App>>) -> Response {
     let fleet = app.hardware.read().clone();
     let book = app.prices.read().clone();
-    let (costs, lifecycle) = {
+    let (costs, lifecycle, local) = {
         let c = app.config.read();
-        (c.costs.clone(), c.hardware.default_lifecycle_months)
+        (
+            c.costs.clone(),
+            c.hardware.default_lifecycle_months,
+            c.hosts
+                .iter()
+                .filter(|h| !h.is_public())
+                .map(|h| h.id.clone())
+                .collect::<std::collections::HashSet<String>>(),
+        )
     };
     let a = app.clone();
     match tokio::task::spawn_blocking(move || {
         a.ledger
-            .with_data(|d| hardware::savings(d, &fleet, &book, &costs, lifecycle))
+            .with_data(|d| hardware::savings(d, &fleet, &book, &costs, lifecycle, Some(&local)))
     })
     .await
     {

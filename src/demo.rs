@@ -149,6 +149,7 @@ pub fn prepare(dir: &Path) -> Result<()> {
                     upstream: format!("http://127.0.0.1:{}", h.fake_port),
                     listen: format!("127.0.0.1:{}", h.port),
                     enabled: true,
+                    ..Default::default()
                 })
                 .collect(),
             ..Config::default()
@@ -380,6 +381,15 @@ fn write_history(data: &Path) -> Result<()> {
                     "0".into(),
                     String::new(),
                     String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    "0".into(),
+                    "0".into(),
+                    "false".into(),
+                    String::new(),
+                    String::new(),
+                    "0".into(),
                     String::new(),
                     String::new(),
                 ],
@@ -711,7 +721,7 @@ pub fn seed_captures(app: &std::sync::Arc<crate::app::App>) {
     ].iter().enumerate() {
         let response=serde_json::to_vec(&json!({"model":"qwen/qwen3-8b","choices":[{"message":{"content":text,"refusal":if *refusal {Some(*text)}else{None}}}],"usage":{"prompt_tokens":80,"completion_tokens":32}})).unwrap();
         let (outcome,signal,response_chars)=crate::intelligence::classify(200,&response);
-        let rec=crate::ledger::Record {request_id:format!("00000000-0000-4000-8000-{:012}",i+1),timestamp:ts,model:"qwen/qwen3-8b".into(),endpoint:"demo/seed".into(),streamed:false,status:200,input_tokens:80,output_tokens:32,duration_ms:400,ttft_ms:None,usage_source:"reported",prompt_sha256:String::new(),host:"laptop".into(),record:String::new(),outcome,signal,response_chars,prompt_blob:String::new(),prompt_key:String::new(),response_key:String::new(),reference_key:String::new()};
+        let rec=crate::ledger::Record {request_id:format!("00000000-0000-4000-8000-{:012}",i+1),timestamp:ts,model:"qwen/qwen3-8b".into(),endpoint:"demo/seed".into(),streamed:false,status:200,input_tokens:80,output_tokens:32,duration_ms:400,ttft_ms:None,usage_source:"reported",prompt_sha256:String::new(),host:"laptop".into(),record:String::new(),outcome,signal,response_chars,prompt_blob:String::new(),prompt_key:String::new(),response_key:String::new(),reference_key:String::new(),meta:Default::default()};
         let body=serde_json::to_vec(&json!({"model":"qwen/qwen3-8b","messages":[{"role":"user","content":prompt}]})).unwrap();
         crate::records::enqueue(app,rec,Some(body),Some(response));
     }

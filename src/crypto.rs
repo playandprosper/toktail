@@ -26,7 +26,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use parking_lot::{Mutex, RwLock};
-use rand_like::random_bytes;
+pub use rand_like::random_bytes;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{Read, Write};

@@ -624,9 +624,37 @@ const Pip = (() => {
     else { drawing = false; ctx.clearRect(0, 0, innerWidth, innerHeight); }
   }
 
+  // A skin (pip3d.js) can take over drawing: it follows each fox's state and
+  // the SVG goes invisible but stays as the click target.
+  let skin = null;
+  function setSkin(s) {
+    skin = s;
+    for (const f of all) if (s && !f.skin3d) s.attach(f);
+  }
+  const mountRaw = Fox.prototype.mount;
+  Fox.prototype.mount = function (parent) {
+    mountRaw.call(this, parent);
+    if (skin && !this.skin3d) skin.attach(this);
+    return this;
+  };
+  const unmountRaw = Fox.prototype.unmount;
+  Fox.prototype.unmount = function () {
+    if (skin && this.skin3d) skin.detach(this);
+    unmountRaw.call(this);
+  };
+  /** A flourish by name (happy, excited, shake, lick, stretch…); 3D only. */
+  Fox.prototype.emote = function (name) {
+    if (skin && this.skin3d) return skin.emote(this, name);
+    this.hop();
+    return false;
+  };
+
   return {
     create: (opts) => new Fox(opts),
     step, sparkle, reduceMotion, HEIGHT,
     setDark(v) { dark = !!v; },
+    setSkin,
+    hasSkin: () => !!skin,
   };
 })();
+

@@ -70,14 +70,15 @@ fn dollars(v: f64) -> String {
     )
 }
 
-/// Chat models on every enabled host, asked through Toktail's own ports.
+/// Chat models on every enabled local host, asked through Toktail's own
+/// ports. Public API hosts are left out: Pip talks to your own models.
 async fn models(State(app): State<Arc<App>>) -> Json<Value> {
     let hosts = app
         .config
         .read()
         .hosts
         .iter()
-        .filter(|h| h.enabled)
+        .filter(|h| h.enabled && !h.is_public())
         .cloned()
         .collect::<Vec<_>>();
     let requests = hosts.into_iter().map(|h| {
@@ -774,11 +775,14 @@ fn compare(app: &App, a: &Scope, b: &Scope) -> Value {
 
 fn model_stats(app: &App, s: &Scope, limit: usize) -> Value {
     let book = app.prices.read().clone();
-    let baseline = app.config.read().costs.baseline.clone();
+    let (baseline, cache_aware) = {
+        let c = app.config.read();
+        (c.costs.baseline.clone(), c.costs.cache_aware)
+    };
     let f = s.filter();
     let rep = app
         .ledger
-        .with_data(|d| crate::stats::models(d, &f, &book, &baseline));
+        .with_data(|d| crate::stats::models(d, &f, &book, &baseline, cache_aware));
     let rows: Vec<Value> = rep
         .models
         .iter()
@@ -939,7 +943,7 @@ fn savings(app: &App) -> Value {
     };
     let s = app
         .ledger
-        .with_data(|d| crate::hardware::savings(d, &fleet, &book, &costs, life));
+        .with_data(|d| crate::hardware::savings(d, &fleet, &book, &costs, life, None));
     json!({
         "kind": "savings", "baseline": s.baseline_name,
         "saved_usd": (s.total.savings * 100.0).round() / 100.0,
@@ -1761,6 +1765,9 @@ struct Chat {
     context: bool,
     temperature: Option<f64>,
     max_tokens: Option<u64>,
+    /// The chat thread this turn belongs to; its prompts chain together.
+    #[serde(default)]
+    thread: Option<String>,
 }
 fn yes() -> bool {
     true
@@ -1794,10 +1801,19 @@ async fn stream_turn(
     url: &str,
     body: &Value,
     tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    session: &str,
 ) -> Result<Turn, String> {
+    let mut req = app
+        .chat_client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("X-Toktail-Client", "pip");
+    if crate::threads::valid_id(session) {
+        req = req.header("X-Toktail-Session", session);
+    }
     let resp = tokio::select! {
         _ = tx.closed() => return Err("closed".into()),
-        r = app.chat_client.post(url).header("content-type", "application/json").header("X-Toktail-Client", "pip").body(body.to_string()).send() => r,
+        r = req.body(body.to_string()).send() => r,
     };
     let resp = match resp {
         Ok(r) if r.status().is_success() => r,
@@ -1957,6 +1973,7 @@ async fn chat(State(app): State<Arc<App>>, Json(c): Json<Chat>) -> Response {
     app.rt.clone().spawn(async move {
         let send = |kind: &str, v: Value| tx.send(Ok(event(kind, v)));
         let url = format!("{}/v1/chat/completions", crate::proxy::local_url(&host.listen));
+        let session = c.thread.clone().unwrap_or_default();
         let system = c.system.clone().filter(|s| !s.trim().is_empty());
         let mut messages: Vec<Value> = Vec::new();
         let mut use_tools = false;
@@ -1991,7 +2008,7 @@ async fn chat(State(app): State<Arc<App>>, Json(c): Json<Chat>) -> Response {
                 body["tools"] = tools();
                 body["tool_choice"] = json!("auto");
             }
-            let mut turn = stream_turn(&app, &url, &body, &tx).await;
+            let mut turn = stream_turn(&app, &url, &body, &tx, &session).await;
             if offer && matches!(&turn, Err(e) if e.contains("HTTP 4")) {
                 // This model doesn't take tools: answer from the facts alone.
                 use_tools = false;
@@ -1999,7 +2016,7 @@ async fn chat(State(app): State<Arc<App>>, Json(c): Json<Chat>) -> Response {
                     o.remove("tools");
                     o.remove("tool_choice");
                 }
-                turn = stream_turn(&app, &url, &body, &tx).await;
+                turn = stream_turn(&app, &url, &body, &tx, &session).await;
             }
             let turn = match turn {
                 Ok(t) => t,
