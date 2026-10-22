@@ -222,6 +222,7 @@ const Dashboard = (() => {
     const a = L && L.activity;
     if (!a) return;
     S.flights = a.in_flight || [];
+    S.stacks = a.stacks || [];
     const fresh = (a.finished || []).filter((f) => f.seq > (S.liveSeq || 0));
     if (fresh.length) {
       S.feed = fresh.reverse().map((f) => ({ ...f, isNew: S.liveSeq > 0 })).concat((S.feed || []).map((f) => ({ ...f, isNew: false }))).slice(0, 60);
@@ -231,26 +232,283 @@ const Dashboard = (() => {
     if (S.page === "dashboard") renderFeed(!fresh.length);
   }
   const inScope = (x) => !S.hosts || !S.hosts.size || S.hosts.has(x.host);
-  /** Redraws the flights; the finished list too unless `flightsOnly`. */
+  // ---- requests in flight you can steer: cancel, reroute, or answer with an
+  // identical one already running. Rows are kept and updated in place so a
+  // click is never lost to the once-a-second refresh.
+  S.flightSel = S.flightSel || new Set();
+  let cancelArm = null; // { id, until }: the second click confirms
+  const mmss = (s) => Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+  const ago = (ms) => ms >= 3600e3 ? (ms / 3600e3).toFixed(1) + " h" : ms >= 60e3 ? mmss(Math.round(ms / 1000)) : (ms / 1000).toFixed(1) + " s";
+  async function flightAction(path, body, okText) {
+    try {
+      const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+      const v = await r.json().catch(() => ({}));
+      if (!r.ok || v.ok === false) throw new Error(v.message || (v.errors && v.errors[0]) || "HTTP " + r.status);
+      toast(okText || v.message || "Done");
+      return v;
+    } catch (e) { toast(e.message); return null; }
+  }
+  /** First click arms, second confirms. Stays armed while the pointer is on
+   *  the button, and for 4 s after it leaves. */
+  function cancelFlight(f, btn) {
+    if (cancelArm && cancelArm.id === f.id && (cancelArm.over || cancelArm.until > Date.now())) {
+      cancelArm = null;
+      btn.disabled = true;
+      btn.textContent = "Cancelling…";
+      flightAction("/api/flights/" + f.id + "/cancel", null, "Cancelled #" + f.id + (f.agent ? " (" + f.agent + ")" : ""));
+      return;
+    }
+    const arm = { id: f.id, until: Date.now() + 4000, over: btn.matches(":hover") };
+    cancelArm = arm;
+    btn.textContent = "Sure? Cancel";
+    btn.classList.add("armed");
+    const disarm = () => {
+      if (cancelArm !== arm || arm.over || arm.until > Date.now()) return;
+      cancelArm = null;
+      if (!btn.disabled) { btn.textContent = "Cancel"; btn.classList.remove("armed"); }
+    };
+    btn.onpointerenter = () => { arm.over = true; };
+    btn.onpointerleave = () => { arm.over = false; arm.until = Date.now() + 4000; setTimeout(disarm, 4050); };
+    setTimeout(disarm, 4050);
+  }
+  /** Asks where to send one or more requests, then sends them there. */
+  async function rerouteFlights(list) {
+    const endpoint = list[0].endpoint;
+    let t;
+    try { t = await getJSON("/api/flights/targets?endpoint=" + encodeURIComponent(endpoint)); } catch (e) { return toast(e.message); }
+    const hosts = t.hosts || [];
+    const here = new Set(list.map((f) => f.host));
+    const pick = hosts.find((x) => x.available && !here.has(x.id)) || hosts.find((x) => x.available);
+    if (!pick) return toast("No other host can take " + endpoint.replace(/^\/v1\//, "") + " right now.");
+    const host = h("select", { "aria-label": "Host" });
+    for (const x of hosts) host.append(h("option", { value: x.id, text: x.name + (x.public ? " (API)" : "") + (x.available ? "" : " — " + x.reason), disabled: !x.available }));
+    host.value = pick.id;
+    // The model it runs on there: only one that machine has. A host that
+    // doesn't list its models takes a typed name instead.
+    const model = h("select", { "aria-label": "Model" });
+    const typed = h("input", { type: "text", class: "wide", spellcheck: "false", "aria-label": "Model name", hidden: true });
+    const note = h("div", { class: "label-sm reroute-note" });
+    const asked = [...new Set(list.map((f) => f.model))];
+    const chosen = () => (model.hidden ? typed.value : model.value).trim();
+    const fill = () => {
+      const x = hosts.find((y) => y.id === host.value) || {};
+      const ms = x.models || [];
+      model.textContent = "";
+      model.hidden = !ms.length;
+      typed.hidden = !!ms.length;
+      for (const m of ms) model.append(h("option", { value: m, text: m + (asked.includes(m) ? "  (the model it asked for)" : "") }));
+      const same = asked.find((m) => ms.includes(m));
+      if (ms.length) model.value = same || ms[0];
+      else typed.placeholder = "The model's name on " + x.name;
+      note.textContent = !ms.length
+        ? x.name + " didn't list its models. Type one it has."
+        : same ? "" : x.name + " doesn't have " + asked.join(", ") + ", so it will run on " + model.value + " there. Pick another if you like.";
+    };
+    model.addEventListener("change", () => { note.textContent = asked.includes(model.value) ? "" : "It asked for " + asked.join(", ") + "; it will run on " + model.value + " instead."; });
+    fill();
+    host.addEventListener("change", fill);
+    const body = h("div", { class: "reroute" },
+      h("p", { text: list.length === 1
+        ? "#" + list[0].id + " (" + list[0].model + ") is still reading its prompt on " + hostName(list[0].host) + ". Send it to another machine and model; the agent gets that answer on the same request, as if nothing happened."
+        : "Send these " + list.length + " requests to another machine and model; each agent gets its answer on the same request, as if nothing happened." }),
+      h("label", { class: "stack" }, span("Host", "label-sm"), host),
+      h("label", { class: "stack" }, span("Model on that host", "label-sm"), model, typed),
+      note,
+      h("p", { class: "label-sm", text: "The agent's own API key is never sent to another host: the target's stored key is used, or none. The work started on " + [...here].map(hostName).join(", ") + " is stopped." }));
+    const go = await modal(list.length === 1 ? "Reroute #" + list[0].id : "Reroute " + list.length + " requests", body, [{ label: "Cancel", value: false }, { label: "Reroute", value: true, cls: "primary", validate: () => { if (!chosen()) { typed.focus(); return false; } return true; } }]);
+    if (!go) return;
+    const target = chosen();
+    if (list.length === 1) await flightAction("/api/flights/" + list[0].id + "/reroute", { host: host.value, model: target }, "Rerouted #" + list[0].id + " to " + target + " on " + hostName(host.value));
+    else {
+      const r = await flightAction("/api/flights/bulk", { ids: list.map((f) => f.id), action: "reroute", host: host.value, model: target }, "Rerouting…");
+      if (r) toast("Rerouted " + r.done + " of " + list.length + (r.errors.length ? ". " + r.errors[0] : ""));
+      S.flightSel.clear();
+    }
+  }
+  function flightRow(id) {
+    const cb = h("input", { type: "checkbox", class: "fl-cb", "aria-label": "Select #" + id });
+    const host = h("b"), model = h("code"), idl = span("#" + id, "fl-id");
+    const tags = h("span", { class: "fl-tags" });
+    const nums = h("div", { class: "nums" });
+    const state = h("div", { class: "state" });
+    const acts = h("div", { class: "fl-acts" });
+    const row = h("div", { class: "flight", "data-id": String(id) },
+      h("div", { class: "who" }, cb, idl, host, model, tags), nums, h("div", { class: "bar" }, h("i")), state, acts);
+    cb.addEventListener("change", () => { if (cb.checked) S.flightSel.add(id); else S.flightSel.delete(id); paintBulk(); });
+    row._parts = { cb, host, model, tags, nums, state, acts };
+    return row;
+  }
+  function paintFlight(row, f) {
+    const p = row._parts;
+    const pre = f.output === 0;
+    row.classList.toggle("prefill", pre);
+    row.classList.toggle("gone", !!f.agent_gone);
+    row.classList.toggle("joined", f.joined_to != null);
+    row.classList.toggle("sel", S.flightSel.has(f.id));
+    row.style.setProperty("--hc", hostColor(f.host));
+    p.cb.checked = S.flightSel.has(f.id);
+    p.host.textContent = hostName(f.host);
+    p.model.textContent = f.model;
+    const tags = [];
+    if (f.agent) tags.push(span(f.agent + (f.session ? " · " + f.session.slice(-6) : ""), "tag agent", ));
+    if (f.duplicate_of != null && f.joined_to == null) tags.push(span("retry of #" + f.duplicate_of, "tag warn"));
+    if (f.joined_to != null) tags.push(span(f.joined_finished ? "gets #" + f.joined_to + "'s finished answer" : "gets #" + f.joined_to + "'s answer · not read again", "tag hit"));
+    else if (f.queue_len > 1 && f.output === 0) tags.push(span(f.queue_pos === 1 ? "first in line" : "in line: " + f.queue_pos + " of " + f.queue_len, f.queue_pos === 1 ? "tag" : "tag warn"));
+    if (f.joiners) tags.push(span("answering " + f.joiners + " more", "tag hit"));
+    if (f.rerouted_from) tags.push(span("rerouted from " + f.rerouted_from, "tag"));
+    if (f.agent_gone) tags.push(span(f.stops_in_secs != null ? "agent hung up · stops in " + mmss(f.stops_in_secs) + " unless it retries" : "agent hung up", "tag err"));
+    p.tags.replaceChildren(...tags);
+    if (pre) p.nums.replaceChildren(span(f.joined_to != null ? "waiting on #" + f.joined_to + "…" : "reading the prompt…", "state"));
+    else p.nums.replaceChildren(document.createTextNode(fmt(f.output)), h("small", { text: " tokens" + (f.tokens_per_sec ? " · " + f.tokens_per_sec.toFixed(1) + " tok/s" : "") }));
+    p.state.textContent = ago(f.elapsed_ms) + (f.output === 0 && f.prompt_tokens_est > 2000 && f.joined_to == null ? " · ~" + compact(f.prompt_tokens_est) + " tokens of prompt to read" : "") + (f.ttft_ms != null ? " · first token after " + fmt(f.ttft_ms) + " ms" : "") + " · " + f.endpoint.replace(/^\/(v1|api\/v\d)\//, "");
+    // Actions: rebuilt only when what's possible changes.
+    const sig = [f.can_reroute, f.duplicate_of, f.joined_to].join("|");
+    if (p.acts.dataset.sig !== sig) {
+      p.acts.dataset.sig = sig;
+      const list = [];
+      if (f.can_reroute && f.duplicate_of != null) list.push(h("button", { type: "button", class: "small", title: "Stop this one and give its agent #" + f.duplicate_of + "'s answer when it comes", text: "Use #" + f.duplicate_of + "'s answer", onclick: () => flightAction("/api/flights/" + f.id + "/join", { to: f.duplicate_of }) }));
+      if (f.can_reroute) list.push(h("button", { type: "button", class: "small", text: "Reroute…", onclick: () => { const cur = (S.flights || []).find((x) => x.id === f.id); if (cur) rerouteFlights([cur]); } }));
+      const cancel = h("button", { type: "button", class: "small danger", text: "Cancel", title: "Stop it on the model server and tell the agent it was cancelled (agents don't retry this)" });
+      cancel.addEventListener("click", () => cancelFlight(f, cancel));
+      list.push(cancel);
+      p.acts.replaceChildren(...list);
+    }
+  }
+  // ---- the diagnosis: what's piling up, why, and what Toktail is doing
+  const seenStacks = new Set();
+  function stackNote(st) {
+    const host = hostName(st.host);
+    const box = h("div", { class: "stack-why" });
+    const head = st.line.length > 1
+      ? host + " is reading " + st.line.length + " prompts for " + st.model + ", one at a time"
+      : host + ": an agent sent the same prompt again";
+    box.append(h("b", { text: head }));
+    for (const g of st.groups) {
+      const who = g.agent || "The agent";
+      const copies = g.attempts || g.answered_by_original.length + g.running_separately.length + 1;
+      const size = g.prompt_tokens_est > 2000 ? "~" + compact(g.prompt_tokens_est) + "-token " : "";
+      const latest = g.answered_by_original.length ? Math.max(...g.answered_by_original) : null;
+      const p = h("p", {});
+      p.append(h("strong", { text: who + " sent the same " + size + "prompt " + copies + " times. " }));
+      if (g.original_finished) p.append("#" + g.original + " finished after " + who + " stopped waiting for it; Toktail kept the answer and is handing it to the retry (#" + latest + "). Nothing is read again.");
+      else if (g.original_gone && latest != null) p.append(who + " stopped waiting for #" + g.original + " while it was still being read, and sent it again. #" + g.original + " keeps going, and when it's done its answer goes to the latest attempt (#" + latest + "). The " + (g.answered_by_original.length === 1 ? "retry isn't" : g.answered_by_original.length + " retries aren't") + " read again.");
+      else if (latest != null) p.append("Toktail sends #" + g.original + "'s answer to " + (g.answered_by_original.length === 1 ? "the copy" : "all " + g.answered_by_original.length + " copies") + " when it's done; they aren't read again.");
+      if (g.running_separately.length) {
+        p.append(" " + g.running_separately.map((x) => "#" + x).join(", ") + (g.running_separately.length === 1 ? " is" : " are") + " being read again on " + (g.running_separately.length === 1 ? "its" : "their") + " own. ");
+        const b = h("button", { type: "button", class: "small primary", text: "Answer " + (g.running_separately.length === 1 ? "it" : "them") + " with #" + g.original + "'s answer" });
+        b.addEventListener("click", () => { b.disabled = true; flightAction("/api/flights/" + g.original + "/collapse"); });
+        p.append(b);
+      }
+      box.append(p);
+    }
+    const waiting = st.line.slice(1);
+    if (waiting.length) {
+      const p = h("p", {});
+      const behind = (S.flights || []).filter((f) => waiting.includes(f.id)).reduce((a, f) => a + (f.prompt_tokens_est || 0), 0);
+      p.append(waiting.length + " other prompt" + (waiting.length === 1 ? " is" : "s are") + " waiting behind #" + st.line[0] + (behind > 2000 ? " (~" + compact(behind) + " more tokens to read)" : "") + "; LM Studio will read " + (waiting.length === 1 ? "it" : "them") + " after it. ");
+      const movable = (S.flights || []).filter((f) => waiting.includes(f.id) && f.can_reroute);
+      if (movable.length) {
+        const b = h("button", { type: "button", class: "small", text: "Send the waiting " + (movable.length === 1 ? "one" : movable.length) + " to another machine…" });
+        b.addEventListener("click", () => { const now = (S.flights || []).filter((f) => waiting.includes(f.id) && f.can_reroute); if (now.length) rerouteFlights(now); });
+        p.append(b);
+      }
+      box.append(p);
+    }
+    box.append(h("p", { class: "label-sm", text: "Why: LM Studio reads one prompt at a time per model on a machine. It can write several answers at once, but coding agents send long prompts for short answers, so parallel requests don't help: each one waits for the reading before it. When an agent times out and sends the same prompt again, the copy joins the back of the line and would be read all over again. Toktail doesn't cause the wait; it keeps the line from growing." }));
+    return box;
+  }
+  function paintWhy() {
+    const why = $("flight-why");
+    if (!why) return;
+    const stacks = (S.stacks || []).filter((st) => inScope({ host: st.host }));
+    const sig = JSON.stringify(stacks.map((st) => [st.host, st.model, st.line, st.groups.map((g) => [g.original, g.attempts, g.answered_by_original, g.running_separately, g.original_gone, g.original_finished])]));
+    if (why.dataset.sig === sig) return;
+    why.dataset.sig = sig;
+    why.hidden = !stacks.length;
+    why.replaceChildren(...stacks.map(stackNote));
+    // Pip says it once per stack, in plain words.
+    for (const st of stacks) for (const g of st.groups) {
+      if (seenStacks.has(g.original) || !g.answered_by_original.length) continue;
+      seenStacks.add(g.original);
+      if (typeof Stage !== "undefined") Stage.cheer((g.agent || "Your agent") + " asked the same thing again. I'll read it once and hand over the answer.");
+    }
+  }
+  function paintBulk() {
+    const bar = $("flight-bulk");
+    if (!bar) return;
+    const live = new Set((S.flights || []).map((f) => f.id));
+    for (const id of [...S.flightSel]) if (!live.has(id)) S.flightSel.delete(id);
+    const n = S.flightSel.size;
+    bar.hidden = n === 0;
+    if (!n) return;
+    const sel = (S.flights || []).filter((f) => S.flightSel.has(f.id));
+    const reroutable = sel.filter((f) => f.can_reroute);
+    const sameApi = new Set(reroutable.map((f) => f.endpoint)).size <= 1;
+    // Rebuilt only when something in it changes, so a click never straddles a rebuild.
+    const sig = [...S.flightSel].sort().join(",") + "|" + reroutable.map((f) => f.id).join(",") + "|" + sameApi;
+    if (bar.dataset.sig === sig) return;
+    bar.dataset.sig = sig;
+    bar.replaceChildren(
+      span(n + " selected", ""),
+      h("button", { type: "button", class: "small", text: "Reroute " + reroutable.length + "…", disabled: !reroutable.length || !sameApi, title: sameApi ? "" : "Pick requests to the same endpoint", onclick: () => rerouteFlights(reroutable) }),
+      h("button", { type: "button", class: "small danger", text: "Cancel " + n, onclick: async () => {
+        if (!(await confirmBox("Cancel " + n + " requests?", "Each is stopped on its model server and its agent is told it was cancelled.", "Cancel them", true))) return;
+        const r = await flightAction("/api/flights/bulk", { ids: [...S.flightSel], action: "cancel" }, "Cancelling…");
+        if (r) toast("Cancelled " + r.done + " of " + n + (r.errors.length ? ". " + r.errors[0] : ""));
+        S.flightSel.clear(); paintBulk();
+      } }),
+      h("button", { type: "button", class: "small", text: "Clear", onclick: () => { S.flightSel.clear(); for (const c of document.querySelectorAll(".fl-cb")) c.checked = false; paintBulk(); renderFeed(true); } }));
+  }
+  /** Redraws the flights; the finished list too unless `flightsOnly`. While
+   *  the pointer is over the list nothing moves: finished requests stay put,
+   *  greyed out, and new ones join at the bottom. */
   function renderFeed(flightsOnly) {
     const fl = $("flights"), feed = $("feed");
     if (!fl) return;
-    const flights = (S.flights || []).filter(inScope).sort((a, b) => b.elapsed_ms - a.elapsed_ms);
-    fl.textContent = "";
+    if (!fl.dataset.hoverWired) {
+      fl.dataset.hoverWired = "1";
+      fl.addEventListener("pointerenter", () => { S.flightHold = true; });
+      fl.addEventListener("pointerleave", () => { S.flightHold = false; renderFeed(true); });
+    }
+    // Oldest first, each original followed by the retries it answers.
+    const flights = (S.flights || []).filter(inScope).sort((a, b) => ((a.joined_to ?? a.id) - (b.joined_to ?? b.id)) || ((a.joined_to != null) - (b.joined_to != null)) || (a.id - b.id));
+    const empty = fl.querySelector(":scope > .empty");
     if (!flights.length) {
-      fl.append(h("div", { class: "empty" }, h("img", { src: "/pip.svg", alt: "", width: 34, height: 34 }), span("Nothing streaming right now. Pip is listening.", "")));
+      if (!empty) { fl.textContent = ""; fl.append(h("div", { class: "empty" }, h("img", { src: "/pip.svg", alt: "", width: 34, height: 34 }), span("Nothing streaming right now. Pip is listening.", ""))); }
+    } else if (empty) empty.remove();
+    const rows = new Map([...fl.querySelectorAll(":scope > .flight")].map((r) => [Number(r.dataset.id), r]));
+    if (S.flightHold && rows.size) {
+      for (const f of flights.slice(0, 40)) {
+        let row = rows.get(f.id);
+        if (!row) { row = flightRow(f.id); fl.insertBefore(row, fl.querySelector(":scope > .fl-more")); }
+        rows.delete(f.id);
+        paintFlight(row, f);
+      }
+      for (const r of rows.values()) if (!r.classList.contains("ended")) {
+        r.classList.add("ended");
+        r._parts.acts.replaceChildren(span("finished", "label-sm"));
+        r._parts.cb.disabled = true;
+      }
+    } else {
+      let prev = null;
+      for (const f of flights.slice(0, 40)) {
+        let row = rows.get(f.id);
+        if (!row) row = flightRow(f.id);
+        rows.delete(f.id);
+        paintFlight(row, f);
+        const want = prev ? prev.nextSibling : fl.firstChild;
+        if (row !== want) fl.insertBefore(row, want);
+        prev = row;
+      }
+      for (const r of rows.values()) r.remove();
     }
-    for (const f of flights.slice(0, 8)) {
-      const pre = f.output === 0;
-      const row = h("div", { class: "flight" + (pre ? " prefill" : ""), style: "--hc:" + hostColor(f.host) },
-        h("div", { class: "who" }, h("b", { text: hostName(f.host) }), h("code", { text: f.model })),
-        h("div", { class: "nums" }, pre ? span("reading the prompt…", "state") : document.createTextNode(fmt(f.output)), pre ? null : h("small", { text: " tokens" + (f.tokens_per_sec ? " · " + f.tokens_per_sec.toFixed(1) + " tok/s" : "") })),
-        h("div", { class: "bar" }, h("i")),
-        h("div", { class: "state", text: (f.elapsed_ms / 1000).toFixed(1) + " s" + (f.ttft_ms != null ? " · first token after " + fmt(f.ttft_ms) + " ms" : "") + " · " + f.endpoint.replace(/^\/(v1|api\/v\d)\//, "") }));
-      fl.append(row);
-    }
-    if (flights.length > 8) fl.append(h("div", { class: "label-sm", text: "and " + (flights.length - 8) + " more in flight" }));
-    $("live-sub").textContent = flights.length ? flights.length + " request" + (flights.length === 1 ? "" : "s") + " streaming now" : "Requests streaming through your hosts, and the ones that just finished";
+    let more = fl.querySelector(":scope > .fl-more");
+    if (flights.length > 40) { if (!more) { more = h("div", { class: "label-sm fl-more" }); fl.append(more); } more.textContent = "and " + (flights.length - 40) + " more in flight"; }
+    else if (more) more.remove();
+    paintBulk();
+    paintWhy();
+    const waiting = flights.filter((f) => f.output === 0).length, dups = flights.filter((f) => f.duplicate_of != null || f.joined_to != null).length;
+    $("live-sub").textContent = flights.length ? flights.length + " request" + (flights.length === 1 ? "" : "s") + " in flight" + (waiting ? ", " + waiting + " still reading the prompt" : "") + (dups ? ", " + dups + " retr" + (dups === 1 ? "y" : "ies") : "") + ". Cancel or reroute any of them." : "Requests streaming through your hosts, and the ones that just finished";
     if (!feed || S.feedPaused || (flightsOnly && feed.childElementCount)) return;
     feed.textContent = "";
     const items = (S.feed || []).filter(inScope).slice(0, 30);
@@ -258,8 +516,9 @@ const Dashboard = (() => {
     for (const f of items) {
       const t = new Date(f.finished_at);
       const tags = [];
-      if (f.status >= 400) tags.push(span(f.status === 499 ? "client left" : String(f.status), "tag err"));
-      if (f.cache_hit) tags.push(span("cache hit", "tag hit"));
+      if (f.status >= 400 && !(f.status === 499 && f.note)) tags.push(span(f.status === 499 ? "client left" : String(f.status), "tag err"));
+      if (f.note) tags.push(span(f.note, "tag" + (f.note.startsWith("cancelled") || f.note.startsWith("agent hung up") ? " err" : f.note.startsWith("answered by") ? " hit" : "")));
+      else if (f.cache_hit) tags.push(span("cache hit", "tag hit"));
       if (f.agent) tags.push(span(f.agent, "tag agent"));
       if (f.outcome === "refused") tags.push(span("refused", "tag err"));
       else if (["structured", "substantial", "tool_call"].includes(f.signal)) tags.push(span(f.signal.replace("_", " "), "tag"));

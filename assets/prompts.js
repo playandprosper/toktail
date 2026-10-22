@@ -91,7 +91,7 @@ const Prompts = (() => {
     const cb = h("input", { type: "checkbox", class: "rec-cb", "aria-label": "Select" });
     cb.checked = P.checked.has(id);
     cb.addEventListener("click", (e) => { e.stopPropagation(); if (cb.checked) P.checked.add(id); else P.checked.delete(id); updateBulk(); });
-    const title = n.title || it.preview || (r.captured ? "Saved prompt" : "Not saved (count only)");
+    const title = n.title || it.summary || it.preview || (r.captured ? "Saved prompt" : "Not saved (count only)");
     const row = h("div", { class: "rec-item" + (P.sel === id ? " sel" : "") + (r.captured ? "" : " nofile"), role: "option", tabindex: "0", "data-id": id, "aria-selected": String(P.sel === id) },
       cb,
       h("div", { class: "ri-main" },
@@ -99,6 +99,7 @@ const Prompts = (() => {
           n.starred ? span("★", "star on") : null,
           h("span", { class: "ri-title", text: title }),
           h("span", { class: "ri-time", text: when(r.timestamp) })),
+        it.summary && n.title ? h("div", { class: "ri-summary", title: "Pip's summary", text: "🦊 " + it.summary }) : null,
         h("div", { class: "ri-meta" },
           swatchText(hostName(r.host), hostColorVar(r.host)),
           span(r.model, "ri-model"),
@@ -176,6 +177,7 @@ const Prompts = (() => {
       span(r.endpoint, "label-sm"), span(" · ", "label-sm"),
       span(String(r.status) + (r.status === 499 ? " client left" : ""), "tag" + (r.status >= 400 ? " err" : "")));
     box.append(meta);
+    if (d.summary) box.append(h("div", { class: "rd-summary", title: "Pip's one-sentence summary, written by " + d.summary.model + " " + when(d.summary.at) }, span("🦊", "rd-summary-fox"), span(d.summary.text, "")));
 
     // ---- token counts
     box.append(h("div", { class: "rd-nums" },
@@ -390,7 +392,7 @@ const Prompts = (() => {
     else if (st.pre_v2_bytes > 0) {
       const free = h("button", { type: "button", class: "small", text: "Free " + human(st.pre_v2_bytes) });
       free.addEventListener("click", async () => { free.disabled = true; try { const x = await postJSON("/api/chains/free-space", {}); toast("Freed " + human(x.freed_bytes)); showSessions(); } catch (e) { toast(e.message); free.disabled = false; } });
-      list.append(h("div", { class: "banner" }, h("b", { text: "Migration done. " }), "The pre-0.0.2 originals of " + fmt(m.folded) + " prompts are still on disk, verified against the new chains. ", free));
+      list.append(h("div", { class: "banner" }, h("b", { text: "Migration done. " }), "The pre-0.0.3 originals of " + fmt(m.folded) + " prompts are still on disk, verified against the new chains. ", free));
     }
     const total = r.sessions.reduce((a, s) => a + s.saved_bytes, 0), full = r.sessions.reduce((a, s) => a + s.full_bytes, 0);
     $("sessions-sub").textContent = r.sessions.length ? fmt(r.sessions.length) + " sessions · " + human(total) + " saved of " + human(full) + " (" + (full ? Math.round(100 * total / full) : 0) + "%) by storing only what changed. Every " + st.snapshot_every + "nd link is a full snapshot." : "No sessions yet. Chains form as agents send prompts to a host with saving on.";
@@ -415,24 +417,87 @@ const Prompts = (() => {
     det.textContent = "";
     det.append(h("div", { class: "row-end", style: "justify-content:flex-start" }, h("a", { href: "#/prompts/sessions", class: "btn small", text: "← All sessions" }), h("b", { text: (s.agent || "session") + (s.project ? " · " + s.project : "") }), span(s.id, "label-sm mono")));
     det.append(h("p", { class: "label-sm", text: fmt(s.nodes.length) + " prompts · " + s.heads.length + " branch tip" + (s.heads.length === 1 ? "" : "s") + " · " + human(s.saved_bytes) + " saved of " + human(s.full_bytes) + ". Each node's id is the hash of its parent's id and its own content, so a tip commits to its whole branch." }));
-    // A tree, drawn as an indented list by depth with branch glyphs.
-    const byParent = new Map();
-    for (const n of s.nodes) { const k = n.parent || ""; if (!byParent.has(k)) byParent.set(k, []); byParent.get(k).push(n); }
-    const tree = h("div", { class: "sess-tree" });
-    const walk = (parent, depth) => {
-      for (const n of (byParent.get(parent) || [])) {
-        const kids = (byParent.get(n.node) || []).length;
-        const el = h("div", { class: "sess-node" + (n.missing ? " missing" : "") + (n.snapshot ? " snap" : "") + (s.heads.includes(n.node) ? " head" : ""), style: "--depth:" + depth },
-          span(n.missing ? "✕" : n.snapshot ? "◆" : "●", "glyph"),
-          h("div", { class: "sn-main" },
-            h("div", {}, n.request_id ? h("a", { href: "#/prompts/" + n.request_id, text: n.stem ? n.stem.split("/").pop() : n.content.slice(0, 12) }) : span(n.stem ? n.stem.split("/").pop() : n.content.slice(0, 12), ""), n.missing ? span(" erased", "tag err") : null, kids > 1 ? span(" " + kids + " branches", "tag") : null, s.heads.includes(n.node) ? span(" tip", "tag") : null),
-            span(when(n.created) + " · " + (n.snapshot ? "full copy, " + human(n.size) : human(Math.max(0, n.size - n.prefix)) + " new of " + human(n.size) + " (" + (n.size ? Math.round(100 * n.prefix / n.size) : 0) + "% repeated)") + " · " + n.node.slice(0, 10), "label-sm")));
-        tree.append(el);
-        walk(n.node, depth + 1);
-      }
-    };
-    walk("", 0);
-    det.append(tree);
+    det.append(chainView(s));
+  }
+
+  // A session chain as a flat timeline. The main line (root to the newest
+  // tip) comes first, then each branch from where it forks. Every row shows
+  // its link number instead of being indented by depth, and long straight
+  // runs fold into one row you can open, a page at a time. Chains of
+  // thousands of links stay readable and quick.
+  const RUN_FOLD = 6, PAGE = 200;
+  function chainView(s) {
+    const byId = new Map(s.nodes.map((n) => [n.node, n]));
+    const kids = new Map();
+    for (const n of s.nodes) { const k = n.parent || ""; if (!kids.has(k)) kids.set(k, []); kids.get(k).push(n); }
+    const pathTo = (id, stop) => { const out = []; let cur = byId.get(id); while (cur && !(stop && stop.has(cur.node))) { out.push(cur); cur = cur.parent ? byId.get(cur.parent) : null; } return out.reverse(); };
+    const newest = s.heads[0] || (s.nodes.length ? s.nodes.reduce((a, b) => (a.created > b.created ? a : b)).node : null);
+    const placed = new Set();
+    const segments = [];
+    if (newest) { const main = pathTo(newest); main.forEach((n) => placed.add(n.node)); segments.push({ title: "Main line", fork: null, nodes: main }); }
+    s.heads.slice(1).forEach((hd, i) => {
+      const seg = pathTo(hd, placed);
+      if (!seg.length) return;
+      seg.forEach((n) => placed.add(n.node));
+      segments.push({ title: "Branch " + (i + 2), fork: seg[0].parent ? byId.get(seg[0].parent) : null, nodes: seg });
+    });
+    const rest = s.nodes.filter((n) => !placed.has(n.node)).sort((a, b) => (a.created < b.created ? -1 : 1));
+    if (rest.length) segments.push({ title: "Erased ends", fork: null, nodes: rest });
+
+    const wrap = h("div", { class: "chain" });
+    for (const seg of segments) {
+      const head = h("div", { class: "chain-seg-head" }, h("b", { text: seg.title }), span(fmt(seg.nodes.length) + " link" + (seg.nodes.length === 1 ? "" : "s"), "label-sm"),
+        seg.fork ? span("forks from link " + fmt(seg.fork.depth + 1), "tag") : null);
+      wrap.append(head);
+      const list = h("div", { class: "chain-list" + (seg.fork ? " branch" : "") });
+      renderRuns(list, seg.nodes, s, kids);
+      wrap.append(list);
+    }
+    return wrap;
+  }
+  function plain(n, s, kids) { return !n.missing && !s.heads.includes(n.node) && (kids.get(n.node) || []).length <= 1; }
+  function renderRuns(list, nodes, s, kids) {
+    let i = 0;
+    while (i < nodes.length) {
+      let j = i;
+      while (j < nodes.length && plain(nodes[j], s, kids)) j++;
+      const run = nodes.slice(i, j);
+      if (run.length >= RUN_FOLD) {
+        // Keep the ends of a long straight run visible; fold the middle.
+        list.append(linkRow(run[0], s, kids));
+        list.append(foldRow(run.slice(1, -1), s, kids));
+        list.append(linkRow(run[run.length - 1], s, kids));
+      } else run.forEach((n) => list.append(linkRow(n, s, kids)));
+      if (j < nodes.length) list.append(linkRow(nodes[j], s, kids));
+      i = j + 1;
+    }
+  }
+  function foldRow(run, s, kids) {
+    const fresh = run.reduce((a, n) => a + Math.max(0, n.size - n.prefix), 0), full = run.reduce((a, n) => a + n.size, 0);
+    const first = run[0], last = run[run.length - 1];
+    const row = h("button", { type: "button", class: "chain-fold" },
+      span("⋮", "glyph"),
+      h("span", {}, h("b", { text: "Links " + fmt(first.depth + 1) + "–" + fmt(last.depth + 1) }), span(" · " + fmt(run.length) + " in a straight line · " + human(fresh) + " new of " + human(full) + " · " + when(first.created) + " to " + when(last.created), "label-sm")),
+      span("Show", "chain-fold-cta"));
+    row.addEventListener("click", () => {
+      const frag = document.createDocumentFragment();
+      const shown = run.slice(0, PAGE);
+      shown.forEach((n) => frag.append(linkRow(n, s, kids)));
+      if (run.length > PAGE) frag.append(foldRow(run.slice(PAGE), s, kids));
+      row.replaceWith(frag);
+    });
+    return row;
+  }
+  function linkRow(n, s, kids) {
+    const k = (kids.get(n.node) || []).length;
+    const head = s.heads.includes(n.node);
+    const name = n.stem ? n.stem.split("/").pop() : n.content.slice(0, 12);
+    return h("div", { class: "chain-link" + (n.missing ? " missing" : "") + (n.snapshot ? " snap" : "") + (head ? " head" : "") },
+      span(fmt(n.depth + 1), "chain-num"),
+      span(n.missing ? "✕" : n.snapshot ? "◆" : "●", "glyph"),
+      h("div", { class: "sn-main" },
+        h("div", {}, n.request_id ? h("a", { href: "#/prompts/" + n.request_id, text: name }) : span(name, ""), n.missing ? span(" erased", "tag err") : null, k > 1 ? span(" " + k + " branches", "tag") : null, head ? span(" tip", "tag") : null),
+        span(when(n.created) + " · " + (n.snapshot ? "full copy, " + human(n.size) : human(Math.max(0, n.size - n.prefix)) + " new of " + human(n.size) + " (" + (n.size ? Math.round(100 * n.prefix / n.size) : 0) + "% repeated)") + " · " + n.node.slice(0, 10), "label-sm")));
   }
 
   // ================================================================ chat

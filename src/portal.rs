@@ -26,7 +26,12 @@ use std::sync::Arc;
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const PIP_SVG: &str = include_str!("../assets/pip.svg");
 /// Page scripts and styles, served from memory.
-const ASSETS: [(&str, &str, &str); 17] = [
+const ASSETS: [(&str, &str, &str); 18] = [
+    (
+        "/agents.js",
+        "text/javascript; charset=utf-8",
+        include_str!("../assets/agents.js"),
+    ),
     (
         "/vendor/BufferGeometryUtils.js",
         "text/javascript; charset=utf-8",
@@ -119,6 +124,9 @@ pub fn router(app: Arc<App>) -> Router {
     let mut r = Router::new()
         .route("/", get(index))
         .route("/api/ping", get(ping))
+        .route("/api/status", get(status))
+        .route("/login", get(login))
+        .route("/api/signout", post(sign_out_everywhere))
         .route("/api/meta", get(meta))
         .route("/api/daily", get(daily))
         .route("/api/heatmap", get(heatmap))
@@ -134,7 +142,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/pip/commentary/now", post(commentary_now))
         .route("/api/cache", get(cache_summary))
         .route("/api/cache/clear", post(cache_clear))
-        .route("/api/costs", get(costs));
+        .route("/api/costs", get(costs))
+        .route("/api/host-status", get(host_status));
     for (path, ct, body) in ASSETS {
         r = r.route(
             path,
@@ -146,6 +155,9 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(crate::pip_agent::routes())
         .merge(crate::portal_insights::routes())
         .merge(crate::threads::routes())
+        .merge(crate::flights::routes())
+        .merge(crate::api::portal_routes())
+        .merge(crate::portal_agents::routes())
         .layer(middleware::from_fn_with_state(app.clone(), local_only))
         .with_state(app)
 }
@@ -192,6 +204,34 @@ async fn local_only(State(app): State<Arc<App>>, req: Request, next: Next) -> Re
             "Toktail's portal only answers on this Mac.",
         )
             .into_response();
+    }
+    // Everything but a few read-only counters needs a signed-in browser
+    // (portal_auth.rs): programs on this computer, containers included, can
+    // fake the Host header but can't get the cookie.
+    let path = req.uri().path().to_string();
+    if !crate::portal_auth::is_open_path(&path) {
+        let cookie = req
+            .headers()
+            .get(header::COOKIE)
+            .and_then(|c| c.to_str().ok());
+        if !app.portal_auth.check(cookie) {
+            let mut resp = if path == "/" || path == "/index.html" {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Html(crate::portal_auth::SIGNED_OUT_HTML),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "Signed out: open Toktail from the menu bar (or run `Toktail open`).",
+                )
+                    .into_response()
+            };
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            return resp;
+        }
     }
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
@@ -247,8 +287,90 @@ async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
+#[derive(Debug, Deserialize)]
+struct HostStatusQ {
+    minutes: Option<usize>,
+}
+
+/// Toktail's and this computer's memory, CPU and disk (Settings).
+async fn host_status(
+    State(app): State<Arc<App>>,
+    Query(q): Query<HostStatusQ>,
+) -> Json<serde_json::Value> {
+    Json(crate::hoststatus::snapshot(&app, q.minutes.unwrap_or(10)))
+}
+
 async fn ping() -> Json<serde_json::Value> {
     Json(json!({ "app": "toktail", "version": env!("CARGO_PKG_VERSION") }))
+}
+
+/// Pip's mood and speed, for `make status`. Open without signing in, so it
+/// carries counts only: no projects, prompts or models.
+async fn status(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    let stampede = app.stampede_tps();
+    let (snap, state) = app.pip(5);
+    let ids: Vec<String> = app
+        .config
+        .read()
+        .hosts
+        .iter()
+        .map(|h| h.id.clone())
+        .collect();
+    let hosts: serde_json::Map<String, serde_json::Value> = ids
+        .iter()
+        .map(|id| {
+            let s = app.live_for(id).snapshot(5);
+            let st = crate::live::pip_state(&s, stampede);
+            (
+                id.clone(),
+                json!({ "state": st, "tokens_per_sec": s.tokens_per_sec }),
+            )
+        })
+        .collect();
+    Json(json!({
+        "state": state,
+        "tokens_per_sec": snap.tokens_per_sec,
+        "active_requests": snap.active_requests,
+        "hosts": hosts,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginQ {
+    t: Option<String>,
+    to: Option<String>,
+}
+
+/// `/login?t=<one-time token>&to=#/page`: signs this browser in and opens the
+/// page. A used, old or made-up token gets the signed-out page.
+async fn login(State(app): State<Arc<App>>, Query(q): Query<LoginQ>) -> Response {
+    let ok = q.t.as_deref().is_some_and(|t| app.portal_auth.redeem(t));
+    if !ok {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::CACHE_CONTROL, "no-store")],
+            Html(crate::portal_auth::SIGNED_OUT_HTML),
+        )
+            .into_response();
+    }
+    let cookie = app.portal_auth.start_session();
+    let to =
+        q.to.filter(|t| t.starts_with("#/") && !t.contains(['\r', '\n']))
+            .unwrap_or_default();
+    let location = format!("/{to}");
+    let mut resp = (StatusCode::SEE_OTHER, [(header::LOCATION, location)]).into_response();
+    if let Ok(v) = HeaderValue::from_str(&crate::portal_auth::PortalAuth::cookie_header(&cookie)) {
+        resp.headers_mut().insert(header::SET_COOKIE, v);
+    }
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
+}
+
+/// Signs every browser out, this one included.
+async fn sign_out_everywhere(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    app.portal_auth.sign_out_all();
+    Json(json!({ "ok": true }))
 }
 
 async fn meta(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
@@ -453,7 +575,7 @@ async fn live(State(app): State<Arc<App>>, Query(q): Query<LiveQ>) -> Json<serde
         .collect();
     let (in_flight, finished, seq) = app.activity.snapshot(q.since.unwrap_or(0), 60);
     Json(json!({
-        "activity": { "in_flight": in_flight, "finished": finished, "seq": seq },
+        "activity": { "in_flight": in_flight, "finished": finished, "seq": seq, "stacks": app.activity.stacks() },
         "state": state,
         "per_second": snap.per_second,
         "tokens_per_sec": snap.tokens_per_sec,

@@ -2,13 +2,14 @@
 // Toktail portal: pages, header status, theme, and refreshes.
 //   #/dashboard            the dashboard (default)
 //   #/prompts[/<id>|/chat] saved prompts and responses, and chat
+//   #/agents[/<id>]        roc's coding sessions and autopilot
 //   #/models[/<model>]     per-model speed, wait, errors and cost
 //   #/savings              hardware, lifecycle and savings
 //   #/settings[/<section>] settings
 "use strict";
 
 const Main = (() => {
-  const PAGES = ["dashboard", "prompts", "models", "savings", "settings"];
+  const PAGES = ["dashboard", "prompts", "agents", "models", "savings", "settings"];
 
   function parse() {
     const parts = location.hash.replace(/^#\/?/, "").split("/");
@@ -27,6 +28,7 @@ const Main = (() => {
     if (changed) scrollTo({ top: 0 });
     if (page === "dashboard") { if (changed && S.meta) { S.animate = false; Dashboard.render(); } }
     else if (page === "prompts") await Prompts.show(sub);
+    else if (page === "agents") await Agents.show(sub);
     else if (page === "models") await Models.show(sub);
     else if (page === "savings") await Savings.show();
     else if (page === "settings") await Settings.show(sub);
@@ -42,7 +44,7 @@ const Main = (() => {
     ph.className = "pill clickable " + (enabled.length && ok.length === enabled.length ? "ok" : "bad");
     ph.lastChild.textContent = enabled.length === 1
       ? (ok.length ? "Counting on port " + enabled[0].listen.split(":").pop() : enabled[0].name + ": " + (!enabled[0].proxy_ok ? "proxy down" : "LM Studio unreachable"))
-      : ok.length + " of " + enabled.length + " hosts counting";
+      : ok.length + " of " + enabled.length + " hosts";
     ph.title = enabled.map((x) => (x.proxy_ok && x.lmstudio.ok ? "✓ " : "⚠ ") + x.name + ": localhost:" + x.listen.split(":").pop() + " → " + x.upstream + (x.lmstudio.ok ? "" : " (" + (x.proxy_ok ? x.lmstudio.message : x.proxy_message) + ")")).join("\n") + "\nClick to manage hosts";
     const ps = $("pill-s3");
     if (!m.s3.enabled) { ps.className = "pill"; ps.lastChild.textContent = "S3 off"; ps.title = "Turn on the S3 mirror in Settings"; }
@@ -51,7 +53,7 @@ const Main = (() => {
     else { ps.className = "pill"; ps.lastChild.textContent = m.s3.in_progress ? "S3 syncing" : "S3 waiting"; ps.title = m.s3.target; }
     $("btn-sync").hidden = !m.s3.enabled;
     if (m.demo && !document.querySelector(".sample-badge")) $("nav").after(h("span", { class: "sample-badge", text: "SAMPLE DATA", title: "make demo: pretend hosts, made-up history and traffic" }));
-    $("btn-theme").textContent = isDark() ? "Light mode" : "Dark mode";
+    $("btn-theme").textContent = isDark() ? "🌕" : "🌑";
   }
 
   async function refresh() {
@@ -119,6 +121,7 @@ const Main = (() => {
     Prompts.init();
     Models.init();
     Savings.init();
+    Agents.init();
     Palette.init();
     $("btn-alerts").addEventListener("click", (e) => { e.stopPropagation(); toggleAlerts(); });
     document.addEventListener("click", (e) => { if (!$("alerts-pop").hidden && !e.target.closest("#alerts-pop")) toggleAlerts(false); });

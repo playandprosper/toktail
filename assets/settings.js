@@ -7,8 +7,8 @@
 const Settings = (() => {
   let st = null;
   const SECTIONS = [
-    ["hosts", "Hosts"], ["cache", "Prompt cache"], ["capture", "Saving prompts"], ["encryption", "Encryption"], ["s3", "S3 mirror"],
-    ["budgets", "Budgets & alerts"], ["pip", "Pip & menu bar"], ["costs", "Cost comparison"], ["hardware", "Hardware"], ["api", "Metrics & API"],
+    ["hosts", "Hosts"], ["flights", "In flight"], ["cache", "Prompt cache"], ["capture", "Saving prompts"], ["encryption", "Encryption"], ["s3", "S3 mirror"],
+    ["budgets", "Budgets & alerts"], ["pip", "Pip & menu bar"], ["costs", "Cost comparison"], ["hardware", "Hardware"], ["autopilot", "Autopilot"], ["api", "API & MCP"], ["host", "This computer"],
   ];
 
   let bud = null;
@@ -51,7 +51,7 @@ const Settings = (() => {
     const nav = $("settings-nav"); nav.textContent = "";
     for (const [id, name] of SECTIONS) nav.append(h("a", { href: "#/settings/" + id, text: name }));
     const body = $("settings-body"); body.textContent = "";
-    body.append(hostsSection(), cacheSection(), captureSection(), encryptionSection(), s3Section(), budgetsSection(), pipSection(), costsSection(), hardwareSection(), apiSection());
+    body.append(hostsSection(), flightsSection(), cacheSection(), captureSection(), encryptionSection(), s3Section(), budgetsSection(), pipSection(), costsSection(), hardwareSection(), autopilotSection(), apiSection(), hostSection());
     body.append(h("p", { class: "label-sm" }, "Settings live in " + st.config_file + ". Secrets are in your " + (st.secret_store || "Keychain") + ". Your CSV is in " + st.data_dir + ". ", h("button", { type: "button", class: "small", text: "Open the folder", onclick: () => getJSON("/api/open-data-folder", { method: "POST" }).catch((e) => toast(e.message)) })));
     if ((typeof Stage !== "undefined")) Stage.platformsChanged();
   }
@@ -191,6 +191,17 @@ const Settings = (() => {
     summary.addEventListener("click", () => row.classList.toggle("open"));
     row.append(summary, form);
     return row;
+  }
+
+  // ---------------------------------------------------------------- in flight
+  function flightsSection() {
+    const c = st.flights || { join_duplicates: true, abandoned_grace_secs: 180 };
+    const sec = section("flights", "Requests in flight", "Coding agents pile requests up: a long prompt is still being read when the agent times out and sends it again, and subagents queue behind each other. On the dashboard's Right now card you can cancel any request, reroute one that hasn't started answering to another host and model, or let it share an identical request's answer.");
+    const join = toggleField("When an agent sends the same prompt again, answer it with the one already being read", "Same host, model, prompt, tools and key (a retry may change settings like max_tokens or temperature). LM Studio reads one prompt at a time per model, so a resent prompt would otherwise wait in line and be read all over again. The latest attempt gets the original's answer, streamed from the start.", c.join_duplicates);
+    const grace = numberField("When an agent stops waiting, keep its request (and its finished answer) for", "Long enough for the agent's retry to arrive and pick up the answer, even if the answer finished in the meantime. If no retry comes, Toktail stops it on the model server. 0 stops it at once.", c.abandoned_grace_secs, "10", "seconds", 0, 3600);
+    sec.append(join.row, grace.row);
+    saveRow(sec, "Save", (msg) => post({ flights: { join_duplicates: join.input.checked, abandoned_grace_secs: num(grace.input) } }, msg));
+    return sec;
   }
 
   // ---------------------------------------------------------------- prompt cache
@@ -364,11 +375,17 @@ const Settings = (() => {
     const anim = toggleField("Animate Pip in the menu bar", "Off keeps Pip still in the menu bar: awake while tokens flow, asleep otherwise.", st.app.animate_menu_bar);
     const count = toggleField("Show today's count in the menu bar", null, st.app.show_count_in_menu_bar);
     const stamp = numberField("Stampede at", "0 means automatic: three times your usual speed.", st.app.stampede_tokens_per_sec, "10", "tokens/sec");
+    const sm = st.summaries || { enabled: true, bubbles: true, max_queue: 200, status: {} };
+    const sums = toggleField("Summarize every prompt in one sentence", "For each prompt that goes to an LM Studio host on your network, Pip asks the same model, while it has nothing else to do, what the prompt is (\u201cSends back the output of go test, which has two failures.\u201d). The sentence is kept with the request, searchable on the Prompts page and readable through the API, sealed like your saved records. The same prompt sent again is summarized once. Never for public API hosts.", sm.enabled);
+    const bub = toggleField("Pip says each summary in its speech bubble", "Watch what your agents are doing as it happens. Off: Pip's bubbles go back to its whimsical commentary below.", sm.bubbles);
+    const q = numberField("Prompts waiting for a summary", "When agents keep the model busy, the oldest waiting ones are skipped.", sm.max_queue, "10", "", 1, 10000);
+    const ss = sm.status || {};
+    const sline = h("div", { class: "label-sm cache-stat", text: fmt(ss.stored || 0) + " summaries kept · " + fmt(ss.queued || 0) + " waiting · since launch: " + fmt(ss.done_since_start || 0) + " written, " + fmt(ss.dropped_since_start || 0) + " skipped, " + fmt(ss.failed_since_start || 0) + " failed" });
     const cm = st.commentary || { enabled: true, every_minutes: 5 };
-    const talk = toggleField("Let Pip comment on what your agents are doing", "When opencode, Claude Code, Codex, Goose or roc send a prompt to an LM Studio host on your network, Pip asks that same local model for one whimsical sentence about it and says it in a speech bubble. Never for public API hosts; nothing leaves your network. Press u or Space on the dashboard to ask Pip right away.", cm.enabled);
+    const talk = toggleField("Let Pip comment on what your agents are doing", "When opencode, Claude Code, Codex, Goose or roc send a prompt to an LM Studio host on your network, Pip asks that same local model for one whimsical sentence about it and says it in a speech bubble (when summaries aren't in the bubbles). Never for public API hosts; nothing leaves your network. Press u or Space on the dashboard to ask Pip right away.", cm.enabled);
     const every = numberField("At most once every", "Pip waits this long between comments.", cm.every_minutes, "1", "minutes", 1, 1440);
-    sec.append(intro.row, roams.row, anim.row, count.row, stamp.row, talk.row, every.row);
-    saveRow(sec, "Save", (msg) => post({ portal: { intro_animation: intro.input.checked, pip_roams: roams.input.checked }, app: { animate_menu_bar: anim.input.checked, show_count_in_menu_bar: count.input.checked, stampede_tokens_per_sec: num(stamp.input) }, commentary: { enabled: talk.input.checked, every_minutes: num(every.input) } }, msg).then(() => { if ((typeof Stage !== "undefined")) Stage.applySettings(); }));
+    sec.append(intro.row, roams.row, anim.row, count.row, stamp.row, sums.row, bub.row, q.row, sline, talk.row, every.row);
+    saveRow(sec, "Save", (msg) => post({ portal: { intro_animation: intro.input.checked, pip_roams: roams.input.checked }, app: { animate_menu_bar: anim.input.checked, show_count_in_menu_bar: count.input.checked, stampede_tokens_per_sec: num(stamp.input) }, summaries: { enabled: sums.input.checked, bubbles: bub.input.checked, max_queue: Math.round(num(q.input) || 200) }, commentary: { enabled: talk.input.checked, every_minutes: num(every.input) } }, msg).then(() => { if ((typeof Stage !== "undefined")) Stage.applySettings(); }));
     return sec;
   }
 
@@ -464,16 +481,258 @@ const Settings = (() => {
   }
 
   // ---------------------------------------------------------------- metrics and API
-  function apiSection() {
-    const sec = section("api", "Metrics and API", "Everything the portal shows comes from a local JSON API, and Toktail also speaks Prometheus. Both answer only on this computer.");
-    const base = location.origin;
-    sec.append(field("Prometheus", "Scrape this from a Prometheus or Grafana Agent running on this computer: tokens, requests and errors per host and model, live tokens/sec, requests in flight, host health and budget use.", h("code", { class: "metrics-url", text: base + "/metrics" }), { stack: true }));
-    const scrape = "scrape_configs:\n  - job_name: toktail\n    static_configs:\n      - targets: ['" + location.host + "']";
-    sec.append(h("details", { class: "params" }, h("summary", { text: "prometheus.yml example" }), h("pre", { text: scrape })));
-    const eps = [["/api/meta", "hosts, models, totals and status"], ["/api/daily?from=&to=&hosts=&models=", "tokens per day, host and model"], ["/api/live", "live tokens/sec, mood, requests in flight and just finished"], ["/api/models/stats", "per-model speed, wait, errors and cloud value"], ["/api/budgets", "budgets with use and projection"], ["/api/pip/usage?period=last%20month&host=studio", "exact totals, the same numbers Pip uses"], ["/api/pip/facts?q=…", "what Pip would look up for a question"], ["/api/export.csv", "the raw CSV for a range"]];
-    const t = table([{ h: "Endpoint", l: true, v: (r) => h("a", { href: r[0], target: "_blank", rel: "noopener", text: r[0] }) }, { h: "What", l: true, v: (r) => r[1] }], eps);
-    sec.append(h("h3", { text: "JSON endpoints" }), h("div", { class: "tbl" }, t));
+  // ---------------------------------------------------------------- autopilot
+  // What Toktail sends to a roc coding session on your behalf (autopilot.rs).
+  function autopilotSection() {
+    const sec = section("autopilot", "Autopilot", "Autopilot keeps a coding agent that roc runs working until you stop it (Agents page, or ask Pip). Everything it sends is written here, in your words; it never adds anything of its own.");
+    const body = h("div", {}, h("div", { class: "label-sm", text: "Loading…" }));
+    sec.append(body);
+    getJSON("/api/agents/settings").then((r) => renderAutopilot(body, r)).catch((e) => { body.textContent = "⚠ " + e.message; });
     return sec;
+  }
+  function areaField(label, hint, value, rows) {
+    const t = h("textarea", { class: "wide", rows: String(rows || 5), spellcheck: "true" });
+    t.value = value || "";
+    return { row: field(label, hint, t, { stack: true }), input: t };
+  }
+  function renderAutopilot(body, r) {
+    const c = r.settings, d = r.defaults;
+    body.textContent = "";
+    const marks = "{{goal}} becomes the goal you give a run, {{verifier}} the verifier's output, {{turn}} the prompt's number and {{done_claims}} how often the agent has said it's done.";
+    const cont = areaField("When the agent stops without saying it's done", "Sent after the session has been quiet for the wait below. " + marks, c.continue_template, 5);
+    const done = areaField("When the agent says it's done", "Sent instead when its last reply says the work is finished. Firm and specific works better than harsh: it goes out in your name. Tell it how to reach you: " + r.need_human + " and the reason.", c.done_template, 6);
+    const reset = (f, v) => { const b = h("button", { type: "button", class: "small", text: "Use the default" }); b.addEventListener("click", () => { f.input.value = v; }); return b; };
+    cont.row.append(h("div", { class: "row-end" }, reset(cont, d.continue_template)));
+    done.row.append(h("div", { class: "row-end" }, reset(done, d.done_template)));
+    const ver = textField("Verifier command", "Optional. Runs inside the agent's container, in its working directory, before each prompt; its output becomes {{verifier}}. A script that lists the files not yet meeting your skills turns \"not done\" into a work list.", c.verifier_command, "e.g. make audit, or ./scripts/unfinished.sh");
+    const verT = numberField("Verifier time limit", "", c.verifier_timeout_secs, "1", "seconds", 5, 3600);
+    const verN = numberField("Verifier output kept", "Longer output is cut.", c.verifier_max_chars, "100", "characters", 200, 100000);
+    const grace = numberField("Wait before answering", "How long the session must be quiet first.", c.grace_secs, "1", "seconds", 5, 3600);
+    const silence = numberField("Silence", "With no new message for this long, autopilot tries again after a prompt that got no answer, and tells you when a busy session looks stuck. Prompt reading on a big local model can take a while.", c.silence_minutes, "1", "minutes", 1, 1440);
+    const qWait = numberField("Answer questions for me after", "If you haven't answered an agent's question by then, autopilot sends the default answer below (and marks it). 0 = always wait for you.", c.question_timeout_minutes, "1", "minutes", 0, 10080);
+    const qAns = textField("Default answer", "", c.question_default_answer, "");
+    const turns = numberField("Prompts per run", "0 = until you stop it.", c.max_turns, "1", "", 0, 100000);
+    const ceil = numberField("Token ceiling per run", "Input + output Toktail counts for the session's model while the run lasts (only when roc goes through a Toktail port). 0 = none.", c.token_ceiling, "1000000", "tokens", 0);
+    const rep = numberField("Pause after identical replies", "In a row, with no work in between.", c.repeat_limit, "1", "", 2, 100);
+    const err = numberField("Stop after failed turns", "In a row (model errors, empty replies); autopilot says what to fix.", c.error_limit, "1", "", 1, 100);
+    const dc = numberField("Tell me after “I'm done” replies", "In a row; autopilot keeps going, but you may want to look in. 0 = never.", c.done_claims_alert, "1", "", 0, 1000);
+    const state = textField("roc's state file", "Found: " + r.found.roc_state, c.roc_state, "~/.local/roc/state.json");
+    const roc = textField("roc command", "For “End the roc session”. Found: " + r.found.roc, c.roc_command, "roc");
+    const docker = textField("docker command", "For the verifier. Found: " + r.found.docker, c.docker_command, "docker");
+    body.append(h("h3", { text: "What autopilot says" }), cont.row, done.row, ver.row, verT.row, verN.row,
+      h("h3", { text: "When" }), grace.row, silence.row, qWait.row, qAns.row,
+      h("h3", { text: "Limits" }), turns.row, ceil.row, rep.row, err.row, dc.row,
+      h("details", { class: "params" }, h("summary", { text: "Where roc is" }), state.row, roc.row, docker.row));
+    saveRow(body, "Save", async (msg) => {
+      const n = (i, dflt) => { const v = num(i); return v === undefined ? dflt : Math.round(v); };
+      const r2 = await postJSON("/api/agents/settings", {
+        roc_state: state.input.value.trim(), roc_command: roc.input.value.trim(), docker_command: docker.input.value.trim(),
+        grace_secs: n(grace.input, 60), silence_minutes: n(silence.input, 10),
+        continue_template: cont.input.value, done_template: done.input.value,
+        verifier_command: ver.input.value.trim(), verifier_timeout_secs: n(verT.input, 600), verifier_max_chars: n(verN.input, 6000),
+        max_turns: n(turns.input, 0), token_ceiling: n(ceil.input, 0), repeat_limit: n(rep.input, 3), error_limit: n(err.input, 3),
+        done_claims_alert: n(dc.input, 5), question_timeout_minutes: n(qWait.input, 15), question_default_answer: qAns.input.value,
+      });
+      msg.dataset.ok = "1"; msg.textContent = "✓ Saved";
+      setTimeout(() => renderAutopilot(body, r2), 900);
+    });
+  }
+
+  // ---------------------------------------------------------------- this computer
+  // Toktail's own memory and CPU, and how the computer it runs on is doing
+  // (hoststatus.rs). Sampled every 2 s, kept an hour, drawn live.
+  let hostTimer = null;
+  function hostSection() {
+    const sec = section("host", "This computer", "How much Toktail itself uses, and how the computer it runs on is doing. Sampled every 2 seconds and kept for an hour, in memory only.");
+    const range = h("div", { class: "seg", role: "group", "aria-label": "Range" });
+    let minutes = 10;
+    for (const [m, t] of [[10, "10 min"], [60, "1 hour"]]) {
+      const b = h("button", { type: "button", text: t, "aria-pressed": String(m === minutes) });
+      b.addEventListener("click", () => { minutes = m; for (const x of range.children) x.setAttribute("aria-pressed", String(x === b)); tick(); });
+      range.append(b);
+    }
+    const grid = h("div", { class: "hs-grid" });
+    const info = h("div", { class: "label-sm hs-info" });
+    const disk = h("div", { class: "hs-disk" });
+    sec.querySelector(".card-head").append(h("div", { class: "actions" }, range));
+    sec.append(grid, info, disk);
+    let shown = false;
+    async function tick() {
+      // Stop once the section has left the page (it starts out not yet on it).
+      if (!sec.isConnected) { if (shown) { clearInterval(hostTimer); hostTimer = null; } return; }
+      shown = true;
+      if (document.hidden) return;
+      let r;
+      try { r = await getJSON("/api/host-status?minutes=" + minutes); } catch (e) { info.textContent = "⚠ " + e.message; return; }
+      drawHost(grid, info, disk, r);
+    }
+    clearInterval(hostTimer);
+    hostTimer = setInterval(tick, 2000);
+    setTimeout(tick, 50);
+    return sec;
+  }
+  const bytes = (n) => { const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0, v = n || 0; while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; } return (i ? v.toFixed(v >= 100 ? 0 : 1) : v) + " " + u[i]; };
+  function spark(values, max, cls) {
+    const W = 260, H = 54, n = values.length;
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("class", "hs-spark " + cls); svg.setAttribute("preserveAspectRatio", "none");
+    if (n < 2) return svg;
+    const top = Math.max(max || 0, ...values, 1e-9);
+    const pts = values.map((v, i) => [(i / (n - 1)) * W, H - 2 - (Math.max(0, v) / top) * (H - 6)]);
+    const line = pts.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ");
+    const area = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+    area.setAttribute("points", `0,${H} ${line} ${W},${H}`); area.setAttribute("class", "area");
+    const pl = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+    pl.setAttribute("points", line); pl.setAttribute("class", "line");
+    svg.append(area, pl);
+    return svg;
+  }
+  function tile(title, value, sub, values, max, cls) {
+    return h("div", { class: "hs-tile" }, h("div", { class: "label-sm", text: title }), h("div", { class: "hs-value", text: value }), sub ? h("div", { class: "label-sm", text: sub }) : null, spark(values, max, cls));
+  }
+  function drawHost(grid, info, disk, r) {
+    const s = r.series || [], now = r.now;
+    grid.textContent = "";
+    if (!now) { grid.append(h("div", { class: "label-sm", text: "Measuring…" })); return; }
+    const peak = (k) => Math.max(...s.map((x) => x[k] || 0));
+    grid.append(
+      tile("Toktail's memory", bytes(now.rss), "peak " + bytes(peak("rss")) + " · " + (now.threads ? now.threads + " threads" : ""), s.map((x) => x.rss), 0, "lav"),
+      tile("Toktail's CPU", now.cpu.toFixed(1) + "%", "of one core · " + now.in_flight + " request" + (now.in_flight === 1 ? "" : "s") + " in flight", s.map((x) => x.cpu), 100, "lav"),
+      tile("Memory in use", bytes(now.mem_used) + " of " + bytes(now.mem_total), Math.round(100 * now.mem_used / Math.max(1, now.mem_total)) + "% · swap " + bytes(now.swap_used) + (now.swap_total ? " of " + bytes(now.swap_total) : ""), s.map((x) => x.mem_used), now.mem_total, "mint"),
+      tile("CPU", now.sys_cpu.toFixed(0) + "%", "all " + r.system.cpus + " cores" + (r.system.load ? " · load " + r.system.load.map((x) => x.toFixed(2)).join(" ") : ""), s.map((x) => x.sys_cpu), 100, "mint"),
+      now.pressure == null ? null : tile("Memory pressure", pressureWord(now.pressure, r.system.pressure_kind), r.system.pressure_kind, s.map((x) => x.pressure || 0), 100, now.pressure >= 50 ? "bad" : "mint"));
+    info.textContent = [r.system.os, r.system.host, "up " + Math.round((r.system.uptime_secs || 0) / 3600) + " h", "Toktail " + r.toktail.version + " (pid " + r.toktail.pid + ")", s.length + " samples"].filter(Boolean).join(" · ");
+    disk.textContent = "";
+    if (r.disk && r.disk.total != null) {
+      const rows = ["history", "records", "cache", "summaries", "market"].filter((k) => r.disk[k]).map((k) => [k, r.disk[k]]);
+      disk.append(h("h3", { text: "Disk: " + bytes(r.disk.total) }), h("div", { class: "tbl" }, table([{ h: "What", l: true, v: (x) => ({ history: "Token history (CSV)", records: "Saved prompts and responses", cache: "Prompt cache", summaries: "Pip's summaries", market: "Market prices" })[x[0]] }, { h: "Size", v: (x) => bytes(x[1].bytes) }, { h: "Folder", l: true, v: (x) => h("code", { text: x[1].path }) }], rows)));
+    }
+  }
+  function pressureWord(p, kind) {
+    if (kind.startsWith("macOS")) return p >= 100 ? "Critical" : p >= 50 ? "Warning" : "Normal";
+    return p.toFixed(1) + "% stalled";
+  }
+
+  // ---------------------------------------------------------------- API & MCP
+  // Toktail's API (/api/v1, OpenAPI) and MCP server (/mcp) on their own port,
+  // with keys (api.rs). Prometheus stays on the portal at /metrics.
+  function apiSection() {
+    const sec = section("api", "API & MCP", "Let other apps and AI clients use your Toktail: a documented REST API and an MCP server with the same operations, on a port of their own. Open WebUI, Claude Code or your own scripts can ask about your tokens and read your saved prompts from wherever they run. Every request needs a key you issue here; nothing here can change Toktail or drive an agent.");
+    const body = h("div", { class: "api-body" }, h("div", { class: "label-sm", text: "Loading…" }));
+    sec.append(body);
+    const load = () => getJSON("/api/api-settings").then((a) => renderApi(body, a)).catch((e) => { body.textContent = "⚠ " + e.message; });
+    load();
+    // Prometheus and the portal's sign-in stay here too.
+    const base = location.origin;
+    const prom = h("div", { class: "api-prom" },
+      h("h3", { text: "Prometheus" }),
+      field("Metrics", "Scrape this from a Prometheus or Grafana Agent on this computer: tokens, requests and errors per host and model, live tokens/sec, requests in flight, host health and budget use. It answers without signing in and holds counts only.", h("code", { class: "metrics-url", text: base + "/metrics" }), { stack: true }),
+      h("details", { class: "params" }, h("summary", { text: "prometheus.yml example" }), h("pre", { text: "scrape_configs:\n  - job_name: toktail\n    static_configs:\n      - targets: ['" + location.host + "']" })));
+    const out = h("button", { type: "button", class: "small danger", text: "Sign out every browser" });
+    out.addEventListener("click", async () => {
+      if (!(await confirmBox("Sign out every browser?", "Every browser signed in to this portal, this one included, has to be opened again from the menu bar (or with Toktail open).", "Sign out", true))) return;
+      try { await getJSON("/api/signout", { method: "POST" }); location.reload(); } catch (e) { toast(e.message); }
+    });
+    sec.append(prom, h("h3", { text: "Portal sign-in" }), h("div", { class: "hint", text: "The portal only opens for browsers you opened from the menu bar or with Toktail open, so programs on this computer (coding agents in containers included) can't read your prompts or change these settings." }), h("div", { class: "row-end" }, out));
+    return sec;
+  }
+
+  const WHERE = [["local", "On this computer"], ["docker", "In Docker on this computer (Open WebUI's usual setup)"], ["network", "On another machine"]];
+  function apiBase(a, where) {
+    if (where === "docker") return a.urls.docker;
+    if (where === "network") return a.urls.network || ("http://<this computer's address>:" + a.port);
+    return a.urls.this_computer;
+  }
+
+  function renderApi(body, a) {
+    body.textContent = "";
+    const status = h("div", { class: "label-sm api-status", text: (a.status.startsWith("listening") ? "✓ " : a.status === "off" ? "" : "⚠ ") + "API and MCP: " + a.status });
+    const en = toggleField("Turn on the API and MCP server", "Off closes the port.", a.enabled);
+    const port = numberField("Port", "Separate from the portal's. Keys work the same on any port.", a.port, "1", "", 1024, 65535);
+    const lan = toggleField("Let other machines connect", "Listens on your network as well as this computer. Each key still says whether it works from the network.", a.allow_network);
+    const encrypted = a.encryption_mode !== "off";
+    const bodies = toggleField("Let keys with the records scope read whole prompts and responses", encrypted
+      ? "Your saved records are encrypted. Off: those keys get the metadata, chain positions and short snippets. On: whole text, decrypted for them. Whatever reads it (Open WebUI keeps its chats in its own database) stores it unencrypted."
+      : "Your saved records aren't encrypted, so records keys already get whole text; this matters only if you turn encryption on.", a.decrypted_bodies);
+    bodies.input.disabled = !encrypted;
+    body.append(status, en.row, port.row, lan.row, bodies.row);
+    saveRow(body, "Save", async (msg) => {
+      const r = await postJSON("/api/api-settings", { enabled: en.input.checked, port: Math.round(num(port.input) || a.port), allow_network: lan.input.checked, decrypted_bodies: bodies.input.checked });
+      msg.dataset.ok = "1"; msg.textContent = "✓ Saved";
+      renderApi(body, r);
+    });
+
+    // Keys
+    const list = h("div", { class: "gw-list api-keys" });
+    for (const k of a.keys) list.append(keyRow(body, a, k));
+    if (!a.keys.length) list.append(h("div", { class: "label-sm", text: "No keys yet. Connect a client to make one." }));
+    const connect = h("button", { type: "button", class: "primary", text: "Connect a client…" });
+    connect.addEventListener("click", () => connectClient(body, a));
+    body.append(h("h3", { text: "Keys" }), h("div", { class: "hint", text: "read: usage, models, costs, savings, budgets, hosts, what's live. records: saved prompts and responses, and their session chains. Toktail keeps only a hash of each key." }), list, h("div", { class: "row-end" }, connect));
+
+    // What's on offer
+    const t = table([{ h: "Tool / endpoint", l: true, v: (o) => h("code", { text: o.name }) }, { h: "REST", l: true, v: (o) => o.path }, { h: "Scope", l: true, v: (o) => o.scope }], a.tools);
+    body.append(h("details", { class: "params" }, h("summary", { text: a.tools.length + " operations (MCP tools and REST endpoints)" }),
+      h("p", { class: "hint" }, "OpenAPI document: ", h("code", { text: a.urls.this_computer + a.urls.openapi_path }), ". MCP: ", h("code", { text: a.urls.this_computer + a.urls.mcp_path }), "."),
+      h("div", { class: "tbl" }, t)));
+  }
+
+  function keyRow(body, a, k) {
+    const scopes = h("span", { class: "api-scopes" });
+    for (const sc of a.scopes) {
+      const c = h("input", { type: "checkbox" }); c.checked = k.scopes.includes(sc);
+      c.addEventListener("change", async () => {
+        const want = a.scopes.filter((x) => x === sc ? c.checked : k.scopes.includes(x));
+        try { const r = await postJSON("/api/api-keys/" + encodeURIComponent(k.id), { scopes: want }); renderApi(body, r); } catch (e) { c.checked = !c.checked; toast(e.message); }
+      });
+      scopes.append(h("label", { class: "inline" }, c, " " + sc));
+    }
+    const net = h("input", { type: "checkbox" }); net.checked = k.network;
+    net.addEventListener("change", async () => {
+      try { const r = await postJSON("/api/api-keys/" + encodeURIComponent(k.id), { network: net.checked }); renderApi(body, r); } catch (e) { net.checked = !net.checked; toast(e.message); }
+    });
+    const rm = h("button", { type: "button", class: "small danger", text: "Revoke" });
+    rm.addEventListener("click", async () => {
+      if (!(await confirmBox("Revoke " + (k.label || k.id) + "?", "Apps using this key stop working at once.", "Revoke", true))) return;
+      try { renderApi(body, await getJSON("/api/api-keys/" + encodeURIComponent(k.id), { method: "DELETE" })); } catch (e) { toast(e.message); }
+    });
+    const used = k.last_used ? "used " + ago(k.last_used) + (k.last_from ? " from " + k.last_from : "") : "not used yet";
+    return h("div", { class: "gw-row api-key" }, h("code", { text: k.id }), span(k.label || "", ""), scopes, h("label", { class: "inline" }, net, " from the network"), span(used, "label-sm"), rm);
+  }
+
+  async function connectClient(body, a) {
+    const label = h("input", { type: "text", class: "wide", value: "Open WebUI", placeholder: "What it's for" });
+    const where = h("select"); for (const [v, t] of WHERE) where.append(h("option", { value: v, text: t }));
+    const read = h("input", { type: "checkbox" }); read.checked = true;
+    const recs = h("input", { type: "checkbox" }); recs.checked = true;
+    const form = h("div", { class: "connect-form" },
+      field("Name", "Shown next to the key here.", label, { stack: true }),
+      field("Where does it run?", "Decides the address to use, and whether the key works from the network.", where, { stack: true }),
+      h("div", { class: "row" }, h("span", { class: "row-label", text: "It may see" }), h("span", {}, h("label", { class: "inline" }, read, " read (counts)"), " ", h("label", { class: "inline" }, recs, " records (saved prompts)"))));
+    const ok = await modal("Connect a client", form, [{ label: "Cancel", value: false }, { label: "Make a key", value: true, cls: "primary" }]);
+    if (!ok) return;
+    const w = where.value;
+    const scopes = [read.checked ? "read" : null, recs.checked ? "records" : null].filter(Boolean);
+    let r;
+    try {
+      if (w === "network" && !a.allow_network) a = await postJSON("/api/api-settings", { allow_network: true });
+      r = await postJSON("/api/api-keys", { label: label.value, scopes, network: w === "network" });
+    } catch (e) { return toast(e.message); }
+    renderApi(body, r.settings);
+    const base = apiBase(r.settings, w);
+    const mcp = base + "/mcp", spec = base + "/api/v1/openapi.json";
+    const copyRow = (text, what) => { const b = h("button", { type: "button", class: "small", text: "Copy" }); b.addEventListener("click", () => navigator.clipboard && navigator.clipboard.writeText(text).then(() => toast(what + " copied"))); return h("div", { class: "with-btn" }, h("code", { class: "gw-key", text: text }), b); };
+    const claude = "claude mcp add --transport http toktail " + mcp + ' --header "Authorization: Bearer ' + r.key + '"';
+    const steps = h("div", { class: "connect-done" },
+      h("p", { class: "label-sm", text: "Copy the key now. Toktail keeps only a hash and can't show it again." }),
+      copyRow(r.key, "Key"),
+      h("h4", { text: "Open WebUI (0.6.31 or later, as an admin)" }),
+      h("ol", {}, h("li", { text: "Settings → Admin → Integrations → External Tool Servers → + Add Connection." }), h("li", { text: "Type: MCP (Streamable HTTP)." }), h("li", {}, "Server URL: ", copyRow(mcp, "URL")), h("li", { text: "Auth: Bearer, and paste the key into Key. Save." })),
+      h("h4", { text: "Anything that reads OpenAPI" }), copyRow(spec, "OpenAPI URL"),
+      h("h4", { text: "Claude Code" }), copyRow(claude, "Command"),
+      w === "network" && !r.settings.urls.network ? h("p", { class: "label-sm warn-note", text: "Toktail couldn't find this computer's network address; use its name or IP in place of the placeholder." }) : null,
+      w === "docker" ? h("p", { class: "hint", text: "host.docker.internal reaches this computer from Docker Desktop. On Linux Docker, start the container with --add-host=host.docker.internal:host-gateway." }) : null);
+    await modal("Your key for " + (label.value || "the client"), steps, [{ label: "Done", value: true, cls: "primary" }]);
   }
 
   // ---------------------------------------------------------------- hardware

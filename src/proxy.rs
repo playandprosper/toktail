@@ -64,18 +64,28 @@ struct Tracked {
     /// Who sent it, what it's about, and the newest turn (for Pip).
     detected: commentary::Detected,
     turn: String,
+    /// What's new in the prompt, for Pip's summary (summaries.rs).
+    new_part: String,
     token_id: String,
     client: String,
     /// Set when the answer should be stored in the prompt cache.
     cache_key: Option<String>,
+    /// The host it runs on (changes when you reroute it).
+    host: String,
+    /// What happened to it in Toktail, for the live feed.
+    note: String,
 }
 
 /// How the credential is forwarded.
+#[derive(Clone)]
 enum Forward {
     /// Whatever the client sent goes through unchanged.
     KeepClient,
     /// The client's credential (if any) is dropped; this one is sent instead.
     Replace { header: &'static str, value: String },
+    /// The client's credential is dropped and nothing is sent (a reroute to a
+    /// host with no stored token: the agent's key never follows a request).
+    Strip,
 }
 
 /// Where a host's requests go: its server address, normalized.
@@ -149,7 +159,7 @@ fn client() -> reqwest::Client {
 /// Guards that keep a request counted as in flight until it ends.
 struct InFlight {
     _all: crate::live::ActiveGuard,
-    _host: crate::live::ActiveGuard,
+    host: crate::live::ActiveGuard,
     flight: crate::live::FlightGuard,
 }
 
@@ -446,7 +456,7 @@ fn forward_request_headers(src: &HeaderMap, tracked: bool, auth: &Forward) -> He
         }
         // With a replacement credential, whatever the client sent is dropped
         // (OpenAI SDKs insist on sending one, often a placeholder).
-        if matches!(auth, Forward::Replace { .. }) && is_credential_header(k) {
+        if matches!(auth, Forward::Replace { .. } | Forward::Strip) && is_credential_header(k) {
             continue;
         }
         // Ask for an uncompressed body on counted endpoints so it can be read.
@@ -672,7 +682,11 @@ async fn handle(
     // The prompt cache: an identical request from the same credential.
     let cache_on = ctx.app.config.read().cache.enabled;
     let cache_mode = cache::mode_from_headers(&parts.headers);
-    let cache_key = if cache_on && kind.is_some() && toktail_client != commentary::CLIENT {
+    let cache_key = if cache_on
+        && kind.is_some()
+        && toktail_client != commentary::CLIENT
+        && toktail_client != crate::summaries::CLIENT
+    {
         Some(cache::key(&ctx.host, &path, &token_id, &body_bytes))
     } else {
         None
@@ -697,6 +711,14 @@ async fn handle(
     }
 
     let saving = ctx.app.config.read().capture.enabled;
+    // Identical requests (an agent's retry, say) share this key, so one can
+    // answer the other. Computed from the body exactly as the agent sent it.
+    // An agent resending the same input (a retry after a timeout) shares this
+    // key with the request still running, so one answer serves both.
+    let flight_key = (kind.is_some() && toktail_client != commentary::CLIENT)
+        .then(|| crate::flights::same_input_key(&ctx.host, &path, &token_id, &body_bytes))
+        .flatten();
+    let prompt_bytes = body_bytes.len() as u64;
     let tracked = kind.and_then(|kind| {
         prepare(
             kind,
@@ -713,90 +735,458 @@ async fn handle(
             },
         )
     });
+    let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
+        .unwrap_or(reqwest::Method::GET);
+
+    let Some(mut t) = tracked else {
+        // Not an inference call: stream it straight through.
+        let resp = ctx
+            .client
+            .request(method, format!("{up}{path_q}"))
+            .headers(forward_request_headers(&parts.headers, false, &auth))
+            .body(body_bytes)
+            .send()
+            .await;
+        return match resp {
+            Ok(resp) => {
+                let status =
+                    StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                let headers = forward_response_headers(resp.headers());
+                let mut r = Response::new(Body::from_stream(resp.bytes_stream()));
+                *r.status_mut() = status;
+                *r.headers_mut() = headers;
+                r
+            }
+            Err(e) => bad_gateway(kind_name(&h), &up, e),
+        };
+    };
+    t.host = ctx.host.clone();
+
     // Counts this request as in flight (for Pip and the live feed) until the
     // guards are dropped, however the request ends.
-    let in_flight = tracked.as_ref().map(|t| InFlight {
+    let guards = InFlight {
         _all: ctx.app.live.begin(),
-        _host: ctx.app.live_for(&ctx.host).begin(),
+        host: ctx.app.live_for(&ctx.host).begin(),
         flight: ctx.app.activity.begin(
             &ctx.host,
             t.request_model.as_deref(),
             &t.endpoint,
             t.streamed,
         ),
-    });
-
-    let url = format!("{up}{path_q}");
-    let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
-        .unwrap_or(reqwest::Method::GET);
-    let upstream_resp = ctx
-        .client
-        .request(method, &url)
-        .headers(forward_request_headers(
-            &parts.headers,
-            tracked.is_some(),
-            &auth,
-        ))
-        .body(body_bytes)
-        .send()
-        .await;
-    drop(auth);
-    let resp = match upstream_resp {
-        Ok(r) => r,
-        Err(e) => {
-            // Count the failure, so a host that stops answering shows up as
-            // errors on the dashboard instead of silence.
-            if let Some(t) = tracked {
-                let duration = t.started.elapsed();
-                record(
-                    &ctx,
-                    t,
-                    None,
-                    502,
-                    Usage::default(),
-                    0,
-                    None,
-                    duration,
-                    None,
-                );
-            }
-            drop(in_flight);
-            return bad_gateway(kind_name(&h), &up, e);
-        }
     };
-
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut headers = forward_response_headers(resp.headers());
-    let is_sse = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.contains("text/event-stream"));
-
-    let Some(t) = tracked else {
-        // Not an inference call: stream it straight through.
-        let mut r = Response::new(Body::from_stream(resp.bytes_stream()));
-        *r.status_mut() = status;
-        *r.headers_mut() = headers;
-        return r;
-    };
-    headers.insert(
-        "x-toktail-cache",
-        HeaderValue::from_static(match (cache_on, cache_mode) {
-            (false, _) => "off",
-            (true, cache::Mode::Bypass) => "bypass",
-            (true, cache::Mode::Refresh) => "refresh",
-            (true, cache::Mode::Use) => "miss",
-        }),
+    guards.flight.describe(
+        flight_key.clone(),
+        &t.detected.agent,
+        &t.detected.session,
+        &t.detected.project,
+        prompt_bytes,
     );
+    let cache_header = match (cache_on, cache_mode) {
+        (false, _) => "off",
+        (true, cache::Mode::Bypass) => "bypass",
+        (true, cache::Mode::Refresh) => "refresh",
+        (true, cache::Mode::Use) => "miss",
+    };
+    let grace = ctx.app.config.read().flights.abandoned_grace_secs;
+    // The request runs in its own task, so it can be steered from the portal
+    // and can outlive an agent that hangs up (a retry may still want it).
+    let (reply, mut answer) = tokio::sync::mpsc::channel::<Response>(1);
+    let run = Run {
+        ctx: ctx.clone(),
+        t,
+        out: Outgoing {
+            method,
+            path_q,
+            headers: parts.headers.clone(),
+            body: body_bytes,
+        },
+        to: Target {
+            host: ctx.host.clone(),
+            upstream: up.clone(),
+            forward: auth,
+            model: None,
+        },
+        guards,
+        reply: Some(reply),
+        cache_header,
+        key: flight_key,
+        gone_at: None,
+        grace,
+        settled: false,
+        rerouted_from: None,
+    };
+    tokio::spawn(fly(run));
+    match answer.recv().await {
+        Some(r) => r,
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Toktail lost track of this request.",
+        )
+            .into_response(),
+    }
+}
 
-    if is_sse {
-        stream_and_count(ctx, t, status, headers, resp, in_flight)
+// ------------------------------------------------------------------ steering
+
+/// What's needed to send (or resend) a request.
+struct Outgoing {
+    method: reqwest::Method,
+    path_q: String,
+    headers: HeaderMap,
+    /// The body after `prepare` (with usage asked for in streams).
+    body: Bytes,
+}
+
+/// Where a request goes and how it's authorized there.
+#[derive(Clone)]
+struct Target {
+    host: String,
+    upstream: String,
+    forward: Forward,
+    /// Replaces the request's model (after a reroute).
+    model: Option<String>,
+}
+
+type BodyTx = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
+
+/// One counted request, from the moment it arrives until its row is written.
+struct Run {
+    ctx: Arc<Ctx>,
+    t: Tracked,
+    out: Outgoing,
+    to: Target,
+    guards: InFlight,
+    /// Where the response goes, until it has been sent.
+    reply: Option<tokio::sync::mpsc::Sender<Response>>,
+    cache_header: &'static str,
+    key: Option<String>,
+    /// When the agent hung up.
+    gone_at: Option<Instant>,
+    /// How long to keep going for a retry after the agent hangs up.
+    grace: u64,
+    /// Its row is written (it was answered by another request).
+    settled: bool,
+    /// The host it was sent to before you rerouted it.
+    rerouted_from: Option<String>,
+}
+
+enum Steer<T> {
+    Got(T),
+    /// Rerouted: send again, to the new target.
+    Resend,
+    /// Finished (cancelled, joined, stopped): nothing left to do.
+    Done,
+}
+
+/// A host to reroute to, authorized with its own stored key, never the agent's.
+fn retarget(app: &App, host: &str, model: &str) -> Result<Target, String> {
+    let h = app
+        .config
+        .read()
+        .host(host)
+        .filter(|h| h.enabled)
+        .cloned()
+        .ok_or_else(|| format!("{host} isn't an enabled host."))?;
+    let forward = match app.host_token(&h.id) {
+        Some(t) => Forward::Replace {
+            header: h.key_header(),
+            value: t,
+        },
+        None if h.is_public() => {
+            return Err(format!(
+                "No {} key is stored for {}.",
+                kind_name(&h),
+                h.name
+            ))
+        }
+        None => Forward::Strip,
+    };
+    Ok(Target {
+        upstream: normalize_upstream(&h.upstream).unwrap_or(h.upstream.clone()),
+        host: h.id,
+        forward,
+        model: Some(model.to_string()).filter(|m| !m.is_empty()),
+    })
+}
+
+/// The body with its model swapped (other fields untouched).
+fn with_model(body: &Bytes, model: &str) -> Bytes {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(mut m)) => {
+            m.insert("model".into(), Value::String(model.to_string()));
+            Bytes::from(serde_json::to_vec(&Value::Object(m)).unwrap_or_default())
+        }
+        _ => body.clone(),
+    }
+}
+
+/// An error the agent can read, in the shape of the API it called.
+fn error_event(endpoint: &str, kind: &str, message: &str) -> Bytes {
+    let s = if endpoint.contains("/messages") {
+        format!(
+            "event: error\ndata: {}\n\n",
+            serde_json::json!({"type": "error", "error": {"type": kind, "message": message}})
+        )
     } else {
-        // Non-streamed JSON (or an error body): read it whole, count, return it.
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => return bad_gateway(kind_name(&h), &up, e),
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"error": {"type": kind, "message": message, "code": 499}})
+        )
+    };
+    Bytes::from(s)
+}
+
+fn cancelled_response(message: &str) -> Response {
+    let body = serde_json::json!({"error": {"message": message, "type": "toktail_cancelled", "code": 499}});
+    let mut r = (
+        StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+        axum::Json(body),
+    )
+        .into_response();
+    r.headers_mut()
+        .insert("x-toktail-cancelled", HeaderValue::from_static("1"));
+    r
+}
+
+fn host_name(app: &App, id: &str) -> String {
+    app.config
+        .read()
+        .host(id)
+        .map(|h| h.name.clone())
+        .unwrap_or_else(|| id.to_string())
+}
+
+impl Run {
+    fn request(&self) -> reqwest::RequestBuilder {
+        let body = match &self.to.model {
+            Some(m) => with_model(&self.out.body, m),
+            None => self.out.body.clone(),
+        };
+        self.ctx
+            .client
+            .request(
+                self.out.method.clone(),
+                format!("{}{}", self.to.upstream, self.out.path_q),
+            )
+            .headers(forward_request_headers(
+                &self.out.headers,
+                true,
+                &self.to.forward,
+            ))
+            .body(body)
+    }
+
+    fn tracker(&self) -> SseTracker {
+        // Saving keeps the whole answer; otherwise only enough of it to tell
+        // a refusal from an answer (the character count stays exact).
+        let cap = if self.t.original.is_some() {
+            MAX_CAPTURE_BYTES / 2
+        } else {
+            16 * 1024
+        };
+        SseTracker::new(self.t.strip_injected_usage).collect_text(cap)
+    }
+
+    fn respond(&mut self, r: Response) {
+        if let Some(tx) = self.reply.take() {
+            let _ = tx.try_send(r);
+        }
+    }
+
+    fn reroute(&mut self, to: Target) {
+        let from = host_name(&self.ctx.app, &self.t.host);
+        self.guards
+            .flight
+            .rerouted(&from, &to.host, to.model.as_deref());
+        self.guards.host = self.ctx.app.live_for(&to.host).begin();
+        if let Some(m) = &to.model {
+            self.t.request_model = Some(m.clone());
+        }
+        self.t.note = format!("rerouted from {from}");
+        self.rerouted_from
+            .get_or_insert_with(|| self.t.host.clone());
+        // Not cached: the cache key names the host the agent asked for.
+        self.t.cache_key = None;
+        self.t.host = to.host.clone();
+        log::info!(
+            "flight #{}: rerouted from {from} to {}{}",
+            self.guards.flight.id(),
+            self.t.host,
+            to.model
+                .as_deref()
+                .map(|m| format!(" ({m})"))
+                .unwrap_or_default()
+        );
+        self.to = to;
+    }
+
+    fn agent_hung_up(&mut self) {
+        if self.gone_at.is_none() {
+            self.gone_at = Some(Instant::now());
+            self.guards.flight.agent_gone(self.grace);
+        }
+    }
+
+    /// The agent left long enough ago, and no retry joined.
+    fn abandoned(&self) -> bool {
+        self.gone_at
+            .is_some_and(|g| g.elapsed().as_secs() >= self.grace)
+            && self.guards.flight.joiners() == 0
+    }
+
+    /// Ends a request that never reached the agent's answer: a row, the
+    /// feed, and its joiners told.
+    fn end_unanswered(mut self, status: u16, note: &str, reply: Response) {
+        self.respond(reply);
+        self.t.note = note.to_string();
+        let duration = self.t.started.elapsed();
+        record(
+            &self.ctx,
+            self.t,
+            None,
+            status,
+            Usage::default(),
+            0,
+            None,
+            duration,
+            None,
+        );
+        self.guards
+            .flight
+            .control()
+            .tee
+            .finish(crate::flights::Summary::default());
+    }
+
+    /// Waits for `fut` while listening to the portal and to the agent.
+    async fn steer<T>(
+        &mut self,
+        cmds: &mut tokio::sync::watch::Receiver<crate::flights::Cmd>,
+        fut: impl std::future::Future<Output = T>,
+    ) -> Steer<T> {
+        use crate::flights::Cmd;
+        tokio::pin!(fut);
+        let watch = self.reply.clone();
+        let gone = async move {
+            match watch {
+                Some(t) => t.closed().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(gone);
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                v = &mut fut => return Steer::Got(v),
+                ch = cmds.changed() => {
+                    if ch.is_err() {
+                        // The control outlives the flight; this can't happen.
+                        continue;
+                    }
+                    let cmd = cmds.borrow_and_update().clone();
+                    match cmd {
+                        Cmd::Cancel => return Steer::Done,
+                        Cmd::Reroute { host, model } => match retarget(&self.ctx.app, &host, &model) {
+                            Ok(to) => { self.reroute(to); return Steer::Resend; }
+                            Err(e) => log::warn!("flight #{}: can't reroute: {e}", self.guards.flight.id()),
+                        },
+                        Cmd::Join(id) => {
+                            if let Some(leader) = self.ctx.app.activity.control_of(id) {
+                                match self.wait_for_join(id, leader, cmds).await {
+                                    JoinEnd::Done => return Steer::Done,
+                                    JoinEnd::Rerouted => return Steer::Resend,
+                                    JoinEnd::Fallback => {}
+                                }
+                            }
+                        }
+                        Cmd::None => {}
+                    }
+                }
+                _ = &mut gone, if self.gone_at.is_none() => self.agent_hung_up(),
+                _ = tick.tick(), if self.gone_at.is_some() => {
+                    if self.abandoned() {
+                        return Steer::Done;
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum JoinEnd {
+    /// Answered with the other request's answer.
+    Done,
+    /// The other request failed before answering: carry on alone.
+    Fallback,
+    /// Rerouted while waiting.
+    Rerouted,
+}
+
+/// Runs one counted request to the end.
+async fn fly(mut r: Run) {
+    let mut cmds = r.guards.flight.control().commands();
+    // An identical request already running answers this one.
+    let join_on = r.ctx.app.config.read().flights.join_duplicates;
+    if let (true, Some(key)) = (join_on, r.key.clone()) {
+        if let Some((id, leader)) = r.ctx.app.activity.leader_for(&key, r.guards.flight.id()) {
+            match r.wait_for_join(id, leader, &mut cmds).await {
+                JoinEnd::Done => return,
+                JoinEnd::Fallback | JoinEnd::Rerouted => {}
+            }
+        }
+    }
+    loop {
+        // ---- the answer's head
+        let send = r.request().send();
+        let resp = match r.steer(&mut cmds, send).await {
+            Steer::Got(v) => v,
+            Steer::Resend => continue,
+            Steer::Done => return finish_steered(r, &cmds),
+        };
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(e) => {
+                let to = r.to.upstream.clone();
+                let what = r
+                    .ctx
+                    .app
+                    .config
+                    .read()
+                    .host(&r.t.host)
+                    .map(kind_name)
+                    .unwrap_or("the server");
+                let reply = bad_gateway(what, &to, &e);
+                return r.end_unanswered(502, "", reply);
+            }
+        };
+        let status =
+            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let mut headers = forward_response_headers(resp.headers());
+        headers.insert("x-toktail-cache", HeaderValue::from_static(r.cache_header));
+        // Tells the agent's side where the answer really came from.
+        if let Some(from) = &r.rerouted_from {
+            if let Ok(v) = HeaderValue::from_str(&format!("{from} -> {}", r.t.host)) {
+                headers.insert("x-toktail-rerouted", v);
+            }
+        }
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+        if content_type.contains("text/event-stream") {
+            return stream(r, cmds, status, headers, resp).await;
+        }
+        // ---- a whole JSON answer (or an error body)
+        let bytes = match r.steer(&mut cmds, resp.bytes()).await {
+            Steer::Got(Ok(b)) => b,
+            Steer::Got(Err(e)) => {
+                let to = r.to.upstream.clone();
+                let reply = bad_gateway("the server", &to, &e);
+                return r.end_unanswered(502, "", reply);
+            }
+            Steer::Resend => continue,
+            Steer::Done => return finish_steered(r, &cmds),
         };
         let mut u = Usage::default();
         let mut model = None;
@@ -804,38 +1194,664 @@ async fn handle(
             usage::scan_usage(&v, &mut u);
             model = usage::response_model(&v);
         }
-        let duration = t.started.elapsed();
-        if let (Some(f), Some(m)) = (in_flight.as_ref(), model.as_deref()) {
-            f.flight.set_model(m);
+        if let Some(m) = model.as_deref() {
+            r.guards.flight.set_model(m);
         }
-        let captured = Some(bytes.clone());
-        let content_type = headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/json")
-            .to_string();
-        record_and_cache(
-            &ctx,
-            t,
+        let control = r.guards.flight.control();
+        control.tee.set_head(status.as_u16(), &content_type);
+        control.tee.push(&bytes);
+        let mut reply = Response::new(Body::from(bytes.clone()));
+        *reply.status_mut() = status;
+        *reply.headers_mut() = headers;
+        r.respond(reply);
+        let gone = r.gone_at.is_some() && r.guards.flight.joiners() == 0;
+        let duration = r.t.started.elapsed();
+        let kept = bytes.clone();
+        let rec = record_and_cache(
+            &r.ctx,
+            r.t,
             model,
-            status.as_u16(),
+            if gone { 499 } else { status.as_u16() },
             u,
             0,
             None,
             duration,
-            captured,
+            Some(bytes.clone()),
             CacheBody {
                 content_type,
                 streamed: false,
-                bytes: bytes.clone(),
+                bytes,
             },
         );
-        drop(in_flight);
-        let mut r = Response::new(Body::from(bytes));
-        *r.status_mut() = status;
-        *r.headers_mut() = headers;
-        r
+        control.tee.finish(summary_of(
+            rec.as_ref(),
+            status.as_u16() == 200,
+            Some(&kept),
+        ));
+        return;
     }
+}
+
+/// How a request the portal (or a hung-up agent) stopped ends.
+fn finish_steered(r: Run, cmds: &tokio::sync::watch::Receiver<crate::flights::Cmd>) {
+    let id = r.guards.flight.id();
+    if r.settled {
+        return;
+    }
+    if matches!(*cmds.borrow(), crate::flights::Cmd::Cancel) {
+        log::info!("flight #{id}: cancelled from the portal");
+        r.end_unanswered(
+            499,
+            "cancelled in Toktail",
+            cancelled_response("Cancelled in Toktail."),
+        );
+    } else if r.gone_at.is_some() {
+        log::info!("flight #{id}: the agent hung up and no retry came; stopped");
+        r.end_unanswered(
+            499,
+            "agent hung up; stopped",
+            cancelled_response("The agent hung up."),
+        );
+    }
+    // Otherwise it was answered by another request (joined), already recorded.
+}
+
+/// How an answer ended, for the requests it answers. `answered`: the model
+/// finished a good answer, even if this request's own agent had hung up
+/// (its row says 499, but a retry can still use the answer).
+fn summary_of(
+    rec: Option<&Record>,
+    answered: bool,
+    captured: Option<&[u8]>,
+) -> crate::flights::Summary {
+    match rec {
+        Some(r) => {
+            let (outcome, signal, chars) = if r.status == 200 || !answered {
+                (r.outcome.clone(), r.signal.clone(), r.response_chars)
+            } else {
+                crate::intelligence::classify(200, captured.unwrap_or(&[]))
+            };
+            crate::flights::Summary {
+                ok: answered,
+                host: r.host.clone(),
+                model: r.model.clone(),
+                input: r.input_tokens,
+                output: r.output_tokens,
+                outcome,
+                signal,
+                response_chars: chars,
+            }
+        }
+        None => crate::flights::Summary::default(),
+    }
+}
+
+/// Sends `b` to the agent and keeps it for joiners and the cache.
+async fn emit(
+    b: Vec<u8>,
+    tx: &BodyTx,
+    tee: &crate::flights::Tee,
+    cache: &mut Option<Vec<u8>>,
+    agent_gone: &mut bool,
+) {
+    if b.is_empty() {
+        return;
+    }
+    tee.push(&b);
+    if let Some(s) = cache.as_mut() {
+        if s.len() + b.len() <= cache::MAX_ENTRY_BYTES {
+            s.extend_from_slice(&b);
+        } else {
+            *cache = None;
+        }
+    }
+    if !*agent_gone && tx.send(Ok(Bytes::from(b))).await.is_err() {
+        *agent_gone = true;
+    }
+}
+
+/// A streamed answer: counted as it passes, steerable until its first token.
+async fn stream(
+    mut r: Run,
+    mut cmds: tokio::sync::watch::Receiver<crate::flights::Cmd>,
+    status: StatusCode,
+    headers: HeaderMap,
+    resp: reqwest::Response,
+) {
+    use crate::flights::Cmd;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("text/event-stream")
+        .to_string();
+    let control = r.guards.flight.control();
+    control.tee.set_head(status.as_u16(), &content_type);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let body = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let mut reply = Response::new(Body::from_stream(body));
+    *reply.status_mut() = status;
+    *reply.headers_mut() = headers;
+    let was_gone = r.gone_at.is_some();
+    r.respond(reply);
+    let mut agent_gone = was_gone;
+
+    let mut upstream = resp.bytes_stream();
+    let mut tracker = r.tracker();
+    let mut code = status.as_u16();
+    // Nothing reaches the agent until the first token: until then the
+    // request can still be rerouted or joined without the agent noticing.
+    let mut held: Vec<u8> = Vec::new();
+    let mut released = false;
+    let mut cache_copy: Option<Vec<u8>> = r.t.cache_key.is_some().then(Vec::new);
+    let mut upstream_failed = false;
+    let mut stopped: Option<&'static str> = None;
+    let mut named = false;
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            chunk = upstream.next() => match chunk {
+                None => break,
+                Some(Err(e)) => {
+                    log::warn!("upstream stream ended with an error: {e}");
+                    upstream_failed = true;
+                    break;
+                }
+                Some(Ok(c)) => {
+                    let before = tracker.deltas;
+                    let out = tracker.push(&c);
+                    if tracker.deltas > before {
+                        r.ctx.app.live.add(tracker.deltas - before, 0);
+                        r.ctx.app.live_for(&r.t.host).add(tracker.deltas - before, 0);
+                    }
+                    r.guards.flight.progress(tracker.deltas, tracker.first_token_at);
+                    if !named {
+                        if let Some(m) = tracker.model.as_deref() {
+                            r.guards.flight.set_model(m);
+                            named = true;
+                        }
+                    }
+                    if released {
+                        emit(out, &tx, &control.tee, &mut cache_copy, &mut agent_gone).await;
+                    } else {
+                        held.extend_from_slice(&out);
+                        if tracker.deltas > 0 || tracker.tool_call || held.len() > 64 * 1024 {
+                            released = true;
+                            r.guards.flight.released();
+                            emit(std::mem::take(&mut held), &tx, &control.tee, &mut cache_copy, &mut agent_gone).await;
+                        }
+                    }
+                    if agent_gone {
+                        r.agent_hung_up();
+                    }
+                    // The last event went by: done, even if the server
+                    // leaves the connection open.
+                    if tracker.ended {
+                        break;
+                    }
+                }
+            },
+            ch = cmds.changed() => {
+                if ch.is_err() {
+                    continue;
+                }
+                let cmd = cmds.borrow_and_update().clone();
+                match cmd {
+                    Cmd::Cancel => {
+                        stopped = Some("cancelled in Toktail");
+                        break;
+                    }
+                    Cmd::Reroute { host, model } if !released => match retarget(&r.ctx.app, &host, &model) {
+                        Ok(to) => {
+                            r.reroute(to);
+                            match r.request().send().await {
+                                Ok(nr) if nr.status().is_success()
+                                    && nr.headers().get(header::CONTENT_TYPE)
+                                        .and_then(|v| v.to_str().ok())
+                                        .is_some_and(|c| c.contains("text/event-stream")) =>
+                                {
+                                    upstream = nr.bytes_stream();
+                                    tracker = r.tracker();
+                                    held.clear();
+                                    named = false;
+                                    r.guards.flight.progress(0, None);
+                                }
+                                Ok(nr) => {
+                                    code = nr.status().as_u16();
+                                    let body = nr.bytes().await.unwrap_or_default();
+                                    let msg = format!(
+                                        "Rerouted to {} and it answered HTTP {code}: {}",
+                                        host_name(&r.ctx.app, &r.t.host),
+                                        String::from_utf8_lossy(&body).chars().take(400).collect::<String>()
+                                    );
+                                    emit(error_event(&r.t.endpoint, "toktail_reroute_failed", &msg).to_vec(), &tx, &control.tee, &mut None::<Vec<u8>>, &mut agent_gone).await;
+                                    stopped = Some("rerouted, but the new host refused it");
+                                    break;
+                                }
+                                Err(e) => {
+                                    let msg = format!("Rerouted to {}, which couldn't be reached: {e}", host_name(&r.ctx.app, &r.t.host));
+                                    emit(error_event(&r.t.endpoint, "toktail_reroute_failed", &msg).to_vec(), &tx, &control.tee, &mut None::<Vec<u8>>, &mut agent_gone).await;
+                                    code = 502;
+                                    stopped = Some("rerouted, but the new host couldn't be reached");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => log::warn!("flight #{}: can't reroute: {e}", r.guards.flight.id()),
+                    },
+                    Cmd::Join(id) if !released => {
+                        if let Some(leader) = r.ctx.app.activity.control_of(id) {
+                            drop(upstream);
+                            r.guards.flight.joined(id);
+                            relay(&mut r, id, leader, tx, cmds).await;
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            },
+            _ = tx.closed(), if !agent_gone => {
+                agent_gone = true;
+                r.agent_hung_up();
+            },
+            _ = tick.tick(), if r.gone_at.is_some() => {
+                if r.abandoned() {
+                    stopped = Some("agent hung up; stopped");
+                    break;
+                }
+            },
+        }
+    }
+    drop(upstream);
+    if let Some(note) = stopped {
+        if note == "cancelled in Toktail" {
+            emit(
+                error_event(&r.t.endpoint, "toktail_cancelled", "Cancelled in Toktail.").to_vec(),
+                &tx,
+                &crate::flights::Tee::default(),
+                &mut None::<Vec<u8>>,
+                &mut agent_gone,
+            )
+            .await;
+            code = 499;
+        } else if note.starts_with("agent hung up") {
+            code = 499;
+        }
+        r.t.note = if r.t.note.is_empty() {
+            note.to_string()
+        } else {
+            format!("{}; {note}", r.t.note)
+        };
+        log::info!("flight #{}: {note}", r.guards.flight.id());
+    } else {
+        // Answers with no token at all (an error, say) are sent at the end.
+        if !released {
+            emit(
+                std::mem::take(&mut held),
+                &tx,
+                &control.tee,
+                &mut cache_copy,
+                &mut agent_gone,
+            )
+            .await;
+        }
+        let rest = tracker.finish();
+        emit(rest, &tx, &control.tee, &mut cache_copy, &mut agent_gone).await;
+        if upstream_failed {
+            code = 502;
+        } else if agent_gone && r.guards.flight.joiners() == 0 {
+            code = 499;
+        }
+    }
+    drop(tx);
+    let ttft = tracker
+        .first_token_at
+        .map(|f| f.duration_since(r.t.started));
+    let duration = r.t.started.elapsed();
+    let captured = tracker.text.take().map(|(content, reasoning)| {
+        let v = serde_json::json!({
+            "object": "toktail.stream",
+            "model": tracker.model,
+            "content": content,
+            "reasoning": reasoning,
+            "usage": { "input_tokens": tracker.usage.input, "output_tokens": tracker.usage.output },
+            "status": code,
+            "refusal": tracker.refusal,
+            "tool_call": tracker.tool_call,
+            "content_chars": tracker.content_chars,
+        });
+        Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
+    });
+    let (model, usage, deltas) = (tracker.model.clone(), tracker.usage, tracker.deltas);
+    let answered = stopped.is_none() && !upstream_failed && status.as_u16() == 200;
+    let kept = captured.clone();
+    let rec = match cache_copy.filter(|_| code == 200 && stopped.is_none()) {
+        Some(bytes) => record_and_cache(
+            &r.ctx,
+            r.t,
+            model,
+            code,
+            usage,
+            deltas,
+            ttft,
+            duration,
+            captured,
+            CacheBody {
+                content_type,
+                streamed: true,
+                bytes: Bytes::from(bytes),
+            },
+        ),
+        None => record(
+            &r.ctx, r.t, model, code, usage, deltas, ttft, duration, captured,
+        ),
+    };
+    control
+        .tee
+        .finish(summary_of(rec.as_ref(), answered, kept.as_deref()));
+    drop(r.guards);
+}
+
+impl Run {
+    /// Answers this request with request `id`'s answer, from its first byte.
+    /// Waits for that answer to start; if it fails first, carries on alone.
+    async fn wait_for_join(
+        &mut self,
+        id: u64,
+        leader: Arc<crate::flights::FlightControl>,
+        cmds: &mut tokio::sync::watch::Receiver<crate::flights::Cmd>,
+    ) -> JoinEnd {
+        use crate::flights::Cmd;
+        self.guards.flight.joined(id);
+        let finished = self.ctx.app.activity.is_orphan(id);
+        log::info!(
+            "flight #{}: {} sent the same input as #{id} again; {}",
+            self.guards.flight.id(),
+            if self.t.detected.agent.is_empty() {
+                "the agent"
+            } else {
+                &self.t.detected.agent
+            },
+            if finished {
+                "#{id} already finished after its agent hung up, and its answer goes to this one"
+            } else {
+                "it waits for #{id}'s answer instead of being read again"
+            }
+        );
+        let mut version = leader.tee.subscribe();
+        let watch = self.reply.clone();
+        let gone = async move {
+            match watch {
+                Some(t) => t.closed().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(gone);
+        let head = loop {
+            let rd = leader.tee.read(0);
+            if let Some(h) = rd.head {
+                break h;
+            }
+            if rd.done.is_some() || rd.overflow {
+                self.guards.flight.unjoin();
+                return JoinEnd::Fallback;
+            }
+            tokio::select! {
+                ch = version.changed() => if ch.is_err() {
+                    self.guards.flight.unjoin();
+                    return JoinEnd::Fallback;
+                },
+                ch = cmds.changed() => {
+                    if ch.is_err() { continue; }
+                    let cmd = cmds.borrow_and_update().clone();
+                    match cmd {
+                        Cmd::Cancel => {
+                            self.guards.flight.unjoin();
+                            self.settle(499, "cancelled in Toktail", cancelled_response("Cancelled in Toktail."));
+                            return JoinEnd::Done;
+                        }
+                        Cmd::Reroute { host, model } => {
+                            if let Ok(to) = retarget(&self.ctx.app, &host, &model) {
+                                self.guards.flight.unjoin();
+                                self.reroute(to);
+                                return JoinEnd::Rerouted;
+                            }
+                        }
+                        _ => {}
+                    }
+                },
+                _ = &mut gone => {
+                    // Nobody left to answer.
+                    self.guards.flight.unjoin();
+                    self.settle(499, "agent hung up", cancelled_response("The agent hung up."));
+                    return JoinEnd::Done;
+                }
+            }
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+        let body = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let mut reply = Response::new(Body::from_stream(body));
+        *reply.status_mut() = StatusCode::from_u16(head.status).unwrap_or(StatusCode::OK);
+        if let Ok(ct) = head.content_type.parse() {
+            reply.headers_mut().insert(header::CONTENT_TYPE, ct);
+        }
+        reply.headers_mut().insert(
+            "x-toktail-joined",
+            HeaderValue::from_str(&id.to_string()).unwrap_or(HeaderValue::from_static("1")),
+        );
+        self.respond(reply);
+        relay(self, id, leader, tx, cmds.clone()).await;
+        JoinEnd::Done
+    }
+
+    /// Writes this request's row without an answer of its own.
+    fn settle(&mut self, status: u16, note: &str, reply: Response) {
+        self.respond(reply);
+        let mut t = std::mem::replace(&mut self.t, empty_tracked());
+        t.note = note.to_string();
+        let duration = t.started.elapsed();
+        record(
+            &self.ctx,
+            t,
+            None,
+            status,
+            Usage::default(),
+            0,
+            None,
+            duration,
+            None,
+        );
+        self.settled = true;
+    }
+}
+
+/// A placeholder after a request's details moved elsewhere.
+fn empty_tracked() -> Tracked {
+    Tracked {
+        endpoint: String::new(),
+        request_model: None,
+        fingerprint: String::new(),
+        streamed: false,
+        strip_injected_usage: false,
+        started: Instant::now(),
+        original: None,
+        detected: commentary::Detected::default(),
+        turn: String::new(),
+        new_part: String::new(),
+        token_id: String::new(),
+        client: String::new(),
+        cache_key: None,
+        host: String::new(),
+        note: String::new(),
+    }
+}
+
+/// Streams request `id`'s answer (from its first byte) to this request's
+/// agent, then writes this request's row: tokens the agent received, which
+/// no model ran for it.
+async fn relay(
+    r: &mut Run,
+    id: u64,
+    leader: Arc<crate::flights::FlightControl>,
+    tx: BodyTx,
+    mut cmds: tokio::sync::watch::Receiver<crate::flights::Cmd>,
+) {
+    use crate::flights::Cmd;
+    let mut version = leader.tee.subscribe();
+    let mut next = 0;
+    let mut status = 200;
+    let mut summary = None;
+    let mut cancelled = false;
+    loop {
+        let rd = leader.tee.read(next);
+        if let Some(h) = &rd.head {
+            status = h.status;
+        }
+        next += rd.chunks.len();
+        let mut gone = false;
+        for c in rd.chunks {
+            if tx.send(Ok(c)).await.is_err() {
+                gone = true;
+                break;
+            }
+        }
+        if gone {
+            status = 499;
+            break;
+        }
+        if let Some(d) = rd.done {
+            if !d.ok && d.model.is_empty() {
+                // It stopped without an answer (cancelled, hung up, failed).
+                let _ = tx
+                    .send(Ok(error_event(
+                        &r.t.endpoint,
+                        "toktail_joined_failed",
+                        &format!(
+                            "The request #{id} this one was waiting on stopped without finishing."
+                        ),
+                    )))
+                    .await;
+                status = 502;
+            }
+            summary = Some(d);
+            break;
+        }
+        if rd.overflow {
+            status = 502;
+            break;
+        }
+        tokio::select! {
+            ch = version.changed() => if ch.is_err() { status = 502; break; },
+            ch = cmds.changed() => {
+                if ch.is_ok() && matches!(*cmds.borrow_and_update(), Cmd::Cancel) {
+                    let _ = tx.send(Ok(error_event(&r.t.endpoint, "toktail_cancelled", "Cancelled in Toktail."))).await;
+                    cancelled = true;
+                    status = 499;
+                    break;
+                }
+            },
+            _ = tx.closed() => { status = 499; break; },
+        }
+    }
+    drop(tx);
+    let s = summary.unwrap_or_default();
+    record_joined(
+        &r.ctx,
+        &mut r.t,
+        &s,
+        status,
+        if cancelled {
+            "cancelled in Toktail".into()
+        } else if status == 499 {
+            format!("hung up while waiting for #{id}'s answer")
+        } else {
+            format!("answered by #{id}")
+        },
+    );
+    r.settled = true;
+}
+
+/// The row for a request another one answered: the agent got those tokens,
+/// no model ran for this one (counted like a cache hit).
+fn record_joined(
+    ctx: &Ctx,
+    t: &mut Tracked,
+    s: &crate::flights::Summary,
+    status: u16,
+    note: String,
+) {
+    let ok = status == 200 && s.ok;
+    let rec = Record {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: Local::now(),
+        model: if s.model.is_empty() {
+            t.request_model.clone().unwrap_or_else(|| "unknown".into())
+        } else {
+            s.model.clone()
+        },
+        endpoint: t.endpoint.clone(),
+        streamed: t.streamed,
+        status,
+        input_tokens: if ok { s.input } else { 0 },
+        output_tokens: if ok { s.output } else { 0 },
+        duration_ms: t.started.elapsed().as_millis() as u64,
+        ttft_ms: None,
+        usage_source: "joined",
+        prompt_sha256: t.fingerprint.clone(),
+        host: if s.host.is_empty() {
+            t.host.clone()
+        } else {
+            s.host.clone()
+        },
+        record: String::new(),
+        outcome: if ok {
+            s.outcome.clone()
+        } else if status == 499 {
+            "cancelled".into()
+        } else {
+            "error".into()
+        },
+        signal: if ok { s.signal.clone() } else { String::new() },
+        response_chars: if ok { s.response_chars } else { 0 },
+        prompt_blob: String::new(),
+        prompt_key: String::new(),
+        response_key: String::new(),
+        reference_key: String::new(),
+        meta: Meta {
+            token_id: t.token_id.clone(),
+            cache_read: 0,
+            cache_write: 0,
+            cache_hit: true,
+            session_id: t.detected.session.clone(),
+            chain_node: String::new(),
+            prefix_tokens: 0,
+            agent: t.detected.agent.clone(),
+            client: t.client.clone(),
+        },
+    };
+    ctx.app.activity.finish(crate::live::Finished {
+        seq: 0,
+        request_id: rec.request_id.clone(),
+        host: rec.host.clone(),
+        model: rec.model.clone(),
+        endpoint: rec.endpoint.clone(),
+        status: rec.status,
+        input: rec.input_tokens,
+        output: rec.output_tokens,
+        duration_ms: rec.duration_ms,
+        ttft_ms: None,
+        tokens_per_sec: None,
+        outcome: rec.outcome.clone(),
+        signal: rec.signal.clone(),
+        finished_at: rec.timestamp.to_rfc3339(),
+        cache_hit: true,
+        agent: rec.meta.agent.clone(),
+        note,
+    });
+    crate::records::enqueue(&ctx.app, rec, None, None);
 }
 
 /// Answers from the prompt cache: the client gets the bytes it got the first
@@ -907,6 +1923,7 @@ fn serve_cached(
         finished_at: rec.timestamp.to_rfc3339(),
         cache_hit: true,
         agent: rec.meta.agent.clone(),
+        note: String::new(),
     });
     // A hit is not saved as a record (the original already is).
     crate::records::enqueue(&ctx.app, rec, None, None);
@@ -948,9 +1965,12 @@ fn prepare(
             original,
             detected: commentary::detect(headers, &Value::Null),
             turn: String::new(),
+            new_part: String::new(),
             token_id,
             client,
             cache_key,
+            host: String::new(),
+            note: String::new(),
         });
     };
     let fingerprint = usage::prompt_fingerprint(&v).unwrap_or_default();
@@ -958,6 +1978,11 @@ fn prepare(
     let streamed = v.get("stream").and_then(Value::as_bool) == Some(true);
     let detected = commentary::detect(headers, &v);
     let turn = commentary::last_user_turn(&v);
+    let new_part = if client.is_empty() {
+        crate::summaries::new_part(&v)
+    } else {
+        String::new()
+    };
     let mut strip = false;
     if streamed && kind.supports_include_usage() {
         let asked = v
@@ -990,139 +2015,13 @@ fn prepare(
         original,
         detected,
         turn,
+        new_part,
         token_id,
         client,
         cache_key,
+        host: String::new(),
+        note: String::new(),
     })
-}
-
-fn stream_and_count(
-    ctx: Arc<Ctx>,
-    t: Tracked,
-    status: StatusCode,
-    headers: HeaderMap,
-    resp: reqwest::Response,
-    in_flight: Option<InFlight>,
-) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("text/event-stream")
-        .to_string();
-    tokio::spawn(async move {
-        // Saving keeps the whole answer; otherwise only enough of it to tell
-        // a refusal from an answer (the character count stays exact).
-        let cap = if t.original.is_some() {
-            MAX_CAPTURE_BYTES / 2
-        } else {
-            16 * 1024
-        };
-        let mut tracker = SseTracker::new(t.strip_injected_usage).collect_text(cap);
-        let mut named = false;
-        let host_live = ctx.app.live_for(&ctx.host);
-        let mut upstream = resp.bytes_stream();
-        let mut client_gone = false;
-        let mut upstream_failed = false;
-        // What the client receives, kept for the cache while it fits.
-        let mut sent: Option<Vec<u8>> = t.cache_key.is_some().then(Vec::new);
-        while let Some(chunk) = upstream.next().await {
-            match chunk {
-                Ok(c) => {
-                    let before = tracker.deltas;
-                    let out = tracker.push(&c);
-                    if tracker.deltas > before {
-                        ctx.app.live.add(tracker.deltas - before, 0);
-                        host_live.add(tracker.deltas - before, 0);
-                    }
-                    if let Some(f) = in_flight.as_ref() {
-                        f.flight.progress(tracker.deltas, tracker.first_token_at);
-                        if !named {
-                            if let Some(m) = tracker.model.as_deref() {
-                                f.flight.set_model(m);
-                                named = true;
-                            }
-                        }
-                    }
-                    if !out.is_empty() {
-                        if let Some(s) = sent.as_mut() {
-                            if s.len() + out.len() <= cache::MAX_ENTRY_BYTES {
-                                s.extend_from_slice(&out);
-                            } else {
-                                sent = None;
-                            }
-                        }
-                        if tx.send(Ok(Bytes::from(out))).await.is_err() {
-                            client_gone = true;
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("upstream stream ended with an error: {e}");
-                    upstream_failed = true;
-                    break;
-                }
-            }
-        }
-        if !client_gone {
-            let rest = tracker.finish();
-            if !rest.is_empty() {
-                if let Some(s) = sent.as_mut() {
-                    s.extend_from_slice(&rest);
-                }
-                let _ = tx.send(Ok(Bytes::from(rest))).await;
-            }
-        }
-        drop(tx);
-        let code = if client_gone {
-            499
-        } else if upstream_failed {
-            502
-        } else {
-            status.as_u16()
-        };
-        let ttft = tracker.first_token_at.map(|f| f.duration_since(t.started));
-        let duration = t.started.elapsed();
-        let captured = tracker.text.take().map(|(content, reasoning)| {
-            let v = serde_json::json!({
-                "object": "toktail.stream",
-                "model": tracker.model,
-                "content": content,
-                "reasoning": reasoning,
-                "usage": { "input_tokens": tracker.usage.input, "output_tokens": tracker.usage.output },
-                "status": code,
-                "refusal": tracker.refusal,
-                "tool_call": tracker.tool_call,
-                "content_chars": tracker.content_chars,
-            });
-            Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
-        });
-        let (model, usage, deltas) = (tracker.model.clone(), tracker.usage, tracker.deltas);
-        let cache_body = sent.filter(|_| code == 200).map(|bytes| CacheBody {
-            content_type: content_type.clone(),
-            streamed: true,
-            bytes: Bytes::from(bytes),
-        });
-        match cache_body {
-            Some(cb) => record_and_cache(
-                &ctx, t, model, code, usage, deltas, ttft, duration, captured, cb,
-            ),
-            None => {
-                record(
-                    &ctx, t, model, code, usage, deltas, ttft, duration, captured,
-                );
-            }
-        }
-        drop(in_flight);
-    });
-    let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    });
-    let mut r = Response::new(Body::from_stream(body_stream));
-    *r.status_mut() = status;
-    *r.headers_mut() = headers;
-    r
 }
 
 /// The answer as the client received it, for the prompt cache.
@@ -1145,7 +2044,7 @@ fn record_and_cache(
     duration: Duration,
     response: Option<Bytes>,
     cache_body: CacheBody,
-) {
+) -> Option<Record> {
     let key = t.cache_key.clone();
     let endpoint = t.endpoint.clone();
     let rec = record(
@@ -1159,6 +2058,7 @@ fn record_and_cache(
         duration,
         response,
     );
+    let copy = rec.clone();
     if let (Some(key), Some(rec)) = (key, rec) {
         if rec.status == 200 && rec.outcome == "complete" {
             let head = cache::Head {
@@ -1189,6 +2089,7 @@ fn record_and_cache(
             });
         }
     }
+    copy
 }
 
 /// Writes the row, updates the live meters and feed, hands the bodies to
@@ -1216,7 +2117,7 @@ fn record(
     // Live meter: streamed deltas were counted as they passed; add the rest
     // (the reported total may differ from the delta count) and the prompt.
     app.live.add(output.saturating_sub(deltas), input);
-    app.live_for(&ctx.host)
+    app.live_for(&t.host)
         .add(output.saturating_sub(deltas), input);
     let now = Local::now();
     let (outcome, signal, response_chars) =
@@ -1246,7 +2147,7 @@ fn record(
         ttft_ms: ttft.map(|d| d.as_millis() as u64),
         usage_source: source,
         prompt_sha256: t.fingerprint,
-        host: ctx.host.clone(),
+        host: t.host.clone(),
         record: String::new(),
         outcome,
         signal,
@@ -1289,10 +2190,11 @@ fn record(
         finished_at: rec.timestamp.to_rfc3339(),
         cache_hit: false,
         agent: rec.meta.agent.clone(),
+        note: t.note.clone(),
     });
     // Pip's own requests (chat, commentary) are counted but never commented on.
     if t.client.is_empty() && status == 200 && rec.outcome == "complete" {
-        if let Some(h) = app.config.read().host(&ctx.host).cloned() {
+        if let Some(h) = app.config.read().host(&t.host).cloned() {
             let answer = response
                 .as_deref()
                 .map(|r| {
@@ -1302,6 +2204,16 @@ fn record(
                         .to_string()
                 })
                 .unwrap_or_default();
+            crate::summaries::offer(
+                app,
+                &rec.request_id,
+                &h,
+                &model,
+                &t.detected.agent,
+                &t.detected.project,
+                &t.new_part,
+                &answer,
+            );
             if let Some(c) =
                 commentary::candidate(&rec.request_id, &h, &model, &t.detected, &t.turn, &answer)
             {
@@ -1310,11 +2222,12 @@ fn record(
         }
     }
     // Toktail's own requests aren't saved as records.
-    let (prompt, captured) = if t.client == commentary::CLIENT {
-        (None, None)
-    } else {
-        (prompt, captured)
-    };
+    let (prompt, captured) =
+        if t.client == commentary::CLIENT || t.client == crate::summaries::CLIENT {
+            (None, None)
+        } else {
+            (prompt, captured)
+        };
     let copy = rec.clone();
     crate::records::enqueue(app, rec, prompt, captured);
     Some(copy)
@@ -1487,6 +2400,820 @@ mod tests {
         assert!(
             matches!(fwd, Forward::Replace { header: "authorization", value } if value == "lm-token")
         );
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+}
+
+#[cfg(test)]
+mod flight_tests {
+    //! Steering requests in flight, end to end: a proxy on a real port, fake
+    //! model servers that hold a request in "prefill" until told to answer.
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fake LM Studio. Requests for model "slow" wait for `open`.
+    /// Requests a fake server saw: (model, authorization).
+    type Seen = Arc<parking_lot::Mutex<Vec<(String, Option<String>)>>>;
+
+    #[derive(Clone)]
+    struct Fake {
+        name: &'static str,
+        received: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+        open: tokio::sync::watch::Sender<bool>,
+        seen: Seen,
+        /// Send SSE headers at once (then stall), like a server that answers
+        /// the head before prefill finishes.
+        early_head: bool,
+    }
+
+    struct DropMark(Arc<AtomicUsize>, bool);
+    impl Drop for DropMark {
+        fn drop(&mut self) {
+            if !self.1 {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    async fn fake_handler(State(f): State<Fake>, req: Request) -> Response {
+        let auth = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let body = to_bytes(req.into_body(), 1 << 20).await.unwrap_or_default();
+        let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let model = v["model"].as_str().unwrap_or("").to_string();
+        let streamed = v["stream"] == true;
+        f.received.fetch_add(1, Ordering::SeqCst);
+        f.seen.lock().push((model.clone(), auth));
+        let mut open = f.open.subscribe();
+        let mut mark = DropMark(f.dropped.clone(), false);
+        let wait = model == "slow";
+        let name = f.name;
+        if !streamed {
+            if wait {
+                let _ = open.wait_for(|o| *o).await;
+            }
+            mark.1 = true;
+            let body = serde_json::json!({"model": model, "choices": [{"message": {"role": "assistant", "content": format!("answer from {name}")}}], "usage": {"prompt_tokens": 7, "completion_tokens": 3}});
+            return axum::Json(body).into_response();
+        }
+        if wait && !f.early_head {
+            let _ = open.wait_for(|o| *o).await;
+        }
+        let stream = async_stream(open, wait, model, name, mark);
+        let mut r = Response::new(Body::from_stream(stream));
+        r.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        r
+    }
+
+    fn async_stream(
+        open: tokio::sync::watch::Receiver<bool>,
+        wait: bool,
+        model: String,
+        name: &'static str,
+        mark: DropMark,
+    ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
+        futures_util::stream::unfold((0u8, mark), move |(step, mut mark)| {
+            let model = model.clone();
+            let mut open = open.clone();
+            async move {
+                if step == 0 && wait {
+                    let _ = open.wait_for(|o| *o).await;
+                }
+                let chunk = match step {
+                    0 => format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"model": model, "choices": [{"delta": {"content": format!("answer from {name}")}}]})
+                    ),
+                    1 => format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"model": model, "choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 3}})
+                    ),
+                    2 => "data: [DONE]\n\n".to_string(),
+                    _ if model == "lingers" => {
+                        // A server that keeps the connection open after
+                        // its last event.
+                        std::future::pending::<()>().await;
+                        return None;
+                    }
+                    _ => {
+                        // Finished cleanly: not a drop.
+                        #[allow(unused_assignments)]
+                        {
+                            mark.1 = true;
+                        }
+                        return None;
+                    }
+                };
+                Some((Ok(Bytes::from(chunk)), (step + 1, mark)))
+            }
+        })
+    }
+
+    async fn start_fake(name: &'static str, early_head: bool) -> (Fake, String) {
+        let f = Fake {
+            name,
+            received: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicUsize::new(0)),
+            open: tokio::sync::watch::channel(false).0,
+            seen: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            early_head,
+        };
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let app = Router::new().fallback(fake_handler).with_state(f.clone());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (f, format!("http://{addr}"))
+    }
+
+    /// Toktail with hosts "studio" and "mini" in front of the two fakes.
+    async fn start_proxy(a: &str, b: &str, grace: u64) -> (Arc<App>, String) {
+        let app = crate::test_support::app();
+        {
+            let mut c = app.config.write();
+            c.hosts = vec![
+                HostConfig {
+                    id: "studio".into(),
+                    name: "Studio".into(),
+                    upstream: a.into(),
+                    listen: "127.0.0.1:0".into(),
+                    ..Default::default()
+                },
+                HostConfig {
+                    id: "mini".into(),
+                    name: "Mini".into(),
+                    upstream: b.into(),
+                    listen: "127.0.0.1:0".into(),
+                    ..Default::default()
+                },
+            ];
+            c.flights.abandoned_grace_secs = grace;
+        }
+        let ctx = Arc::new(Ctx {
+            app: app.clone(),
+            client: client(),
+            host: "studio".into(),
+        });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let router = Router::new().fallback(handle).with_state(ctx);
+        tokio::spawn(async move {
+            axum::serve(
+                l,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+        (app, format!("http://{addr}"))
+    }
+
+    async fn until(what: &str, f: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    fn body(model: &str, stream: bool) -> String {
+        serde_json::json!({"model": model, "stream": stream, "messages": [{"role": "user", "content": "refactor the parser"}]}).to_string()
+    }
+
+    fn flights(app: &App) -> Vec<crate::live::FlightView> {
+        app.activity.snapshot(0, 50).0
+    }
+    fn finished(app: &App) -> Vec<crate::live::Finished> {
+        app.activity.snapshot(0, 50).1
+    }
+
+    fn post(url: &str, b: String) -> reqwest::RequestBuilder {
+        reqwest::Client::new()
+            .post(format!("{url}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer sk-agent-secret-0123456789")
+            .body(b)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_stops_the_model_and_tells_the_agent() {
+        let (a, au) = start_fake("studio", false).await;
+        let (_b, bu) = start_fake("mini", false).await;
+        let (app, url) = start_proxy(&au, &bu, 0).await;
+        let req = tokio::spawn(post(&url, body("slow", false)).send());
+        until("the request is in flight", || flights(&app).len() == 1).await;
+        until("the model server has it", || {
+            a.received.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let id = flights(&app)[0].id;
+        assert!(flights(&app)[0].can_reroute);
+        app.activity
+            .command(id, crate::flights::Cmd::Cancel)
+            .unwrap();
+        let resp = req.await.unwrap().unwrap();
+        assert_eq!(resp.status().as_u16(), 499);
+        let v: Value = resp.json_value().await.unwrap();
+        assert_eq!(v["error"]["type"], "toktail_cancelled");
+        until("the model server sees the connection close", || {
+            a.dropped.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        until("the feed has it", || {
+            finished(&app)
+                .iter()
+                .any(|f| f.note == "cancelled in Toktail" && f.status == 499)
+        })
+        .await;
+        assert!(flights(&app).is_empty());
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reroute_sends_it_elsewhere_and_never_forwards_the_agents_key() {
+        let (a, au) = start_fake("studio", false).await;
+        let (b, bu) = start_fake("mini", false).await;
+        let (app, url) = start_proxy(&au, &bu, 0).await;
+        let req = tokio::spawn(post(&url, body("slow", false)).send());
+        until("in flight", || flights(&app).len() == 1).await;
+        until("studio has it", || a.received.load(Ordering::SeqCst) == 1).await;
+        let id = flights(&app)[0].id;
+        app.activity
+            .command(
+                id,
+                crate::flights::Cmd::Reroute {
+                    host: "mini".into(),
+                    model: "fast".into(),
+                },
+            )
+            .unwrap();
+        let resp = req.await.unwrap().unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("x-toktail-rerouted")
+                .and_then(|v| v.to_str().ok()),
+            Some("studio -> mini"),
+            "the agent's side can tell where the answer came from"
+        );
+        let v: Value = resp.json_value().await.unwrap();
+        assert_eq!(
+            v["choices"][0]["message"]["content"], "answer from mini",
+            "the agent that sent it gets the rerouted answer"
+        );
+        assert_eq!(b.received.load(Ordering::SeqCst), 1);
+        let seen = b.seen.lock().clone();
+        assert_eq!(seen[0].0, "fast", "the model was swapped");
+        assert_eq!(seen[0].1, None, "the agent's key stayed home");
+        until("studio's connection closes", || {
+            a.dropped.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        until("the feed has it", || {
+            finished(&app)
+                .iter()
+                .any(|f| f.host == "mini" && f.note == "rerouted from Studio" && f.model == "fast")
+        })
+        .await;
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
+    /// A request like opencode's: a big prompt, with settings a retry may change.
+    fn agent_body(prompt: &str, max_tokens: u32, temperature: f64) -> String {
+        serde_json::json!({
+            "model": "slow", "stream": true, "max_tokens": max_tokens, "temperature": temperature,
+            "messages": [{"role": "system", "content": "You are opencode."}, {"role": "user", "content": prompt}],
+        })
+        .to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_answer_ends_at_its_last_event_even_if_the_server_stays_open() {
+        let (_a, au) = start_fake("studio", false).await;
+        let (_b, bu) = start_fake("mini", false).await;
+        let (app, url) = start_proxy(&au, &bu, 0).await;
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            reqwest::Client::new()
+                .post(format!("{url}/v1/chat/completions"))
+                .header("content-type", "application/json")
+                .body(body("lingers", true))
+                .send(),
+        )
+        .await
+        .expect("headers in time")
+        .unwrap();
+        let text = tokio::time::timeout(Duration::from_secs(5), res.text())
+            .await
+            .expect("the agent's stream ends after [DONE]")
+            .unwrap();
+        assert!(text.contains("answer from studio"));
+        assert!(text.trim_end().ends_with("data: [DONE]"));
+        until("the request leaves the in-flight list", || {
+            app.activity.snapshot(0, 10).0.is_empty()
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stack_of_retries_is_read_once_and_the_latest_gets_the_answer() {
+        let (a, au) = start_fake("studio", true).await;
+        let (_b, bu) = start_fake("mini", true).await;
+        let (app, url) = start_proxy(&au, &bu, 60).await;
+        let big = "x".repeat(200_000);
+        // The original, then three retries that each time out and give up,
+        // tweaking max_tokens and temperature as SDK retries do.
+        let u = url.clone();
+        let b0 = agent_body(&big, 800, 0.2);
+        let orig = tokio::spawn(async move {
+            drop(post(&u, b0).send().await.unwrap());
+        });
+        orig.await.unwrap();
+        until("the original is in flight", || flights(&app).len() == 1).await;
+        for n in 1..=2u32 {
+            let u = url.clone();
+            let b = agent_body(&big, 800 + n * 100, 0.2 + n as f64 / 10.0);
+            tokio::spawn(async move {
+                drop(post(&u, b).send().await.unwrap());
+            })
+            .await
+            .unwrap();
+        }
+        let u = url.clone();
+        let latest = tokio::spawn(async move {
+            post(&u, agent_body(&big, 4096, 0.7))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        until("every resend has attached to the original", || {
+            let st = app.activity.stacks();
+            st.len() == 1
+                && st[0]
+                    .groups
+                    .first()
+                    .is_some_and(|g| g.attempts == 4 && !g.answered_by_original.is_empty())
+        })
+        .await;
+        let st = app.activity.stacks();
+        let g = &st[0].groups[0];
+        assert_eq!(
+            st[0].line.len(),
+            1,
+            "only the original is waiting to be read"
+        );
+        assert!(g.original_gone, "its agent gave up");
+        assert_eq!(
+            g.attempts, 4,
+            "the original and three resends, counted even after two gave up"
+        );
+        assert!(g.prompt_tokens_est > 50_000, "{}", g.prompt_tokens_est);
+        let orig_view = flights(&app)
+            .into_iter()
+            .find(|f| f.id == g.original)
+            .unwrap();
+        assert_eq!(
+            orig_view.stops_in_secs, None,
+            "kept running: a retry wants it"
+        );
+        assert_eq!(
+            a.received.load(Ordering::SeqCst),
+            1,
+            "LM Studio got the prompt once"
+        );
+        a.open.send(true).unwrap();
+        let text = latest.await.unwrap();
+        assert!(text.contains("answer from studio"), "{text}");
+        assert_eq!(a.received.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_answer_that_finishes_after_the_hang_up_waits_for_the_late_retry() {
+        let (a, au) = start_fake("studio", true).await;
+        let (_b, bu) = start_fake("mini", true).await;
+        let (app, url) = start_proxy(&au, &bu, 60).await;
+        let u = url.clone();
+        tokio::spawn(async move {
+            drop(post(&u, body("slow", true)).send().await.unwrap());
+        })
+        .await
+        .unwrap();
+        until("Toktail notices the agent left", || {
+            flights(&app).first().is_some_and(|f| f.agent_gone)
+        })
+        .await;
+        // The model finishes while the agent is backing off before its retry.
+        a.open.send(true).unwrap();
+        until("the original is done", || flights(&app).is_empty()).await;
+        let text = post(&url, body("slow", true))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(text.contains("answer from studio"), "{text}");
+        assert!(text.trim_end().ends_with("data: [DONE]"));
+        assert_eq!(
+            a.received.load(Ordering::SeqCst),
+            1,
+            "the 700K prompt wasn't read twice"
+        );
+        until("the retry's row", || {
+            finished(&app)
+                .iter()
+                .any(|f| f.cache_hit && f.note.starts_with("answered by #"))
+        })
+        .await;
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn different_prompts_queue_and_the_portal_sees_the_line() {
+        let (a, au) = start_fake("studio", true).await;
+        let (_b, bu) = start_fake("mini", true).await;
+        let (app, url) = start_proxy(&au, &bu, 0).await;
+        let mut reqs = Vec::new();
+        for p in ["subagent one", "subagent two", "subagent three"] {
+            let u = url.clone();
+            let b = agent_body(p, 800, 0.2);
+            reqs.push(tokio::spawn(async move {
+                post(&u, b).send().await.unwrap().text().await.unwrap()
+            }));
+            until("in flight", || flights(&app).len() == reqs.len()).await;
+        }
+        let fl = flights(&app);
+        let mut pos: Vec<(u64, Option<u32>, u32)> = fl
+            .iter()
+            .map(|f| (f.id, f.queue_pos, f.queue_len))
+            .collect();
+        pos.sort();
+        assert_eq!(
+            pos.iter().map(|p| p.1).collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)]
+        );
+        assert!(pos.iter().all(|p| p.2 == 3));
+        let st = app.activity.stacks();
+        assert_eq!(st.len(), 1);
+        assert_eq!(st[0].line.len(), 3);
+        assert!(
+            st[0].groups.is_empty(),
+            "different prompts: nothing to share"
+        );
+        a.open.send(true).unwrap();
+        for r in reqs {
+            assert!(r.await.unwrap().contains("answer from studio"));
+        }
+        assert_eq!(a.received.load(Ordering::SeqCst), 3);
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn copies_already_running_merge_into_the_oldest() {
+        let (a, au) = start_fake("studio", true).await;
+        let (_b, bu) = start_fake("mini", true).await;
+        let (app, url) = start_proxy(&au, &bu, 0).await;
+        app.config.write().flights.join_duplicates = false;
+        let mut reqs = Vec::new();
+        for n in 0..3u32 {
+            let u = url.clone();
+            let b = agent_body("the same big prompt", 800 + n, 0.2);
+            reqs.push(tokio::spawn(async move {
+                post(&u, b).send().await.unwrap().text().await.unwrap()
+            }));
+            until("in flight", || flights(&app).len() == reqs.len()).await;
+        }
+        until("all three reached LM Studio", || {
+            a.received.load(Ordering::SeqCst) == 3
+        })
+        .await;
+        let st = app.activity.stacks();
+        assert_eq!(st[0].groups.len(), 1);
+        assert_eq!(st[0].groups[0].running_separately.len(), 2);
+        let first = st[0].groups[0].original;
+        assert_eq!(app.activity.collapse(first).unwrap(), 2);
+        until("the two copies stop being read", || {
+            a.dropped.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        a.open.send(true).unwrap();
+        let texts: Vec<String> = futures_util::future::join_all(reqs)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(texts
+            .iter()
+            .all(|t| t == &texts[0] && t.contains("answer from studio")));
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reroute_must_pick_a_model_the_target_has() {
+        let (a, au) = start_fake("studio", false).await;
+        let (_b, bu) = start_fake("mini", false).await;
+        let (app, url) = start_proxy(&au, &bu, 0).await;
+        let req = tokio::spawn(post(&url, body("slow", false)).send());
+        until("in flight", || flights(&app).len() == 1).await;
+        let id = flights(&app)[0].id;
+        // The laptop has small models only.
+        app.status
+            .write()
+            .hosts
+            .entry("mini".into())
+            .or_default()
+            .upstream
+            .models = vec!["qwen3-8b".into(), "gemma-3-4b".into()];
+        let e = crate::flights::check_target(&app, id, "mini", "").unwrap_err();
+        assert!(
+            e.contains("doesn't have slow") && e.contains("qwen3-8b"),
+            "{e}"
+        );
+        let e = crate::flights::check_target(&app, id, "mini", "llama-70b").unwrap_err();
+        assert!(e.contains("doesn't have llama-70b"), "{e}");
+        assert_eq!(
+            crate::flights::check_target(&app, id, "mini", "gemma-3-4b").unwrap(),
+            "gemma-3-4b"
+        );
+        // Same model is fine when the target has it.
+        app.status
+            .write()
+            .hosts
+            .get_mut("mini")
+            .unwrap()
+            .upstream
+            .models
+            .push("slow".into());
+        assert_eq!(
+            crate::flights::check_target(&app, id, "mini", "").unwrap(),
+            "slow"
+        );
+        // A host that lists nothing takes the name as given.
+        app.status
+            .write()
+            .hosts
+            .get_mut("mini")
+            .unwrap()
+            .upstream
+            .models
+            .clear();
+        assert_eq!(
+            crate::flights::check_target(&app, id, "mini", "anything").unwrap(),
+            "anything"
+        );
+        a.open.send(true).unwrap();
+        let _ = req.await;
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stream_can_be_rerouted_until_its_first_token() {
+        let (a, au) = start_fake("studio", true).await;
+        let (_b, bu) = start_fake("mini", true).await;
+        let (app, url) = start_proxy(&au, &bu, 0).await;
+        let req = tokio::spawn(async move {
+            post(&url, body("slow", true))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        until("in flight", || flights(&app).len() == 1).await;
+        // The head has arrived; nothing has gone back to the agent yet.
+        until("studio has it", || a.received.load(Ordering::SeqCst) == 1).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let id = flights(&app)[0].id;
+        assert!(flights(&app)[0].can_reroute);
+        app.activity
+            .command(
+                id,
+                crate::flights::Cmd::Reroute {
+                    host: "mini".into(),
+                    model: "fast".into(),
+                },
+            )
+            .unwrap();
+        let text = req.await.unwrap();
+        assert!(text.contains("answer from mini"), "{text}");
+        assert!(!text.contains("answer from studio"));
+        assert!(text.trim_end().ends_with("data: [DONE]"));
+        until("studio's stream is dropped", || {
+            a.dropped.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_identical_retry_joins_instead_of_running_twice() {
+        let (a, au) = start_fake("studio", true).await;
+        let (_b, bu) = start_fake("mini", true).await;
+        let (app, url) = start_proxy(&au, &bu, 0).await;
+        let u1 = url.clone();
+        let first = tokio::spawn(async move {
+            post(&u1, body("slow", true))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        until("the first is in flight", || flights(&app).len() == 1).await;
+        let u2 = url.clone();
+        let retry = tokio::spawn(async move {
+            post(&u2, body("slow", true))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        until("the retry joins", || {
+            flights(&app).iter().any(|f| f.joined_to.is_some())
+        })
+        .await;
+        let fl = flights(&app);
+        let leader = fl.iter().find(|f| f.joined_to.is_none()).unwrap();
+        assert_eq!(leader.joiners, 1);
+        a.open.send(true).unwrap();
+        let (t1, t2) = (first.await.unwrap(), retry.await.unwrap());
+        assert_eq!(t1, t2, "the retry gets the same answer, byte for byte");
+        assert!(t1.contains("answer from studio"));
+        assert_eq!(
+            a.received.load(Ordering::SeqCst),
+            1,
+            "the model did the work once"
+        );
+        until("both rows", || finished(&app).len() == 2).await;
+        let joined = finished(&app).into_iter().find(|f| f.cache_hit).unwrap();
+        assert!(joined.note.starts_with("answered by #"), "{}", joined.note);
+        assert_eq!(joined.output, 3);
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hung_up_request_waits_for_its_retry_then_answers_it() {
+        let (a, au) = start_fake("studio", true).await;
+        let (_b, bu) = start_fake("mini", true).await;
+        let (app, url) = start_proxy(&au, &bu, 30).await;
+        let u1 = url.clone();
+        // The agent times out: its connection goes away mid-prefill.
+        let first = tokio::spawn(async move {
+            let r = post(&u1, body("slow", true)).send().await.unwrap();
+            drop(r);
+        });
+        first.await.unwrap();
+        until("Toktail notices the agent left", || {
+            flights(&app).first().is_some_and(|f| f.agent_gone)
+        })
+        .await;
+        assert!(flights(&app)[0].stops_in_secs.is_some_and(|s| s > 20));
+        // ...and retries the same request.
+        let retry = tokio::spawn(async move {
+            post(&url, body("slow", true))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        until("the retry joins the original", || {
+            flights(&app).iter().any(|f| f.joined_to.is_some())
+        })
+        .await;
+        a.open.send(true).unwrap();
+        let text = retry.await.unwrap();
+        assert!(text.contains("answer from studio"), "{text}");
+        assert_eq!(
+            a.received.load(Ordering::SeqCst),
+            1,
+            "the prefill wasn't thrown away"
+        );
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hung_up_request_nobody_wants_is_stopped_after_the_grace() {
+        let (a, au) = start_fake("studio", true).await;
+        let (_b, bu) = start_fake("mini", true).await;
+        let (app, url) = start_proxy(&au, &bu, 1).await;
+        let r = post(&url, body("slow", true)).send().await.unwrap();
+        drop(r);
+        until("stopped, and the model server's connection closed", || {
+            a.dropped.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        until("recorded", || {
+            finished(&app)
+                .iter()
+                .any(|f| f.note == "agent hung up; stopped")
+        })
+        .await;
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hang_up_is_noticed_before_the_server_answers_at_all() {
+        // No head yet: the server holds everything until prefill is done.
+        let (a, au) = start_fake("studio", false).await;
+        let (_b, bu) = start_fake("mini", false).await;
+        let (app, url) = start_proxy(&au, &bu, 1).await;
+        let req = tokio::spawn(post(&url, body("slow", true)).send());
+        until("in flight", || flights(&app).len() == 1).await;
+        req.abort();
+        until("Toktail notices the agent left", || {
+            flights(&app).first().is_none_or(|f| f.agent_gone)
+        })
+        .await;
+        until("and stops it after the grace", || {
+            a.dropped.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        std::fs::remove_dir_all(&app.paths.base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn manual_join_and_bulk_rules() {
+        let (a, au) = start_fake("studio", true).await;
+        let (_b, bu) = start_fake("mini", true).await;
+        let (app, url) = start_proxy(&au, &bu, 0).await;
+        app.config.write().flights.join_duplicates = false;
+        let u1 = url.clone();
+        let first = tokio::spawn(async move {
+            post(&u1, body("slow", true))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        until("first", || flights(&app).len() == 1).await;
+        let u2 = url.clone();
+        let dup = tokio::spawn(async move {
+            post(&u2, body("slow", true))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        until("both running", || {
+            flights(&app).len() == 2 && a.received.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        let fl = flights(&app);
+        let later = fl.iter().max_by_key(|f| f.id).unwrap();
+        let earlier = fl.iter().min_by_key(|f| f.id).unwrap();
+        assert_eq!(
+            later.duplicate_of,
+            Some(earlier.id),
+            "the portal can see it's a retry"
+        );
+        // A different request can't share an answer.
+        let u3 = url.clone();
+        let other = tokio::spawn(async move {
+            post(&u3, body("fast", false))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        assert!(other.await.unwrap().contains("answer from studio"));
+        app.activity
+            .command(later.id, crate::flights::Cmd::Join(earlier.id))
+            .unwrap();
+        assert!(app
+            .activity
+            .command(earlier.id, crate::flights::Cmd::Join(earlier.id))
+            .is_err());
+        until("studio's second stream is dropped", || {
+            a.dropped.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        a.open.send(true).unwrap();
+        let (t1, t2) = (first.await.unwrap(), dup.await.unwrap());
+        assert_eq!(t1, t2);
         std::fs::remove_dir_all(&app.paths.base).ok();
     }
 }

@@ -24,8 +24,12 @@ endif
 
 SHELL      := $(shell which bash 2>/dev/null || echo /bin/sh)
 APP_NAME   := Toktail
-VERSION    := $(shell grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+# VERSION (managed with github.com/andreimerlescu/bump) is the source of
+# truth; `make version` copies it into Cargo.toml without the leading v.
+VERSION    := $(shell sed -n '1s/^v//p' VERSION)
 PORTAL     := http://127.0.0.1:8765/
+# The portal needs a sign-in; Toktail open makes a one-time link and opens it.
+TOKTAIL_OPEN = $(if $(wildcard $(INSTALLED_BIN)),"$(INSTALLED_BIN)",$(MAKE) --no-print-directory build >/dev/null && "$(BIN)") open
 DEMO_URL   := http://127.0.0.1:8799/
 ARCH       := $(shell uname -m 2>/dev/null || echo x86_64)
 
@@ -173,22 +177,22 @@ service: ## Linux: run headless Toktail as a systemd user service (servers, LM S
 	systemctl --user daemon-reload
 	systemctl --user enable --now toktail.service
 	@echo "Toktail runs as a user service. Logs: journalctl --user -u toktail -f. The portal only answers on this machine:"
-	@echo "  from another computer, use  ssh -L 8765:127.0.0.1:8765 this-host  and open $(PORTAL)"
+	@echo "  from another computer, use  ssh -L 8765:127.0.0.1:8765 this-host  and open the link  Toktail open --print  shows"
 
 settings: ## Open the portal's Settings: hosts, saving prompts, encryption, S3, budgets
-	$(OPEN) "$(PORTAL)#/settings/hosts"
+	@$(TOKTAIL_OPEN) "#/settings/hosts"
 
 prompts: ## Open the Prompts page: saved prompts and responses
-	$(OPEN) "$(PORTAL)#/prompts"
+	@$(TOKTAIL_OPEN) "#/prompts"
 
 chat: ## Open Pip's chat: ask about your tokens, or talk straight to a model
-	$(OPEN) "$(PORTAL)#/prompts/chat"
+	@$(TOKTAIL_OPEN) "#/prompts/chat"
 
 models: ## Open the Models page: speed, wait, errors and cost per model
-	$(OPEN) "$(PORTAL)#/models"
+	@$(TOKTAIL_OPEN) "#/models"
 
 savings: ## Open the Savings page: hardware, lifecycle and savings
-	$(OPEN) "$(PORTAL)#/savings"
+	@$(TOKTAIL_OPEN) "#/savings"
 
 lmstudio: ## Optional: move this computer's LM Studio to port 1235 so apps keep using 1234
 	@if command -v lms >/dev/null 2>&1; then \
@@ -200,19 +204,28 @@ lmstudio: ## Optional: move this computer's LM Studio to port 1235 so apps keep 
 	fi
 
 open: ## Open the portal in your browser
-	$(OPEN) "$(PORTAL)"
+	@$(TOKTAIL_OPEN)
 
 logs: ## Follow Toktail's log
 	@mkdir -p "$$(dirname "$(LOG)")"; touch "$(LOG)"; tail -f "$(LOG)"
 
 status: ## Show whether Toktail is running and what Pip is up to
-	@curl -fs -m 2 -H 'Host: 127.0.0.1:8765' $(PORTAL)api/live?seconds=5 \
+	@curl -fs -m 2 -H 'Host: 127.0.0.1:8765' $(PORTAL)api/status \
 	  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("Pip is %s, %.0f tokens/sec, %d request(s) in flight" % (d["state"], d["tokens_per_sec"], d["active_requests"])); [print("  %-14s %-10s %.0f tokens/sec" % (k, v["state"], v["tokens_per_sec"])) for k, v in d.get("hosts", {}).items()]' \
 	  2>/dev/null || echo "Toktail isn't running. Start it with  make install  (or make run)"
 
 s3-secret: ## Store your S3 secret key in the Keychain / Credential Manager
 	@if [ -x "$(INSTALLED_BIN)" ]; then "$(INSTALLED_BIN)" --set-s3-secret; \
 	else $(MAKE) build && "$(BIN)" --set-s3-secret; fi
+
+version: ## Copy VERSION (e.g. v0.0.3-beta.2) into Cargo.toml and Cargo.lock
+	@perl -0pi -e 's/^version = "[^"]*"/version = "$(VERSION)"/m' Cargo.toml
+	@cargo update -p toktail --offline >/dev/null 2>&1 || cargo update -p toktail >/dev/null
+	@echo "Toktail $(VERSION)"
+
+beta: ## Next beta: bump -beta on VERSION, then make version (needs bump on PATH)
+	bump -beta -write -in VERSION
+	@$(MAKE) --no-print-directory version
 
 test: rust ## Run the tests
 	cargo test $(CARGO_GUI)

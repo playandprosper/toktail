@@ -46,7 +46,8 @@ else
   cargo build --release
   cp target/release/Toktail "$APP/Contents/MacOS/Toktail"
 fi
-sed "s/__VERSION__/$VERSION/g" packaging/Info.plist > "$APP/Contents/Info.plist"
+# macOS wants plain numbers in CFBundleVersion: 0.0.3-beta.1 ships as 0.0.3.
+sed "s/__VERSION__/${VERSION%%-*}/g" packaging/Info.plist > "$APP/Contents/Info.plist"
 
 # App icon: Pip on a midnight squircle, every size macOS asks for.
 ICONSET=$(mktemp -d)/AppIcon.iconset

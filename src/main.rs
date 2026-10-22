@@ -14,9 +14,12 @@
 //!   Toktail --demo           sample data and pretend traffic, to see Pip in action
 //!   Toktail --set-s3-secret  store the S3 secret key in the Keychain
 //!   Toktail fingerprint      read a request JSON on stdin, print its prompt_sha256
+//!   Toktail open [#/page]    open the portal, signed in (--print: just print the link)
 //!   Toktail --version
 
+mod api;
 mod app;
+mod autopilot;
 mod budgets;
 mod cache;
 mod chain;
@@ -24,15 +27,20 @@ mod commentary;
 mod config;
 mod crypto;
 mod demo;
+mod flights;
 mod hardware;
+mod hoststatus;
 mod intelligence;
 mod ledger;
 mod live;
 mod login;
 mod market;
+mod opencode;
 mod pip_agent;
 mod platform;
 mod portal;
+mod portal_agents;
+mod portal_auth;
 mod portal_insights;
 mod portal_records;
 mod portal_settings;
@@ -40,9 +48,11 @@ mod pricing;
 mod proxy;
 mod records;
 mod retrieval;
+mod roc;
 mod s3sync;
 mod secrets;
 mod stats;
+mod summaries;
 #[cfg(test)]
 mod test_support;
 mod threads;
@@ -95,7 +105,7 @@ fn real_main() -> Result<()> {
     }
     if has("--help") || has("-h") {
         println!(
-            "Toktail {} — every token leaves a trail.\n\n  Toktail                  menu bar / system tray app\n  Toktail --headless       run without the menu bar (servers, Linux)\n  Toktail --demo           try it with sample data and pretend traffic\n  Toktail --set-s3-secret  store the S3 secret key in the Keychain / Credential Manager\n  Toktail fingerprint      print prompt_sha256 for a request JSON on stdin\n\nConfig: {}\nHome:   {}",
+            "Toktail {} — every token leaves a trail.\n\n  Toktail                  menu bar / system tray app\n  Toktail --headless       run without the menu bar (servers, Linux)\n  Toktail --demo           try it with sample data and pretend traffic\n  Toktail --set-s3-secret  store the S3 secret key in the Keychain / Credential Manager\n  Toktail fingerprint      print prompt_sha256 for a request JSON on stdin\n  Toktail open [#/page]    open the portal signed in (--print shows the one-time link)\n\nConfig: {}\nHome:   {}",
             env!("CARGO_PKG_VERSION"),
             config::base_dir().join("config.toml").display(),
             portal::REPOSITORY
@@ -116,6 +126,10 @@ fn real_main() -> Result<()> {
         return Ok(());
     }
 
+    if args.first().map(String::as_str) == Some("open") {
+        return open_portal(&args[1..]);
+    }
+
     let demo = has("--demo");
     if demo {
         let dir = demo::demo_dir();
@@ -124,7 +138,11 @@ fn real_main() -> Result<()> {
         config::set_base_dir(dir);
     }
 
-    let (cfg, paths, first_run) = config::load()?;
+    let (mut cfg, paths, first_run) = config::load()?;
+    if demo && cfg.api.port == crate::config::ApiConfig::default().port {
+        // Next to a real Toktail, the demo's API gets a port of its own.
+        cfg.api.port = demo::API_PORT;
+    }
 
     if has("--set-s3-secret") {
         return secrets::prompt_and_store(&cfg.s3.access_key_id);
@@ -140,7 +158,12 @@ fn real_main() -> Result<()> {
             if already_running(&portal_addr) {
                 log::info!("Toktail is already running; opening its portal");
                 if !headless {
-                    let _ = open_url(&format!("http://{portal_addr}/"));
+                    match portal_auth::login_link(&paths.base, cfg.portal.port, "") {
+                        Ok(link) => {
+                            let _ = open_url(&link);
+                        }
+                        Err(e) => log::warn!("could not make a sign-in link: {e}"),
+                    }
                 }
                 return Ok(());
             }
@@ -205,6 +228,11 @@ fn real_main() -> Result<()> {
         cache: cache::PromptCache::new(),
         commentary: commentary::State::new(),
         chains: chain::Chains::new(),
+        portal_auth: portal_auth::PortalAuth::new(&paths_base),
+        api: api::ApiState::new(),
+        autopilot: autopilot::Autopilot::new(),
+        summaries: summaries::Summaries::new(),
+        host_status: hoststatus::HostStatus::new(),
     });
     app.load_host_tokens();
     app.configure_crypto();
@@ -221,6 +249,10 @@ fn real_main() -> Result<()> {
 
     runtime.spawn(proxy::run(app.clone()));
     runtime.spawn(portal::serve(app.clone(), portal_listener));
+    runtime.spawn(api::serve(app.clone()));
+    runtime.spawn(autopilot::run(app.clone()));
+    runtime.spawn(summaries::run(app.clone()));
+    runtime.spawn(hoststatus::run(app.clone()));
     runtime.spawn(s3sync::run(app.clone()));
     runtime.spawn(budgets::run(app.clone()));
     runtime.spawn(cache::run(app.clone()));
@@ -231,11 +263,11 @@ fn real_main() -> Result<()> {
         runtime.spawn(demo::traffic());
         println!(
             "\nToktail demo: open {} (Ctrl-C to stop)\n",
-            app.portal_url()
+            app.portal_link("")
         );
     }
     if (first_run || demo) && !headless {
-        let _ = open_url(&app.portal_url());
+        let _ = open_url(&app.portal_link(""));
     }
 
     if headless {
@@ -258,6 +290,29 @@ fn real_main() -> Result<()> {
     #[cfg(feature = "desktop")]
     tray::run(app);
     #[cfg(not(feature = "desktop"))]
+    Ok(())
+}
+
+/// `Toktail open [#/page] [--print]`: a one-time signed-in link to the
+/// running Toktail's portal, opened in the browser (or printed).
+fn open_portal(args: &[String]) -> Result<()> {
+    let (cfg, paths, _) = config::load()?;
+    let to = args
+        .iter()
+        .find(|a| a.starts_with("#/"))
+        .map(String::as_str)
+        .unwrap_or("");
+    let link = portal_auth::login_link(&paths.base, cfg.portal.port, to)
+        .context("could not write a sign-in token to Toktail's folder")?;
+    let addr = format!("127.0.0.1:{}", cfg.portal.port);
+    if !already_running(&addr) {
+        eprintln!("Toktail isn't running on {addr}; the link works once it is (for 2 minutes).");
+    }
+    if args.iter().any(|a| a == "--print") {
+        println!("{link}");
+        return Ok(());
+    }
+    open_url(&link).context("could not open the browser")?;
     Ok(())
 }
 

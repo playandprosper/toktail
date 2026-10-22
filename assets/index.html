@@ -36,6 +36,7 @@
     <nav class="nav" id="nav" aria-label="Pages">
       <a href="#/dashboard" data-page="dashboard">Dashboard</a>
       <a href="#/prompts" data-page="prompts">Prompts</a>
+      <a href="#/agents" data-page="agents">Agents</a>
       <a href="#/models" data-page="models">Models</a>
       <a href="#/savings" data-page="savings">Savings</a>
       <a href="#/settings" data-page="settings">Settings</a>
@@ -53,6 +54,7 @@
       <button class="small" id="btn-theme" type="button" title="Light or dark (t)">Dark mode</button>
     </div>
   </header>
+  <div class="agents-banner" id="agents-banner" role="status" hidden></div>
 
   <!-- ============================================================ dashboard -->
   <main class="page" data-page="dashboard" id="page-dashboard">
@@ -104,6 +106,8 @@
           <div><h2>Right now</h2><div class="sub" id="live-sub">Requests streaming through your hosts, and the ones that just finished</div></div>
           <div class="actions"><button class="small" id="btn-live-pause" type="button" aria-pressed="false">Pause feed</button></div>
         </div>
+        <div class="flight-why" id="flight-why" hidden aria-live="polite"></div>
+        <div class="flight-bulk" id="flight-bulk" hidden></div>
         <div class="flights" id="flights"></div>
         <ol class="feed" id="feed" aria-live="off"></ol>
       </section>
@@ -276,6 +280,17 @@
     </section>
   </main>
 
+  <!-- ============================================================ agents -->
+  <main class="page" data-page="agents" id="page-agents" hidden>
+    <div class="page-head">
+      <div>
+        <h1>Agents</h1>
+        <p class="page-sub" id="agents-sub"></p>
+      </div>
+    </div>
+    <div id="agents-body"></div>
+  </main>
+
   <!-- ============================================================ models -->
   <main class="page" data-page="models" id="page-models" hidden>
     <div class="page-head">
@@ -393,6 +408,7 @@
 <script src="/common.js"></script>
 <script src="/dashboard.js"></script>
 <script src="/prompts.js"></script>
+<script src="/agents.js"></script>
 <script src="/models.js"></script>
 <script src="/savings.js"></script>
 <script src="/settings.js"></script>

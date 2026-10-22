@@ -288,6 +288,26 @@ fn save(app: &App) {
     }
 }
 
+/// Raises an alert from elsewhere in Toktail (autopilot): it appears in the
+/// portal's bell, Pip says it, and with `desktop` it is also a notification.
+pub fn raise(
+    app: &App,
+    kind: &str,
+    level: &str,
+    title: String,
+    message: String,
+    href: &str,
+    desktop: bool,
+) {
+    load(app);
+    app.alerts
+        .push(kind, level, title.clone(), message.clone(), href);
+    save(app);
+    if desktop {
+        notify(&title, &message);
+    }
+}
+
 /// Logs an alert and shows it as a desktop notification.
 pub fn notify(title: &str, message: &str) {
     log::info!("alert: {title}: {message}");

@@ -77,7 +77,10 @@ async fn list(State(app): State<Arc<App>>, Query(lq): Query<ListQ>) -> Response 
     let sort = lq.sort.clone().unwrap_or_else(|| "newest".into());
     let text_hits = if let Some(q) = search.as_ref() {
         crate::retrieval::warm(&app).await;
-        app.retrieval.matching_ids(q)
+        let mut hits = app.retrieval.matching_ids(q);
+        // Pip's one-line summaries are searchable too.
+        hits.extend(crate::summaries::matching(&app, q));
+        hits
     } else {
         HashSet::new()
     };
@@ -126,7 +129,8 @@ async fn list(State(app): State<Arc<App>>, Query(lq): Query<ListQ>) -> Response 
         .into_iter()
         .map(|r| {
             let note = r.record.as_deref().and_then(|s| notes.get(s)).cloned();
-            json!({ "preview": app.retrieval.preview(&r.request_id), "row": r, "note": note })
+            json!({ "preview": app.retrieval.preview(&r.request_id), "row": r, "note": note,
+                    "summary": crate::summaries::get(&app, &r.request_id).map(|s| s.text) })
         })
         .collect();
     Json(json!({ "total": total, "offset": offset, "rows": rows, "saving": app.config.read().capture.enabled })).into_response()
@@ -237,6 +241,7 @@ async fn detail(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response
             "response": format!("{s}.response"),
         })),
         "note": note,
+        "summary": crate::summaries::get(&app, &row.request_id),
         "availability": avail,
         "performance": perf,
         "encryption": app.config.read().encryption.mode,

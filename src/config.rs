@@ -37,6 +37,198 @@ pub struct Config {
     pub commentary: CommentaryConfig,
     /// Daily market prices for the cost comparison.
     pub market: MarketConfig,
+    /// Requests in flight: identical retries, and requests agents give up on.
+    pub flights: FlightsConfig,
+    /// Toktail's API and MCP server for other apps (api.rs).
+    pub api: ApiConfig,
+    /// Keeping roc's opencode sessions working (autopilot.rs).
+    pub autopilot: AutopilotConfig,
+    /// Pip's one-line summary of every prompt (summaries.rs).
+    pub summaries: SummariesConfig,
+}
+
+/// Pip's "what's this prompt?" sentences (see summaries.rs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SummariesConfig {
+    /// Ask the same model for one sentence per prompt, when it's idle.
+    pub enabled: bool,
+    /// Pip says each new summary in its speech bubble (instead of its
+    /// whimsical commentary).
+    pub bubbles: bool,
+    /// Prompts that may wait for a sentence; the oldest are dropped.
+    pub max_queue: usize,
+}
+
+impl Default for SummariesConfig {
+    fn default() -> Self {
+        SummariesConfig {
+            enabled: true,
+            bubbles: true,
+            max_queue: 200,
+        }
+    }
+}
+
+/// Autopilot: Toktail keeps an opencode session that roc runs working until
+/// you stop it (see autopilot.rs). Everything it sends on your behalf is in
+/// these templates, so you decide its words.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutopilotConfig {
+    /// roc's state file (empty = ~/.local/roc/state.json).
+    pub roc_state: String,
+    /// The roc command, for "end the session" (empty = find it).
+    pub roc_command: String,
+    /// The docker command, for the verifier (empty = find it).
+    pub docker_command: String,
+    /// Seconds a session stays idle before autopilot answers it.
+    pub grace_secs: u64,
+    /// Minutes without a new message before autopilot acts anyway (a turn
+    /// that never finished) or tells you a busy session looks stuck.
+    pub silence_minutes: u64,
+    /// Sent when the agent stops without claiming it's finished.
+    pub continue_template: String,
+    /// Sent when the agent says it's finished.
+    pub done_template: String,
+    /// A command run in the agent's container before each prompt (e.g. a
+    /// script listing files that don't meet your skills); its output goes
+    /// into the prompt as {{verifier}}. Empty = none.
+    pub verifier_command: String,
+    pub verifier_timeout_secs: u64,
+    pub verifier_max_chars: usize,
+    /// Prompts autopilot may send in one run (0 = until you stop it).
+    pub max_turns: u32,
+    /// Tokens (input + output, counted by Toktail for the session's model)
+    /// one run may use (0 = no limit).
+    pub token_ceiling: u64,
+    /// Pause after this many identical replies in a row.
+    pub repeat_limit: u32,
+    /// Stop after this many failed turns in a row (model errors, empty
+    /// replies), and say what to fix.
+    pub error_limit: u32,
+    /// Tell you the agent may be stuck after this many "I'm done" replies
+    /// in a row (autopilot keeps going).
+    pub done_claims_alert: u32,
+    /// Answer an agent's question yourself within this many minutes, or
+    /// autopilot sends the default answer (0 = always wait for you).
+    pub question_timeout_minutes: u64,
+    pub question_default_answer: String,
+}
+
+/// Autopilot's default words when the agent stops without saying it's done.
+pub const DEFAULT_CONTINUE: &str = "Continue. Re-read AGENTS.md and PLAN.md, take the next unfinished item, apply the skills it requires, and verify it before you move on.{{goal}}{{verifier}}\n\nIf you are blocked and need the human, write NEED_HUMAN: and the reason.";
+/// Autopilot's default words when the agent says it's done.
+pub const DEFAULT_DONE: &str = "I hear that you believe this is finished. The human has reviewed the work and it isn't: the requirements in AGENTS.md, and the skills they name, are not yet applied everywhere they apply. Finishing one file is not finishing the task. Keep going: find the next file that doesn't meet them, bring it up to standard, verify it, and continue.{{goal}}{{verifier}}\n\nIf you are blocked and need the human, write NEED_HUMAN: and the reason.";
+
+impl Default for AutopilotConfig {
+    fn default() -> Self {
+        AutopilotConfig {
+            roc_state: String::new(),
+            roc_command: String::new(),
+            docker_command: String::new(),
+            grace_secs: 60,
+            silence_minutes: 10,
+            continue_template: DEFAULT_CONTINUE.into(),
+            done_template: DEFAULT_DONE.into(),
+            verifier_command: String::new(),
+            verifier_timeout_secs: 600,
+            verifier_max_chars: 6000,
+            max_turns: 0,
+            token_ceiling: 0,
+            repeat_limit: 3,
+            error_limit: 3,
+            done_claims_alert: 5,
+            question_timeout_minutes: 15,
+            question_default_answer:
+                "Use your best judgment: follow AGENTS.md and the skills it names, and keep going."
+                    .into(),
+        }
+    }
+}
+
+/// Toktail's public API (`/api/v1`) and MCP server (`/mcp`), on a port of its
+/// own (see api.rs). Every request needs a key; keys are kept as hashes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiConfig {
+    pub enabled: bool,
+    /// The port; it listens on 127.0.0.1 unless `allow_network` is on.
+    pub port: u16,
+    /// Listen on every network interface so other machines (an Open WebUI
+    /// server, say) can connect. Keys still decide what each one may do.
+    pub allow_network: bool,
+    /// Let keys with the `records` scope read whole prompts and responses
+    /// even when saved records are encrypted. Without encryption they always
+    /// can; with it, they get short snippets unless this is on.
+    pub decrypted_bodies: bool,
+    /// Issued keys (hashes only).
+    pub keys: Vec<ApiKey>,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        ApiConfig {
+            enabled: true,
+            port: 8766,
+            allow_network: false,
+            decrypted_bodies: false,
+            keys: vec![],
+        }
+    }
+}
+
+/// One key for the API and MCP server. Only its SHA-256 is kept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiKey {
+    /// Short id (`tkm_` + first 8 hex of the hash) shown in Settings.
+    pub id: String,
+    /// SHA-256 of the full key, hex.
+    pub hash: String,
+    /// What it's for ("Open WebUI").
+    pub label: String,
+    pub created: String,
+    /// `read` (usage, models, costs, budgets, live) and `records` (saved
+    /// prompts, responses and session chains).
+    pub scopes: Vec<String>,
+    /// Usable from other machines. Off = only connections from this
+    /// computer (which includes its Docker containers).
+    pub network: bool,
+}
+
+impl Default for ApiKey {
+    fn default() -> Self {
+        ApiKey {
+            id: String::new(),
+            hash: String::new(),
+            label: "Client".into(),
+            created: String::new(),
+            scopes: vec!["read".into()],
+            network: false,
+        }
+    }
+}
+
+/// How Toktail handles requests that pile up (see flights.rs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlightsConfig {
+    /// An identical request already running answers a new one (an agent's
+    /// retry, say) instead of the model doing the work twice.
+    pub join_duplicates: bool,
+    /// When an agent hangs up on a request nobody else waits for, keep it
+    /// running this long for a retry to join; 0 stops it at once.
+    pub abandoned_grace_secs: u64,
+}
+
+impl Default for FlightsConfig {
+    fn default() -> Self {
+        FlightsConfig {
+            join_duplicates: true,
+            abandoned_grace_secs: 180,
+        }
+    }
 }
 
 /// Toktail's prompt cache (see cache.rs). Off until turned on.

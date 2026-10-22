@@ -512,7 +512,7 @@ impl Ui {
     fn on_click(&mut self, app: &Arc<App>, e: MenuEvent) {
         let id = e.id();
         if id == self.open_portal.id() {
-            open(&app.portal_url(), false);
+            open(&app.portal_link(""), false);
         } else if id == self.open_data.id() {
             open(
                 &app.ledger
@@ -524,11 +524,11 @@ impl Ui {
                 false,
             );
         } else if id == self.settings.id() {
-            open(&format!("{}#/settings", app.portal_url()), false);
+            open(&app.portal_link("#/settings"), false);
         } else if id == self.budget_line.id() {
-            open(&format!("{}#/settings/budgets", app.portal_url()), false);
+            open(&app.portal_link("#/settings/budgets"), false);
         } else if id == self.ask_pip.id() {
-            open(&format!("{}#/prompts/chat", app.portal_url()), false);
+            open(&app.portal_link("#/prompts/chat"), false);
         } else if id == self.edit_config.id() {
             open(&app.paths.config_file.display().to_string(), true);
         } else if id == self.about.id() {

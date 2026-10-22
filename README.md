@@ -4,9 +4,7 @@
 
 # Toktail
 
-**Version 0.0.2:** Toktail now sits in front of public APIs too (Anthropic, OpenAI, any OpenAI-compatible API) for opencode, Claude Code, Codex, goose and roc, with every key protected; a prompt cache that answers repeated requests without a model; session chains that store each saved prompt as only what's new; market prices checked daily; Pip in 3D, with commentary on what your agents are up to; chat threads; and a Yesterday button. Coming from 0.6 or earlier? Read [UPGRADE.md](UPGRADE.md) and [CHANGELOG.md](CHANGELOG.md).
-
-*Toktail's version numbers start over at 0.0.2: the earlier 0.4, 0.5 and 0.6 are the "pre-0.0.2" releases this one upgrades from.*
+![Visitor Count](https://visitor-badge.laobi.icu/badge?page_id=andreimerlescu)
 
 *Pronounced "tock-tail". A mix of **token** and `tail -f`.*
 
@@ -154,8 +152,26 @@ seconds, and it naps wherever it is when nothing is streaming.
   platforming, insights, SVG export for every chart, CSV download for every
   table, light and dark mode, and **Today** / **Yesterday** / 7 / 30 / 90
   days / this month / all time / custom ranges.
-- **Metrics.** A Prometheus endpoint at `/metrics` and the JSON API behind
-  every page, both on this computer only.
+- **Autopilot for coding agents.** roc (0.3 and later) publishes each
+  opencode session's own server to this computer. On the **Agents** page, or
+  by telling Pip "keep opencode going on the studio until I say stop",
+  Toktail answers the agent whenever it goes quiet, in words you write: a
+  firm "it isn't finished" when it says it's done, "continue" otherwise,
+  optionally with a verifier's work list. Its questions come to you to
+  answer. It runs until you stop it, and survives a restart. See
+  [Autopilot](#autopilot).
+- **API and MCP.** A documented REST API (OpenAPI 3.1) and an MCP server with
+  the same operations, on their own port, behind keys you issue with
+  scopes: Open WebUI, Claude Code or your own scripts can ask about your
+  tokens and read your saved prompts and session chains. See
+  [API and MCP](#api-and-mcp).
+- **Pip's summaries.** Every prompt to a host on your network gets one
+  sentence ("Sends back the output of go test, which has two failures."),
+  written by the same model while it's idle, searchable on the Prompts page,
+  and said in Pip's speech bubble, so you can watch what your agents do.
+- **This computer.** Toktail's own memory, CPU and disk, and the host's
+  memory, pressure, swap and CPU, live, in Settings.
+- **Metrics.** A Prometheus endpoint at `/metrics`, on this computer only.
 
 | Dark | Light |
 |---|---|
@@ -242,13 +258,20 @@ menu).
 | `make prompts` | Open the Prompts page |
 | `make savings` | Open the Savings page |
 | `make lmstudio` | Optional: move this computer's LM Studio to 1235 so apps keep 1234 |
-| `make open` | Open the portal |
+| `make open` | Open the portal (signed in) |
 | `make status` | What Pip is doing right now |
 | `make logs` | Follow the log |
 | `make s3-secret` | Save your S3 secret key in the Keychain / Credential Manager |
 | `make dist` | Package for sharing (universal Mac app, Windows zip, Linux tarball) |
 | `make service` | Linux: run headless as a systemd user service |
 | `make uninstall` | Remove the app and login item, keep your CSV history |
+| `make version` | Copy `VERSION` into `Cargo.toml` (after `bump`) |
+| `make beta` | Next beta: `bump -beta -write`, then `make version` |
+
+The portal opens signed in from the menu bar, `make open`, `make settings`
+and the rest, or `Toktail open`. A browser you open some other way (a
+bookmark, a typed address) shows how to get in; see
+[Signing in to the portal](#signing-in-to-the-portal).
 
 ### Add your hosts
 
@@ -465,7 +488,7 @@ were.
 **Coming from an earlier version:** twenty seconds after launch Toktail folds
 every saved prompt into chains in the background, oldest first, checking each
 one unfolds before replacing it. The originals are copied to
-`<folder>/.pre-v0.0.2/` and stay readable until **Free space** on the
+`<folder>/.pre-v0.0.3/` and stay readable until **Free space** on the
 Sessions page removes them.
 
 If a record's files disappear (you deleted them in Finder or Explorer, or
@@ -588,6 +611,91 @@ tokens so far and their speed, or "reading the prompt" until the first token)
 and a feed of the ones that just finished, with errors, refusals and
 noteworthy answers tagged. Click a finished request to open it.
 
+### When agents pile up
+
+Coding agents stack requests on one machine: a long prompt is still being
+read when the agent times out and sends it again, and subagents queue behind
+each other. Every request on the Right now card can be steered:
+
+- **Cancel.** Click **Cancel**, then **Sure? Cancel**. Toktail closes its
+  connection to the model server, which stops the work there, and answers
+  the agent with HTTP 499 (`toktail_cancelled`), which agents don't retry.
+- **Reroute…** a request that hasn't sent anything back yet: pick another
+  host, then a model *that host has* (the menu lists the models it reports
+  right now; not every machine has every model, so the one the agent asked
+  for is only offered where it exists). Toktail sends the same request there
+  with that model, and the agent that sent it gets that answer on the same
+  connection it's waiting on, as if the original host had answered. The
+  response's `model` field names the model that really ran, and (when the
+  answer hadn't started streaming yet) an `X-Toktail-Rerouted: studio ->
+  laptop` header says where it came from. The agent's own API key never
+  follows a request to another host: the target's stored key is used, or
+  none. A rerouted answer isn't put in the prompt cache.
+- **Use #N's answer** on a request tagged *retry of #N*: it stops, and its
+  agent gets #N's answer, streamed from the first byte, when it comes.
+- Tick several and **Reroute** or **Cancel** them together (subagents, say).
+
+#### The same prompt, sent again and again
+
+This one isn't Toktail's doing, and it isn't really the agent's either. LM
+Studio reads one prompt at a time per model on a machine: it can *write*
+several answers at once, but reading (prefill) is serial. Coding agents send
+huge prompts for short answers (opencode routinely sends 600K-700K tokens to
+get a few hundred back), so the reading is nearly all of the work, and extra
+parallel slots don't help. If reading takes longer than the agent's timeout,
+the agent gives up and sends the *same* prompt again, which lines up behind
+the one still being read. A few timeouts later there are four copies in a
+row, and the model would read the same 700K tokens four times.
+
+Toktail notices and stops it, on its own (Settings → In flight):
+
+- **It recognises the same input.** Two requests count as the same when
+  they go to the same host, endpoint and model with the same key, and carry
+  the same messages, system prompt, tools and response format. Sampling
+  settings (`temperature`, `max_tokens`, seeds…) are ignored, since agents
+  change those between retries.
+- **The retry waits for the original instead of being read again.** The
+  latest attempt is answered with the original's answer, streamed from its
+  first byte, as soon as the original has one. The model reads the prompt
+  once. The feed marks the retry *gets #1's answer · not read again*, and
+  its CSV row is marked like a cache hit (`usage_source` = joined, note
+  *answered by #1*), outside budgets.
+- **The original keeps going when its agent hangs up** (for 3 minutes by
+  default), because its retry is about to arrive. If no retry comes, Toktail
+  stops it on the model server. If the original finishes before the retry
+  arrives, the answer is kept for the rest of that time and handed to the
+  retry as soon as it shows up.
+- **Copies already running merge.** When the same prompt is already being
+  read twice (it was sent before Toktail could match it, or matching was
+  off), **Answer them with #N's answer** stops the later copies and gives
+  their agents the oldest one's answer.
+
+Above the list, a short diagnosis says what's happening in plain words, for
+example:
+
+> **Studio is reading 3 prompts for qwen3-coder, one at a time.**
+> opencode sent the same ~608K-token prompt 4 times. opencode stopped
+> waiting for #1 while it was still being read, and sent it again. #1 keeps
+> going, and when it's done its answer goes to the latest attempt (#6). The
+> retry isn't read again. 2 other prompts are waiting behind #1 (~89K more
+> tokens to read); LM Studio will read them after it.
+> [Send the waiting 2 to another machine…]
+>
+> Why: LM Studio reads one prompt at a time per model on a machine…
+
+Each request in the line shows its place (*first in line*, *in line: 2 of
+3*) and roughly how much prompt it has to read. **Reroute** is for the other
+half of the problem: moving the prompts that are queued behind (subagents,
+usually) to another machine.
+
+While your pointer is over the list nothing moves: finished requests stay put,
+greyed out, and new ones join at the bottom, so a button is never pulled out
+from under a click.
+
+The API behind it: `POST /api/flights/{id}/cancel`, `/reroute` (`{host,
+model}`), `/join` (`{to}`), `/api/flights/bulk` and
+`GET /api/flights/targets?endpoint=`; ids are the `#` numbers in `/api/live`.
+
 **Budgets** (Settings → Budgets and alerts) are token limits per day, week
 (Monday to Sunday) or month, for every host or one, every model or one, on
 combined, input or output tokens. The dashboard shows each one's use and a
@@ -619,8 +727,9 @@ saved prompts, or type a question and press Enter to ask Pip.
 
 `http://127.0.0.1:8765/metrics` speaks Prometheus: tokens, requests, errors
 and generation time per host and model (from the CSV), live tokens per
-second, requests in flight, host health and budget use. Scrape it from a
-Prometheus or Grafana Agent on the same computer:
+second, requests in flight, host health and budget use. It answers without
+signing in (counts only). Scrape it from a Prometheus or Grafana Agent on
+the same computer:
 
 ```yaml
 scrape_configs:
@@ -629,10 +738,146 @@ scrape_configs:
       - targets: ['127.0.0.1:8765']
 ```
 
-The JSON API behind every page is listed in **Settings → Metrics and API**.
-`/api/pip/usage?period=last%20month&host=laptop` returns the exact totals Pip
-uses, and `/api/pip/facts?q=…` shows what Pip would look up for a question.
-Both answer only on this computer.
+The JSON behind the portal's pages needs the portal's sign-in. To build on
+Toktail, use the public [API and MCP](#api-and-mcp) server instead: it is
+documented, versioned and works with keys.
+
+### Signing in to the portal
+
+The portal listens on 127.0.0.1 only and refuses other websites, but every
+program on this computer can reach 127.0.0.1, and that includes coding agents
+in Docker containers (Docker Desktop forwards `host.docker.internal` to it).
+So the portal needs a sign-in that only a browser you opened holds:
+
+- The menu bar's **Open Toktail**, the first run, opening the app a second
+  time, `make open` and `Toktail open [#/page]` write a one-time token to a
+  folder only you can read and open `/login?t=…`. That sets an `HttpOnly`,
+  `SameSite=Strict` cookie good for 30 days and takes you to the page.
+- A login link works once and for two minutes. Only SHA-256 hashes of
+  tokens and cookies are kept.
+- `Toktail open --print` prints the link instead, for a browser on another
+  computer through an SSH tunnel (`ssh -L 8765:127.0.0.1:8765 this-host`).
+- **Settings → API & MCP → Sign out every browser** ends every sign-in.
+- `/api/ping`, `/metrics` and `/api/status` (Pip's mood and speed, for
+  `make status`) answer without signing in. They hold counts, never prompts.
+
+## API and MCP
+
+Toktail serves its data to other apps and AI clients on a port of its own
+(8766; the demo uses 8798), separate from the portal:
+
+- **REST** at `/api/v1/…`, plain `GET`s answering JSON. The OpenAPI 3.1
+  document is at `/api/v1/openapi.json`.
+- **MCP** at `/mcp` (Streamable HTTP, stateless, protocol versions
+  2024-11-05 through 2026-07-28). Each REST operation is a tool with the same
+  name and arguments.
+
+Every request carries a key: `Authorization: Bearer tkm_…`. Issue keys in
+**Settings → API & MCP**; **Connect a client** makes one and shows exactly
+what to paste into Open WebUI, an OpenAPI tool or Claude Code. Toktail keeps
+only a SHA-256 hash of each key. Each key has scopes:
+
+| Scope | Operations |
+|---|---|
+| `read` | `usage_summary`, `compare_periods`, `model_stats`, `top_requests`, `cost_estimate`, `savings_summary`, `live_status`, `budget_status`, `list_hosts`, `list_coding_sessions` |
+| `records` | `search_records`, `read_record`, `list_sessions`, `read_session` |
+
+- A key works from this computer only unless you mark it usable from the
+  network (and turn on **Let other machines connect**, which listens on
+  every interface). Docker containers on this computer count as this
+  computer, so keys, not addresses, are what keep an agent out.
+- `read_record` returns where a prompt sits in its session chain (node,
+  parent, depth, snapshot, bytes new at that link) and, by default, only the
+  messages that turn added (`part=new`); `part=prompt` for the whole prompt,
+  `part=response` for the answer.
+- When saved records aren't encrypted, `records` keys get whole prompts and
+  responses. When they are, they get metadata and short snippets unless you
+  allow whole bodies in Settings (whatever reads them, Open WebUI included,
+  stores them in its own, unencrypted, history).
+- Every counting result says what it counted (`counted`: period, hosts,
+  models), so an AI client that guessed an argument shows it.
+- Nothing on the API changes Toktail or drives an agent.
+
+Open WebUI (0.6.31 or later, as an admin): **Settings → Admin → Integrations
+→ External Tool Servers → + Add Connection**, type **MCP (Streamable
+HTTP)**, Server URL `http://host.docker.internal:8766/mcp` (Open WebUI in
+Docker on this computer) or `http://<this computer>:8766/mcp`, Auth
+**Bearer** with the key. Claude Code:
+`claude mcp add --transport http toktail http://127.0.0.1:8766/mcp --header "Authorization: Bearer tkm_…"`.
+
+```sh
+curl -H "Authorization: Bearer $TOKTAIL_KEY" "http://127.0.0.1:8766/api/v1/usage?period=last%20week&group_by=host"
+```
+
+## Autopilot
+
+Autopilot keeps a coding agent working until you tell it to stop. It works
+with opencode sessions that [roc](https://github.com/andreimerlescu/roc)
+(0.3 or later) runs: roc publishes opencode's own server on this computer's
+loopback with a password per session, and Toktail reads where from roc's
+`~/.local/roc/state.json` (Settings → Autopilot if yours is elsewhere).
+
+Start it on the **Agents** page (each roc session is a card; open one and
+press **Start autopilot**, with an optional goal), or ask Pip: *"keep
+opencode going on the studio until I tell you to stop"*. Pip finds the
+session by its label (Q #2), its project, or the host its model runs on.
+Then, every few seconds:
+
+- **Working:** nothing happens. If it stays busy with no new message for the
+  silence time (10 minutes), you're told once, with what Toktail sees in
+  flight for its model (a long prompt being read is normal).
+- **Asked a question:** it's on the Agents page with the agent's options and
+  a box to type your own answer, in the bell, and in a notification. Nothing
+  else is sent until it's answered. If you don't answer in 15 minutes (or
+  never, if you set 0), autopilot answers with your default answer and marks
+  that it did.
+- **Quiet for a minute:** autopilot sends the next prompt. When the agent
+  said it's finished, that's your "done" template (by default a firm,
+  specific "it isn't finished; finishing one file isn't finishing the task;
+  keep going"); otherwise your "continue" template. Both are yours to edit
+  in **Settings → Autopilot**, with `{{goal}}`, `{{verifier}}`, `{{turn}}`
+  and `{{done_claims}}`.
+- **A verifier** (optional) is a command run in the agent's container before
+  each prompt, for example a script that lists the files that don't meet
+  your skills yet. Its output goes into the prompt, so "not done" comes with
+  a work list.
+
+It stops when **you** stop it: **Stop after this turn** (the turn in progress
+finishes), **Stop now** (aborts it), **End the roc session** (`roc -kill`),
+or tell Pip "stop". On its own it only pauses or stops for things a person
+has to fix, and tells you which: the same reply three times with no work in
+between; three failed turns in a row, with what to fix (context window full,
+the API key, opencode's 5-minute timeout, the model server down, the model
+not loaded); or a prompt or token limit you set. If the agent writes
+`NEED_HUMAN: <reason>`, you're told at once and autopilot keeps nudging
+gently until you look. After five "I'm done" replies in a row you're told it
+may be stuck, and it keeps going.
+
+While autopilot drives, every page shows a banner (red when something needs
+you). Runs are saved and resume after Toktail restarts. The Agents page also
+shows the conversation, the agent's todo list, a box to write to the agent
+yourself, and a log of everything autopilot sent and saw.
+
+## Pip's summaries
+
+For each prompt that goes to an LM Studio host on your network, Pip asks the
+same model, while that model has nothing else in flight on that host, what
+the prompt is, in one sentence. It reads only what's new in the prompt (the
+messages after the model's last answer: your turn, or the tool results an
+agent sends back) and the answer. The same prompt sent again is summarized
+once. Summaries are kept with the request (sealed like saved records), shown
+and searchable on the Prompts page, returned by the API, and said in Pip's
+speech bubble so you can watch what your agents are doing. Public API hosts
+are never asked. Turn them, or the bubbles, off in **Settings → Pip**.
+
+## This computer
+
+**Settings → This computer** shows Toktail's own memory, CPU, threads and
+requests in flight, and the computer's memory in use, swap, CPU, load and
+memory pressure (macOS's pressure level; on Linux, the time tasks stalled
+on memory), sampled every 2 seconds and kept for an hour in memory, with
+live charts. It also shows how much disk the history, saved records, cache,
+summaries and market prices use.
 
 ## Savings and hardware
 
@@ -796,6 +1041,33 @@ notify = true                       # a desktop notification at 80% and 100%
 budgets = true                      # budget warnings in the bell and as notifications
 host_down = true                    # a host unreachable for a minute, and its recovery
 stampede = false                    # unusually fast generation (at most every 10 minutes)
+
+[api]                               # the API and MCP server (Settings → API & MCP)
+enabled = true
+port = 8766
+allow_network = false               # listen on every interface, not just this computer
+decrypted_bodies = false            # whole bodies for records keys even when records are encrypted
+# [[api.keys]] entries hold only SHA-256 hashes; issue keys in Settings.
+
+[autopilot]                         # Settings → Autopilot
+roc_state = ""                      # empty = ~/.local/roc/state.json
+grace_secs = 60                     # quiet this long before the next prompt
+silence_minutes = 10
+continue_template = "Continue. …"   # what it says; {{goal}} {{verifier}} {{turn}} {{done_claims}}
+done_template = "I hear that you believe this is finished. …"
+verifier_command = ""               # run in the agent's container before each prompt
+max_turns = 0                       # 0 = until you stop it
+token_ceiling = 0
+repeat_limit = 3
+error_limit = 3
+done_claims_alert = 5
+question_timeout_minutes = 15       # 0 = always wait for you
+question_default_answer = "Use your best judgment: …"
+
+[summaries]                         # Settings → Pip
+enabled = true
+bubbles = true                      # Pip says each summary instead of its commentary
+max_queue = 200
 ```
 
 The machines themselves are in `hardware.json` next to `config.toml`.
@@ -880,6 +1152,7 @@ Toktail --demo           sample data and pretend traffic (what make demo runs)
 Toktail --headless       proxy, portal and S3 only, no menu bar or tray
 Toktail --set-s3-secret  store the S3 secret key in the Keychain / Credential Manager
 Toktail fingerprint      print prompt_sha256 for a request JSON on stdin
+Toktail open [#/page]    open the portal, signed in (--print prints the one-time link)
 ```
 
 `TOKTAIL_HOME` overrides the base folder. `TOKTAIL_S3_SECRET_KEY`,
@@ -940,6 +1213,24 @@ app.
 - **Linux: no tray icon.** Toktail was built headless (no GTK found) or your
   desktop has no AppIndicator support (GNOME needs the AppIndicator
   extension). The portal works either way.
+- **"This browser isn't signed in to Toktail".** Open the portal from the
+  menu bar (or `Toktail open`); a typed address or bookmark has no sign-in.
+  `Toktail open --print` gives a link for a browser elsewhere.
+- **The Agents page says it can't see roc's sessions.** Toktail reads
+  `~/.local/roc/state.json`; set the path in Settings → Autopilot if your
+  roc uses `-state`.
+- **A session says "No remote control".** Autopilot needs roc 0.3 or later
+  and opencode's TUI (`roc`, not `roc -- run …`), with
+  `config.agent.remote_control` on in roc's state file. Sessions started
+  before upgrading roc have to be restarted.
+- **Autopilot stopped with "failed turns".** It names the cause and the
+  fix; the most common is opencode's 5-minute request timeout on a big
+  local model (raise `provider.<id>.options.timeout` in roc's
+  `agents/opencode.json`).
+- **An API client gets 401 or 403.** 401: no key, or a revoked one. 403: the
+  key lacks the scope, or it's a "this computer" key used from the network.
+- **No summaries.** They come only for LM Studio hosts on your network, and
+  only while the model is idle; Settings → Pip shows how many are waiting.
 - **Older Intel Mac.** Use `make dist` (or the CI's universal zip) on any Mac
   and copy `Toktail.app` over; it runs on macOS 11 Big Sur and later.
 
@@ -955,7 +1246,8 @@ TOKTAIL_HOME=/tmp/toktail-dev cargo run --no-default-features -- --headless
 
 | Path | What it does |
 |---|---|
-| `src/proxy.rs` | One proxy per host: forwards traffic to LM Studio or a public API, handles keys and gateway keys, serves the prompt cache, captures usage, hands bodies to records |
+| `src/proxy.rs` | One proxy per host: forwards traffic to LM Studio or a public API, handles keys and gateway keys, serves the prompt cache, runs each request as a steerable task (cancel, reroute, join), captures usage, hands bodies to records |
+| `src/flights.rs` | Steering requests in flight: commands, the shared answer stream identical requests join, reroute targets, the API |
 | `src/tokens.rs` | One-way token ids, gateway keys, private-address rules, scrubbing of key-shaped strings |
 | `src/cache.rs` | The prompt cache: keys, sealed entries, TTL and size sweeps |
 | `src/chain.rs` | Session chains: folded blobs with handlebars references, Merkle index, rebalancing deletes |
@@ -964,7 +1256,7 @@ TOKTAIL_HOME=/tmp/toktail-dev cargo run --no-default-features -- --headless
 | `src/threads.rs` | Chat threads: sealed per-thread files, index, API |
 | `src/usage.rs` | Usage parsing, streamed text and prompt fingerprints |
 | `src/ledger.rs` | CSV reading, writing and queries |
-| `src/records.rs` | Saved prompts and responses: files, chains, S3, notes, retention, the pre-0.0.2 migration |
+| `src/records.rs` | Saved prompts and responses: files, chains, S3, notes, retention, the pre-0.0.3 migration |
 | `src/crypto.rs` | gzip, AES-256-GCM, Argon2id, key stores (file, 1Password, Vault) |
 | `src/hardware.rs` | Machines, lifecycles and the savings report |
 | `src/live.rs` | Live tokens per second, Pip's mood, and requests in flight / just finished |
@@ -976,6 +1268,13 @@ TOKTAIL_HOME=/tmp/toktail-dev cargo run --no-default-features -- --headless
 | `src/pricing.rs`, `assets/pricing.json` | Cloud cost comparison |
 | `src/s3sync.rs` | S3 mirror |
 | `src/portal.rs`, `portal_records.rs`, `portal_settings.rs` | Local web server and API |
+| `src/portal_auth.rs` | Signing in to the portal: one-time links, the cookie, the open paths |
+| `src/api.rs` | The public API (`/api/v1`, OpenAPI) and MCP server (`/mcp`): operations, keys and scopes, the listener |
+| `src/roc.rs`, `src/opencode.rs` | roc's sessions and control passwords; a client for opencode's own server |
+| `src/autopilot.rs`, `src/portal_agents.rs` | Autopilot: the loop, decisions, templates, verifier, questions, stop and kill; the Agents page API |
+| `src/summaries.rs` | Pip's one-line prompt summaries: queue, idle-only worker, sealed storage, search |
+| `src/hoststatus.rs` | This computer: Toktail's and the host's memory, CPU, pressure and disk |
+| `assets/agents.js` | The Agents page and the autopilot banner |
 | `assets/index.html`, `app.css` | The portal's pages |
 | `assets/common.js`, `dashboard.js`, `prompts.js`, `models.js`, `savings.js`, `settings.js`, `main.js` | Page code |
 | `assets/pip-chat.js`, `palette.js` | Pip's chat (panel and page), the ⌘K palette and shortcuts |

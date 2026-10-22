@@ -359,6 +359,13 @@ pub fn offer(app: &Arc<App>, c: Candidate, asked: bool) {
     if !cfg.enabled && !asked {
         return;
     }
+    // Pip's bubbles show prompt summaries instead (summaries.rs); the
+    // latest request is still remembered for `u` / Space.
+    let s = app.config.read().summaries.clone();
+    if !asked && s.enabled && s.bubbles {
+        app.commentary.inner.lock().latest = Some(c);
+        return;
+    }
     if !lan_ok(app, &c.host) {
         return;
     }
@@ -426,6 +433,29 @@ pub fn offer(app: &Arc<App>, c: Candidate, asked: bool) {
             Err(_) => log::debug!("pip had nothing to say: the model took too long"),
         }
         a.commentary.inner.lock().busy = false;
+    });
+}
+
+/// Says a line someone else wrote (a prompt summary) in Pip's bubble.
+pub fn say(
+    app: &App,
+    text: &str,
+    host: &str,
+    model: &str,
+    agent: &str,
+    project: &str,
+    request_id: &str,
+) {
+    app.commentary.push(Line {
+        seq: 0,
+        at: Local::now(),
+        text: text.to_string(),
+        host: host.to_string(),
+        model: model.to_string(),
+        agent: agent.to_string(),
+        project: project.to_string(),
+        request_id: request_id.to_string(),
+        asked: false,
     });
 }
 
@@ -596,6 +626,8 @@ mod tests {
                     ..Default::default()
                 },
             ];
+            // Commentary in the bubbles (summaries would take them otherwise).
+            c.summaries.bubbles = false;
         }
         let d = Detected {
             agent: "opencode".into(),

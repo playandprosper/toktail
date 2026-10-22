@@ -131,9 +131,19 @@ pub fn settings_json(app: &App) -> serde_json::Value {
             "ttl_hours": cfg.cache.ttl_hours,
             "max_mb": cfg.cache.max_mb,
         },
+        "flights": {
+            "join_duplicates": cfg.flights.join_duplicates,
+            "abandoned_grace_secs": cfg.flights.abandoned_grace_secs,
+        },
         "commentary": {
             "enabled": cfg.commentary.enabled,
             "every_minutes": cfg.commentary.every_minutes,
+        },
+        "summaries": {
+            "enabled": cfg.summaries.enabled,
+            "bubbles": cfg.summaries.bubbles,
+            "max_queue": cfg.summaries.max_queue,
+            "status": crate::summaries::status(app),
         },
         "market": {
             "enabled": cfg.market.enabled,
@@ -221,6 +231,8 @@ struct SettingsIn {
     hardware: Option<HardwareIn>,
     cache: Option<CacheIn>,
     commentary: Option<CommentaryIn>,
+    summaries: Option<SummariesIn>,
+    flights: Option<FlightsIn>,
     market: Option<MarketIn>,
 }
 #[derive(Debug, Default, Deserialize)]
@@ -228,6 +240,17 @@ struct CacheIn {
     enabled: Option<bool>,
     ttl_hours: Option<u32>,
     max_mb: Option<u64>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct FlightsIn {
+    join_duplicates: Option<bool>,
+    abandoned_grace_secs: Option<u64>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct SummariesIn {
+    enabled: Option<bool>,
+    bubbles: Option<bool>,
+    max_queue: Option<usize>,
 }
 #[derive(Debug, Default, Deserialize)]
 struct CommentaryIn {
@@ -340,12 +363,31 @@ async fn set_settings(State(app): State<Arc<App>>, Json(body): Json<SettingsIn>)
             cfg.cache.max_mb = v.clamp(16, 1024 * 1024);
         }
     }
+    if let Some(f) = body.flights {
+        if let Some(v) = f.join_duplicates {
+            cfg.flights.join_duplicates = v;
+        }
+        if let Some(v) = f.abandoned_grace_secs {
+            cfg.flights.abandoned_grace_secs = v.min(3600);
+        }
+    }
     if let Some(c) = body.commentary {
         if let Some(v) = c.enabled {
             cfg.commentary.enabled = v;
         }
         if let Some(v) = c.every_minutes {
             cfg.commentary.every_minutes = v.clamp(1, 24 * 60);
+        }
+    }
+    if let Some(sm) = body.summaries {
+        if let Some(v) = sm.enabled {
+            cfg.summaries.enabled = v;
+        }
+        if let Some(v) = sm.bubbles {
+            cfg.summaries.bubbles = v;
+        }
+        if let Some(v) = sm.max_queue {
+            cfg.summaries.max_queue = v.clamp(1, 10_000);
         }
     }
     if let Some(m) = body.market {

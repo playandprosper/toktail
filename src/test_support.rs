@@ -37,6 +37,11 @@ pub fn app() -> Arc<app::App> {
         cache: cache::PromptCache::new(),
         commentary: commentary::State::new(),
         chains: chain::Chains::new(),
+        portal_auth: portal_auth::PortalAuth::new(&base),
+        api: api::ApiState::new(),
+        autopilot: autopilot::Autopilot::new(),
+        summaries: summaries::Summaries::new(),
+        host_status: hoststatus::HostStatus::new(),
     })
 }
 pub fn record(model: &str) -> ledger::Record {

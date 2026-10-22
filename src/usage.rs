@@ -308,6 +308,10 @@ pub struct SseTracker {
     pub content_chars: u64,
     pub refusal: bool,
     pub tool_call: bool,
+    /// The stream's last event went by (`[DONE]`, `message_stop`,
+    /// `response.completed`): the answer is complete even if the server
+    /// keeps the connection open.
+    pub ended: bool,
 }
 
 impl SseTracker {
@@ -324,6 +328,7 @@ impl SseTracker {
             content_chars: 0,
             refusal: false,
             tool_call: false,
+            ended: false,
         }
     }
 
@@ -373,12 +378,20 @@ impl SseTracker {
             }
         }
         let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
+        if data == "[DONE]" {
+            self.ended = true;
+            return true;
+        }
+        if data.is_empty() {
             return true;
         }
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return true;
         };
+        self.ended |= matches!(
+            v["type"].as_str(),
+            Some("message_stop" | "response.completed" | "response.failed" | "response.incomplete")
+        );
         self.refusal |= v
             .pointer("/delta/stop_reason")
             .is_some_and(|s| s == "refusal")

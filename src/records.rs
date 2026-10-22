@@ -391,6 +391,7 @@ pub fn enqueue(
 }
 
 pub async fn shutdown(app: &Arc<App>) {
+    crate::summaries::flush(app);
     app.shutting_down.store(true, Ordering::SeqCst);
     let until = std::time::Instant::now() + Duration::from_secs(10);
     while app.live.snapshot(1).active_requests > 0 && std::time::Instant::now() < until {
@@ -466,7 +467,7 @@ pub fn blob_writer(app: &App) -> impl Fn(&str, &[u8]) -> Result<()> + '_ {
 }
 
 /// Like `blob_writer`; with `keep_old_key` the replaced file's key stays
-/// (its copy under `.pre-v0.0.2/` must stay readable until "Free space").
+/// (its copy under `.pre-v0.0.3/` must stay readable until "Free space").
 pub fn blob_writer_keeping(
     app: &App,
     keep_old_key: bool,
@@ -1104,6 +1105,11 @@ pub async fn release_blobs(app: &Arc<App>, hashes: Vec<String>) -> Result<usize>
 
 /// Where originals go while a v1 (unfolded) blob is rewritten as a chain link.
 pub fn pre_v2_dir(app: &App) -> PathBuf {
+    root(app).join(".pre-v0.0.3")
+}
+
+/// Where the 0.0.2 preview build kept them; still counted and freed.
+fn pre_v2_dir_preview(app: &App) -> PathBuf {
     root(app).join(".pre-v0.0.2")
 }
 
@@ -1111,8 +1117,8 @@ fn migrated_marker(app: &App) -> PathBuf {
     chain::sessions_dir(&root(app)).join(".migrated-v2")
 }
 
-/// Folds every saved prompt from before 0.0.2 into session chains, oldest
-/// first, in the background. Originals are copied to `.pre-v0.0.2/` and
+/// Folds every saved prompt from before 0.0.3 into session chains, oldest
+/// first, in the background. Originals are copied to `.pre-v0.0.3/` and
 /// stay readable until "Free space" in Settings removes them.
 pub async fn migrate_chains(app: Arc<App>) {
     if migrated_marker(&app).exists() || !root(&app).join("blobs").exists() {
@@ -1215,7 +1221,7 @@ pub async fn migrate_chains(app: Arc<App>) {
     );
 }
 
-/// Bytes held by pre-0.0.2 originals.
+/// Bytes held by pre-0.0.3 originals (and the 0.0.2 preview's).
 pub fn pre_v2_bytes(app: &App) -> u64 {
     fn walk(p: &Path) -> u64 {
         std::fs::read_dir(p)
@@ -1233,13 +1239,13 @@ pub fn pre_v2_bytes(app: &App) -> u64 {
             })
             .unwrap_or(0)
     }
-    walk(&pre_v2_dir(app))
+    walk(&pre_v2_dir(app)) + walk(&pre_v2_dir_preview(app))
 }
 
-/// "Free space": removes the pre-0.0.2 originals and forgets their keys.
+/// "Free space": removes the pre-0.0.3 originals (and the 0.0.2 preview's)
+/// and forgets their keys.
 pub fn free_space(app: &App) -> Result<u64> {
     let _guard = app.records.mutation.lock();
-    let dir = pre_v2_dir(app);
     let bytes = pre_v2_bytes(app);
     fn forget_all(app: &App, p: &Path) {
         if let Ok(rd) = std::fs::read_dir(p) {
@@ -1253,12 +1259,15 @@ pub fn free_space(app: &App) -> Result<u64> {
             }
         }
     }
-    forget_all(app, &dir);
-    match std::fs::remove_dir_all(&dir) {
-        Ok(()) => Ok(bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(e.into()),
+    for dir in [pre_v2_dir(app), pre_v2_dir_preview(app)] {
+        forget_all(app, &dir);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
+    Ok(bytes)
 }
 
 pub fn set_note(app: &App, stem: &str, note: Note) -> Result<()> {
@@ -1759,7 +1768,7 @@ mod integration_tests {
             )
             .unwrap();
             let mut rec = test_support::record("m");
-            rec.timestamp = rec.timestamp + chrono::Duration::seconds(n as i64);
+            rec.timestamp += chrono::Duration::seconds(n as i64);
             rec.prompt_blob = hash.clone();
             let stem = app.records.allocate(&root(&app), &rec.host, rec.timestamp);
             let reference = serde_json::to_vec(
@@ -1815,8 +1824,13 @@ mod integration_tests {
             "one session, found by prefix"
         );
         assert!(pre_v2_bytes(&app) > 0);
-        assert!(free_space(&app).unwrap() > 0);
+        // A 0.0.2 preview build left its originals here; they count and go too.
+        let preview = pre_v2_dir_preview(&app).join("blobs/aa/old.prompt");
+        write_atomic(&preview, b"0123456789").unwrap();
+        let before = pre_v2_bytes(&app);
+        assert_eq!(free_space(&app).unwrap(), before);
         assert!(!pre_v2_dir(&app).exists());
+        assert!(!pre_v2_dir_preview(&app).exists());
         // Running again is a no-op.
         migrate_chains(app.clone()).await;
         assert_eq!(app.chains.migration.lock().folded, 3);

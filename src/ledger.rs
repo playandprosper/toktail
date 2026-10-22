@@ -41,7 +41,7 @@ pub const HEADER: [&str; 32] = [
     "prompt_key",
     "response_key",
     "reference_key",
-    // 0.0.2: who paid, what the provider cached, Toktail's own cache, and
+    // 0.0.3: who paid, what the provider cached, Toktail's own cache, and
     // where the request sits in its conversation's chain.
     "token_id",
     "cache_read_tokens",
@@ -54,7 +54,7 @@ pub const HEADER: [&str; 32] = [
     "client",
 ];
 
-/// Columns added in 0.0.2. Kept together so every place that builds a row
+/// Columns added in 0.0.3. Kept together so every place that builds a row
 /// only has one more field to fill, and old CSVs read back with defaults.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Meta {
@@ -378,9 +378,9 @@ impl Ledger {
             match parse_file(&path, &mut tmp, &self.default_host) {
                 Ok((rows, _)) => {
                     // Files from 0.4 were backed up as .pre-v0.5.bak; files from the
-                    // 0.5/0.6 line get a .pre-v0.0.2.bak. Each backup is made once.
+                    // 0.5/0.6 line get a .pre-v0.0.3.bak. Each backup is made once.
                     let backup = path.with_extension(if header_has_host(&path) {
-                        "csv.pre-v0.0.2.bak"
+                        "csv.pre-v0.0.3.bak"
                     } else {
                         "csv.pre-v0.5.bak"
                     });

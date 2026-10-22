@@ -52,6 +52,16 @@ pub struct App {
     pub commentary: crate::commentary::State,
     /// Session chains of saved prompts (chain.rs).
     pub chains: crate::chain::Chains,
+    /// Browsers signed in to the portal (portal_auth.rs).
+    pub portal_auth: crate::portal_auth::PortalAuth,
+    /// The API and MCP listener (api.rs).
+    pub api: crate::api::ApiState,
+    /// Runs keeping roc's opencode sessions working (autopilot.rs).
+    pub autopilot: crate::autopilot::Autopilot,
+    /// Pip's one-line prompt summaries (summaries.rs).
+    pub summaries: crate::summaries::Summaries,
+    /// Toktail's and this computer's memory, CPU and disk (hoststatus.rs).
+    pub host_status: crate::hoststatus::HostStatus,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -91,8 +101,16 @@ pub struct S3Status {
 }
 
 impl App {
+    /// The portal's address, for logs. Browsers need [`App::portal_link`].
     pub fn portal_url(&self) -> String {
         format!("http://127.0.0.1:{}/", self.config.read().portal.port)
+    }
+
+    /// A one-time, signed-in link to the portal, opened at `to` (`#/settings`
+    /// or empty for the dashboard).
+    pub fn portal_link(&self, to: &str) -> String {
+        let port = self.config.read().portal.port;
+        self.portal_auth.link(port, to)
     }
 
     pub fn set_proxy_status(&self, host: &str, ok: bool, msg: impl Into<String>) {

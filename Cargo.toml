@@ -45,6 +45,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "signal", "process"] }
 toml = "0.9"
 notify = "8"
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 uuid = { version = "1", features = ["v4"] }
 tray-icon = { version = "0.26", optional = true }
 tao = { version = "0.37", optional = true }

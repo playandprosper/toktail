@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const PORTAL_PORT: u16 = 8799;
+/// The demo's API and MCP port, beside a real Toktail's 8766.
+pub const API_PORT: u16 = 8798;
 /// The demo's encryption password (kept in the demo's own Keychain entry).
 pub const PASSWORD: &str = "pip-demo-password";
 

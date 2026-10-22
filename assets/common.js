@@ -82,8 +82,22 @@ const METRIC_TITLE = { combined: "Combined", output: "Output", input: "Input" };
 const mv = (e, key) => (key === "combined" ? (e.input || 0) + (e.output || 0) : e[key] || 0);
 
 // ================================================================== fetch
+// The portal needs a sign-in (portal_auth.rs). When it lapses, say how to
+// get back in once, instead of every card failing on its own.
+let signedOutShown = false;
+function signedOut() {
+  if (signedOutShown) return;
+  signedOutShown = true;
+  const bar = document.createElement("div");
+  bar.className = "signed-out";
+  bar.setAttribute("role", "alert");
+  bar.textContent = "This browser is signed out of Toktail. Choose Open Toktail in the menu bar (or run Toktail open) to sign in again.";
+  document.body.prepend(bar);
+}
+
 async function getJSON(url, opts) {
   const r = await fetch(url, { cache: "no-store", ...(opts || {}) });
+  if (r.status === 401) signedOut();
   if (!r.ok) {
     const text = (await r.text().catch(() => "")).trim();
     throw new Error(text && text.length < 400 ? text : url + " answered " + r.status);
