@@ -4,7 +4,7 @@
 
 # Toktail
 
-![Visitors](https://counthis.app/c/majjivxqjdgemdqc-app.toktail.github.installer.sh-installs)
+![Visitors](https://counthis.app/github?repository=playandprosper/toktail)
 
 *Pronounced "tock-tail". A mix of **token** and `tail -f`.*
 
