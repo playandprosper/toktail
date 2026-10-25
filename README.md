@@ -4,7 +4,7 @@
 
 # Toktail
 
-![Visitor Count](https://visitor-badge.laobi.icu/badge?page_id=andreimerlescu)
+![Visitors](https://counthis.app/c/majjivxqjdgemdqc-app.toktail.github.installer.sh-installs)
 
 *Pronounced "tock-tail". A mix of **token** and `tail -f`.*
 
