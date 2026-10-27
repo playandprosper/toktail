@@ -4,7 +4,7 @@
 
 # Toktail
 
-![Visitors](https://counthis.app/github?repository=playandprosper/toktail)
+![Visitors](https://counthis.app/g/qyjy5vwjtjgbjfzy)
 
 *Pronounced "tock-tail". A mix of **token** and `tail -f`.*
 
